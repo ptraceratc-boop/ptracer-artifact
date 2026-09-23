@@ -1,0 +1,8 @@
+PTPLAN 2
+I suites/polybench/targets/durbin_large
+S 138c B 1 r:rax
+S 14a1 B 2 r:rsi r:rsp
+S 14c1 B 3 r:rdx r:rsi r:rsp
+S 1630 B 2 r:rsi r:rsp
+S 173b B 3 f r:rsi r:rsp
+S 17b4 A 1 r:rax

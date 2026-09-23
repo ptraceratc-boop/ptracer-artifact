@@ -1,0 +1,97 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+# Example makefile for building a tool without pin-gcc/pin-g++
+CC ?= gcc
+COMPILER ?= $(CC)
+PINKIT := ../../../
+PINRTDIR := $(PINKIT)/$(TARGET)/pinrt
+OBJ_SUFFIX := .o
+PINTOOL_SUFFIX := .so
+OBJDIR := nopincc-obj-$(TARGET)
+TOOL_CXX := $(CC)
+TOOL_LINKER := $(CC)
+TOOL_CPPFLAGS := -DPIN_CRT=1 -DPIN_RT -DTARGET_LINUX -D_LIBCPP_HAS_MUSL_LIBC -D_GNU_SOURCE
+TOOL_CXXFLAGS := -nostdinc -fPIC -fno-stack-protector -fno-rtti
+TOOL_USER_CXXFLAGS := -std=c++17 -funwind-tables -fasynchronous-unwind-tables -faligned-new -fno-strict-aliasing \
+					  -O3 -fomit-frame-pointer -Wall -Werror
+TOOL_LDFLAGS := -shared -Wl,-Bsymbolic -Wl,--version-script=$(PINKIT)/source/include/pin/pintool.ver \
+				-Wl,--dynamic-linker,$(PINRTDIR)/bin/pin.ld.so -nostdlib -fPIC
+
+TOOL_LIB_PATH :=  -L$(PINKIT)/$(TARGET)/lib \
+				  -L$(PINKIT)/extras/xed-$(TARGET)/lib \
+				  -L$(PINRTDIR)/lib
+
+TOOL_LIBS := -lpin \
+			 -lxed \
+			 -lpindwarf \
+			 -ldwarf \
+			 -lunwind-dynamic \
+			 -lpinrt-adaptor-static \
+			 -lc++abi \
+			 -lc++ \
+			 -lpincrt
+
+ifeq ($(TARGET),ia32)
+	TOOL_CPPFLAGS += -D_arch_long=long -DTARGET_IA32 -DHOST_IA32
+	TOOL_CXXFLAGS += -m32
+	TOOL_LDFLAGS += -Wl,-melf_i386
+	GCC_OBJ_PATH := $(shell dirname $(shell gcc -print-file-name=crtbeginS.o))/32
+else
+	TOOL_CPPFLAGS += -D_arch_long=long -DTARGET_IA32E -DHOST_IA32E
+	TOOL_CXXFLAGS += -m64
+	TOOL_LDFLAGS += -Wl,-melf_x86_64
+	GCC_OBJ_PATH := $(shell dirname $(shell gcc -print-file-name=crtbeginS.o))
+endif
+
+ifeq ($(COMPILER), icx)
+	TOOL_CPPFLAGS += -D_LIBCPP_DISABLE_AVAILABILITY
+endif
+
+ifeq ($(COMPILER), gcc)
+	TOOL_CXXFLAGS += -fabi-version=10
+endif
+
+TOOL_LDFLAGS += $(TOOL_LIB_PATH)
+
+TOOL_START_FILES := $(PINRTDIR)/lib/crti.o \
+					$(GCC_OBJ_PATH)/crtbeginS.o
+
+TOOL_END_FILES :=   $(GCC_OBJ_PATH)/libgcc.a \
+					$(GCC_OBJ_PATH)/libgcc_eh.a \
+					$(GCC_OBJ_PATH)/crtendS.o \
+					$(PINRTDIR)/lib/crtn.o
+
+TOOL_SYSTEM_INCLUDES := -isystem $(PINRTDIR)/include/c++ \
+						-isystem $(PINRTDIR)/include/adaptor \
+						-isystem $(PINRTDIR)/include \
+						-isystem $(PINRTDIR)/include/pinos \
+						-isystem $(GCC_OBJ_PATH)/include
+			
+TOOL_PIN_INCLUDES :=  -I $(PINKIT)/source/include/pin \
+					  -I $(PINKIT)/source/include/pin/gen \
+					  -I $(PINKIT)/extras/components/include \
+					  -I $(PINKIT)/extras/xed-$(TARGET)/include/xed \
+					  -I $(PINKIT)/source/tools/Utils 
+
+TOOL_OBJECTS = $(OBJDIR)/MyPinTool$(OBJ_SUFFIX)
+
+.PHONY: all ;
+
+all: MyPinTool$(PINTOOL_SUFFIX) ;
+
+clean:
+	rm -rf $(OBJDIR)
+
+$(OBJDIR):
+	mkdir -p $(OBJDIR)
+
+MyPinTool$(PINTOOL_SUFFIX) : $(TOOL_OBJECTS) | dir
+	$(TOOL_LINKER) $(TOOL_LDFLAGS) -o $(OBJDIR)/$@ $(TOOL_START_FILES) $< $(TOOL_LIBS) $(TOOL_END_FILES)
+
+$(OBJDIR)/%$(OBJ_SUFFIX) : %.cpp | dir
+	$(TOOL_CXX) $(TOOL_CPPFLAGS) $(TOOL_PIN_INCLUDES) $(TOOL_SYSTEM_INCLUDES) $(TOOL_CXXFLAGS) $(TOOL_USER_CXXFLAGS) -c -o $@ $<
+
+dir: $(OBJDIR)

@@ -1,0 +1,6 @@
+TOOL_ROOTS := nooptool hifitool
+TEST_ROOTS :=
+
+# hifitool.cpp includes headers the kit's implicit rule does not track.
+$(OBJDIR)hifitool$(OBJ_SUFFIX): hifitool.cpp jitplan.h jitbridge.h ../jit/jitsite_format.h
+$(OBJDIR)nooptool$(OBJ_SUFFIX): nooptool.cpp

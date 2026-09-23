@@ -1,0 +1,7 @@
+#
+# Copyright (C) 2026-2026 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+probe_reattach_worker
+probe_reattach_allocator

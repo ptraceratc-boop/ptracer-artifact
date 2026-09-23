@@ -1,0 +1,16 @@
+Pintool [1]: BEFORE SomeFuntionToProbe(). Phase 0
+Pintool [2]: BEFORE SomeFuntionToProbe(). Phase 0
+Pintool [2]: REPLACE SomeFuntionToProbe(). Phase 0
+Pintool [1]: REPLACE SomeFuntionToProbe(). Phase 0
+Application calling SomeFuntionToProbe(). Phase 0
+Pintool [1]: AFTER SomeFuntionToProbe().
+Pintool [2]: AFTER SomeFuntionToProbe().
+Pintool [1]: BEFORE SomeFuntionToProbe(). Phase 1
+Pintool [2]: BEFORE SomeFuntionToProbe(). Phase 1
+Pintool [2]: REPLACE SomeFuntionToProbe(). Phase 1
+Pintool [1]: REPLACE SomeFuntionToProbe(). Phase 1
+Application calling SomeFuntionToProbe(). Phase 1
+Pintool [1]: AFTER SomeFuntionToProbe().
+Pintool [2]: AFTER SomeFuntionToProbe().
+Application calling SomeFuntionToProbe(). Phase 2
+All threads exited. The test PASSED

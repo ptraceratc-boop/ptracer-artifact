@@ -1,0 +1,23 @@
+name: ci_mac_meson
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos_meson:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: tools
+      run:  |
+        brew install meson
+    - name: 
+      run:  |
+        mkdir builddir && cd builddir
+        meson setup -Ddwarfexample=true . ..
+        ninja
+        ninja test
+

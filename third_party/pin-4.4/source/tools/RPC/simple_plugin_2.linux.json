@@ -1,0 +1,9 @@
+{
+    "ExtraRPCPlugins": [
+        {
+            "lib": "libsimple_plugin.so",
+            "name": "simple plugin 2",
+            "log" : false
+        }
+    ]
+}

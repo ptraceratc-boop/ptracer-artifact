@@ -1,0 +1,254 @@
+#
+# Copyright (C) 2026-2026 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS :=
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS := arglen envlen
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS := basic_tool
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS :=
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS := arglen envlen
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Place OS-specific definitions here ######
+
+# Linux
+ifeq ($(TARGET_OS),linux)
+    ifeq ($(TARGET),intel64)
+	    TEST_ROOTS += arglen_w_or_wo_shebang
+    endif	
+endif
+
+###### Handle exceptions here (OS/arch related) ######
+
+RUNNABLE_TESTS := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+###### Handle exceptions here (bugs related) ######
+
+###### Define the sanity subset ######
+
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+# Windows - Max allowed per command line argument is 32KB. Total allowed is also 32KB.
+#           This means that the RSC 64KB message limit can never be reached.
+# Linux - Max allowed per command line argument is 128KB. Total allowed is 4-8 MB (OS configured).
+#         This means that the RSC 64KB message limit can be reached in several ways.
+
+arglen.test: $(OBJDIR)arglen$(EXE_SUFFIX)
+	# Test 1: Single long argument (5000 bytes)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1 5000 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 2, total_len = 5001" $(OBJDIR)arglen.out
+
+	# Test 2: Single long argument (30000 bytes)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1 30000 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 2, total_len = 30001" $(OBJDIR)arglen.out
+
+	# Test 3: Single long argument (30000 bytes) with execve
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1 30000 execve > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 2, total_len = 30001" $(OBJDIR)arglen.out
+
+ifeq ($(TARGET_OS),linux)
+	# Test 4: Single long argument (100000 bytes)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1 100000 > $(OBJDIR)arglen.out 2>&1
+	$(QGREP) "argc = 2, total_len = 100001" $(OBJDIR)arglen.out
+
+	# Test 5: Single long argument (70000 bytes) with execve > 64KB RSC limit
+	-$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1 70000 execve > $(OBJDIR)arglen.out 2>&1
+	$(QGREP) "SYS_prepare_follow_execve failed" $(OBJDIR)arglen.out
+endif
+
+	# Test 6: Few large arguments (3 args x 10KB = ~30KB)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 3 10240 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 4, total_len = 30723" $(OBJDIR)arglen.out
+
+	# Test 7: Many small arguments (300 args x 100 bytes = ~30KB)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 300 100 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 301, total_len = 30300" $(OBJDIR)arglen.out
+
+	# Test 8: Many small arguments (300 args x 100 bytes = ~30KB) with execve
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 300 100 execve > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 301, total_len = 30300" $(OBJDIR)arglen.out
+
+ifeq ($(TARGET_OS),linux)
+	# Test 9: Many small arguments (1000 args x 100 bytes = ~100KB)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1000 100 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 1001, total_len = 101000" $(OBJDIR)arglen.out
+
+	# Test 10: Many small arguments (1000 args x 100 bytes = ~100KB) with execve > 64KB RSC limit
+	-$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1000 100 execve > $(OBJDIR)arglen.out 2>&1
+	$(QGREP) "SYS_prepare_follow_execve failed" $(OBJDIR)arglen.out
+
+	# Test 11: Many medium arguments (1000 args x 1000 bytes = ~1MB)
+	$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 1000 1000 > $(OBJDIR)arglen.out
+	$(QGREP) "argc = 1001, total_len = 1001000" $(OBJDIR)arglen.out
+endif
+
+	# Test 12: Many medium arguments (10000 args x 1000 bytes = ~10MB) > 8MB max total allowed by Linux (and way more than Windows allows)
+	-$(PYTHON) ./call_arglen.py -pin $(PIN) -app $(OBJDIR)arglen$(EXE_SUFFIX) 10000 1000 > $(OBJDIR)arglen.out 2>&1
+	$(QGREP) "too long" $(OBJDIR)arglen.out
+
+	$(RM) $(OBJDIR)arglen.out
+
+# Test that Pin is able to run shell script with shebang line and without shebang line.
+arglen_w_or_wo_shebang.test: $(OBJDIR)arglen$(EXE_SUFFIX) $(OBJDIR)basic_tool$(PINTOOL_SUFFIX)
+# Run tests with shebang
+	$(PIN) -follow-execv -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -unique_logfile -logfile $(OBJDIR)pintool.log \
+	-- ./call_arglen_w_shebang.sh $(OBJDIR)arglen$(EXE_SUFFIX) 50 > $(OBJDIR)arglen_w_shebang.out
+	$(QGREP) "argc = 2, total_len = 51" $(OBJDIR)arglen_w_shebang.out
+# Verify 2 tool logs were generated: one for shell script process and one for arglen app process (being executed from shell forked process)
+	$(BASHTEST) `ls $(OBJDIR)pintool.log.* | $(LINECOUNT)` -eq 2
+	$(RM) $(OBJDIR)pintool.log.* $(OBJDIR)arglen_w_shebang.out
+# Now run same test in probe mode
+	$(PIN) -follow-execv -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -probe -unique_logfile -logfile $(OBJDIR)pintool.log \
+	-- ./call_arglen_w_shebang.sh $(OBJDIR)arglen$(EXE_SUFFIX) 50 > $(OBJDIR)arglen_w_shebang.out
+	$(QGREP) "argc = 2, total_len = 51" $(OBJDIR)arglen_w_shebang.out
+# Verify 2 tool logs were generated: one for shell script process and one for arglen app process (being executed from shell forked process)
+	$(BASHTEST) `ls $(OBJDIR)pintool.log.* | $(LINECOUNT)` -eq 2
+	$(RM) $(OBJDIR)pintool.log.* $(OBJDIR)arglen_w_shebang.out
+# Now run same test without shebang
+	$(PIN) -follow-execv -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -unique_logfile -logfile $(OBJDIR)pintool.log \
+	-- ./call_arglen_wo_shebang.sh $(OBJDIR)arglen$(EXE_SUFFIX) 50 > $(OBJDIR)arglen_wo_shebang.out
+	$(QGREP) "argc = 2, total_len = 51" $(OBJDIR)arglen_wo_shebang.out
+# Verify 2 tool logs were generated: one for shell script process and one for arglen app process (being executed from shell forked process)
+	$(BASHTEST) `ls $(OBJDIR)pintool.log.* | $(LINECOUNT)` -eq 2
+	$(RM) $(OBJDIR)pintool.log.* $(OBJDIR)arglen_wo_shebang.out
+# Now run same test in probe mode
+	$(PIN) -follow-execv -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -probe -unique_logfile -logfile $(OBJDIR)pintool.log \
+	-- ./call_arglen_wo_shebang.sh $(OBJDIR)arglen$(EXE_SUFFIX) 50 > $(OBJDIR)arglen_wo_shebang.out
+	$(QGREP) "argc = 2, total_len = 51" $(OBJDIR)arglen_wo_shebang.out
+# Verify 2 tool logs were generated: one for shell script process and one for arglen app process (being executed from shell forked process)
+	$(BASHTEST) `ls $(OBJDIR)pintool.log.* | $(LINECOUNT)` -eq 2
+	$(RM) $(OBJDIR)pintool.log.* $(OBJDIR)arglen_wo_shebang.out
+
+
+# Windows - Max allowed per env argument is 128KB. Total allowed is 8MB.
+#           The environment variables are passed in execve RSC message, so the RSC 64KB limit can be reached in several ways.
+# Linux - Max allowed per env argument is 128KB. Total allowed is 4-8 MB (OS configured).
+#         The environment variables are not passed in execve RSC message, so the RSC 64KB limit is not a limitation here.
+
+envlen.test: $(OBJDIR)envlen$(EXE_SUFFIX)
+	# Test 1: Single long environment variable (5000 bytes + 1x19 = 5019)
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 5000 > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 1, total_len = 5019" $(OBJDIR)envlen.out
+
+	# Test 2: Single long environment variable (130000 bytes + 1x19 = 130019 < 128KB)
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 130000 > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 1, total_len = 130019" $(OBJDIR)envlen.out
+
+ifeq ($(TARGET_OS),linux)
+	# Test 3: Single long environment variable (120000 bytes + 1x19 = 120019 < 128KB) + execve
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 120000 execve > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 1, total_len = 120019" $(OBJDIR)envlen.out
+else
+	# Test 4: Single long environment variable (40000 bytes + 1x19 = 40019 (+ ~10KB other environment variables) < 64KB) + execve
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 40000 execve > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 1, total_len = 40019" $(OBJDIR)envlen.out
+
+	# Test 5: Single too long environment variable (70000 bytes + 1x19 = 70019 (+ ~10KB other environment variables) > 64KB) + execve
+	-$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 70000 execve > $(OBJDIR)envlen.out 2>&1
+	$(QGREP) "too large" $(OBJDIR)envlen.out
+endif
+
+	# Test 6: Single too long environment variable (132000 bytes + 1x19 = 132019 > 128KB)
+	-$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 1 132000 > $(OBJDIR)envlen.out 2>&1
+	$(QGREP) "too long" $(OBJDIR)envlen.out
+
+	# Test 7: Many small environment variables (100x(100+19) bytes = 11900)
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 100 100 > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 100, total_len = 11900" $(OBJDIR)envlen.out
+
+	# Test 8: Many large environment variables (50x(20000+19) bytes = 1000950)
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 50 20000 > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 50, total_len = 1000950" $(OBJDIR)envlen.out
+
+ifeq ($(TARGET_OS),linux)
+	# Test 9: Many large environment variables (50x(10000+19) bytes = 500950) + execve
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 50 10000 execve > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 50, total_len = 500950" $(OBJDIR)envlen.out
+
+	# Test 10:  Too many large environment variables (100x(84000+19) bytes = 8401900 > 6MB)
+	-$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 100 84000 > $(OBJDIR)envlen.out 2>&1
+	$(QGREP) "too long" $(OBJDIR)envlen.out
+else
+	# Test 11: Many large environment variables (30x(1000+19) bytes = 30570 (+ ~10KB other environment variables) < 64KB) + execve
+	$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 30 1000 execve > $(OBJDIR)envlen.out
+	$(QGREP) "envcount = 30, total_len = 30570" $(OBJDIR)envlen.out
+
+	# Test 12: Too many large environment variables (70x(1000+19) bytes = 71330 > 64KB) + execve
+	-$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 70 1000 execve > $(OBJDIR)envlen.out 2>&1
+	$(QGREP) "too large" $(OBJDIR)envlen.out
+
+	# Test 13: Too many large environment variables (100x(90000+19) bytes = 9001900 > 8MB)
+	-$(PYTHON) ./call_envlen.py -pin $(PIN) -app $(OBJDIR)envlen$(EXE_SUFFIX) 100 90000 > $(OBJDIR)envlen.out 2>&1
+	$(QGREP) "Error" $(OBJDIR)envlen.out
+endif
+
+	$(RM) $(OBJDIR)envlen.out
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+###### Special applications' build rules ######
+
+###### Special objects' build rules ######
+
+###### Special dlls' build rules ######

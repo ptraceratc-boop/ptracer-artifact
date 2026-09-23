@@ -1,0 +1,10 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+win_parent_process.exe
+win_parent_process.exe
+win_parent_process.exe
+win_child_process.exe "param1 param2" param3
+win_child_process.exe "param1 param2" param3
+win_child_process.exe "param1 param2" param3

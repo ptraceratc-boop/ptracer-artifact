@@ -1,0 +1,12 @@
+{
+    "RSCServer": {
+        "RPCPlugins": [
+            {
+                "lib": "libsimple_plugin.so",
+                "name": "simple plugin 1",
+                "log" : true,
+                "logfilename" : "simple_plugin_override_pin.log"
+            }
+        ]
+    }
+}

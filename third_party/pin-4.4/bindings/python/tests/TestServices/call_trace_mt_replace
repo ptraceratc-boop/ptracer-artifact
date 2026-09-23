@@ -1,0 +1,88 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+import json, pin
+
+total_threads = 0
+counter = 0
+
+# Maps to keep track of call counts and locations
+call_trace_count_map = {}
+call_trace_location_map = {}
+
+
+def rtn_cb(name):
+    """Replacement function that increments the global counter when replacing increment_counter
+        and decrement the global counter when replacing decrement_counter.
+    Args:
+    name (str): The name of the original routine being replaced and it's image (in format of <routine name>@<image name> ).
+    """
+    global call_trace_count_map, counter
+    assert(name in call_trace_count_map)
+    call_trace_count_map[name] += 1
+    if name.startswith("increment_counter"):
+        counter += 1
+    elif name.startswith("decrement_counter"):
+        counter -= 1
+        
+
+def image_instrumentation_cb(img):
+    """Callback function for instrumenting images.
+    Args:
+    img: The image object to be instrumented.
+    """
+    img_name = pin.IMG_Name(img)
+    sec = pin.IMG_SecHead(img)
+    while(pin.SEC_Valid(sec)):
+        rtn = pin.SEC_RtnHead(sec)
+        while(pin.RTN_Valid(rtn)):
+            rtn_name = pin.RTN_Name(rtn)
+            
+            # Check with the user-defined client callback whether to replace the routine (with type of void func(void))
+            if(is_to_instrument_rtn(img_name, rtn_name)):
+                name =  rtn_name + "@" + img_name
+                
+                proto = pin.PROTO_Allocate(pin.PIN_PARG_VOID, pin.CALLINGSTD_DEFAULT, name)
+                pin.RTN_ReplaceSignature(rtn, rtn_cb, proto, pin.IARG_PYOBJ, name)
+                
+                # Initialize the call count and location information for the routine
+                global call_trace_count_map, call_trace_location_map
+                call_trace_count_map[name] = 0
+                loc_info = pin.PIN_GetSourceLocation(pin.RTN_Address(rtn))
+                call_trace_location_map[name] = f"srcfile:{loc_info[2]}, line: {loc_info[1]}, column: {loc_info[0]}"
+            
+            rtn = pin.RTN_Next(rtn)
+        sec = pin.SEC_Next(sec)
+    
+def fini(code):
+    """Finalization function called when the Pin tool is about to terminate.
+
+    Args:
+    code: The exit code with which the Pin tool is terminating.
+    """
+    
+    global call_trace_count_map, call_trace_location_map, total_threads, counter
+    result_json = {}
+    
+    # Aggregate call count and location data into a JSON-compatible dictionary
+    for name in call_trace_count_map:
+        assert(name in call_trace_location_map)
+        result_json[name] = {"CallCount": call_trace_count_map[name], "Location": call_trace_location_map[name]}
+    
+    result_json["total_threads"] = total_threads
+    result_json["counter"] = counter
+    
+    # Convert the result dictionary to a JSON string
+    result_json_str = json.dumps(result_json)
+    Glue_SendServiceResultCallback(result_json_str)
+
+def thread_start_cb(threadIndex, ctxt, flags):
+    global total_threads
+    total_threads = total_threads + 1
+    
+
+pin.IMG_AddInstrumentFunction(image_instrumentation_cb)
+pin.PIN_AddThreadStartFunction(thread_start_cb)
+pin.PIN_AddFiniFunction(fini)

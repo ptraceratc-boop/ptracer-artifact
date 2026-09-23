@@ -1,0 +1,346 @@
+#
+# Copyright (C) 2012-2026 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS := syscall_time syscall_stack_verify 
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS :=
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS :=
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS := 
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS := 
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Place OS-specific definitions here ######
+
+ifeq ($(TARGET),intel64)
+	TOOL_ROOTS += check_rcx_r11_return_value
+endif
+
+# Linux
+ifeq ($(TARGET_OS),linux)
+	TEST_TOOL_ROOTS += mmap close_all_files set_syscall_return_and_errno_value
+    TEST_ROOTS += ppollEmulationSuccessful ppollEmulationSignalInterrupt ppollEmulationTimeOut ppollEmulationNullSigmask \
+                  system_syscall_client_lock popen_syscall_client_lock clone_syscall_different_process_client_lock \
+				  clone_syscall_same_process_client_lock pin_clone clone3 exit_restartable_syscall dup23 dup23_probed
+	TOOL_ROOTS += syscalls_and_locks_tool dup23_tool
+	APP_ROOTS += ppollEmulation_app syscalls_and_locks_app mmap_app close_all_files_app pin_clone_app \
+	             exit_restartable_syscall_app clone3_app getsid_app signal_syscall_app
+
+	KERNEL_VER_GE_590 := $(shell $(TOOLS_ROOT)/Utils/testLinuxKernelVersion ge 5.9.0)
+	LIBC_VER_GE_234 := $(shell $(TOOLS_ROOT)/Utils/testLibcVersion ge 2.34)
+	ifeq ($(LIBC_VER_GE_234)-$(KERNEL_VER_GE_590),1-1)
+		TEST_ROOTS += close_range close_range_probed posix_spawn_closefrom posix_spawn_closefrom_probed
+		TOOL_ROOTS += close_range_tool posix_spawn_closefrom_tool
+		APP_ROOTS += close_range_app posix_spawn_closefrom_app
+	endif
+
+	ifeq ($(TARGET),intel64)
+		TEST_ROOTS += check_rcx_r11_return_value
+	endif
+    ifeq ($(TARGET),ia32e)
+        TEST_ROOTS += check_prctl
+        APP_ROOTS += check_prctl_app
+    endif
+endif
+
+# Windows
+ifeq ($(TARGET_OS),windows)
+	TEST_ROOTS += check_ntcontinue_win syscall_key_and_number ex_syscalls
+	APP_ROOTS += windows_exception_ntcontinue_app windows_syscall_key_app ex_syscalls_app
+	ifeq ($(TARGET), intel64)
+		TEST_ROOTS += check_rcx_r11_return_value_win
+		APP_ROOTS += windows_syscall_app
+	endif
+	TOOL_ROOTS += windows_syscall_key_tool ex_syscalls_tool
+endif
+
+RUNNABLE_TESTS := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+###### Handle exceptions here (bugs related) ######
+
+###### Define the sanity subset ######
+
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+# This test verifies that syscall entry and exit callbacks are properly paired and handles nested/stacked syscalls.
+# It uses the cp-pin file copy utility which generates syscalls that the tool verifies.
+syscall_stack_verify.test: $(OBJDIR)syscall_stack_verify$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)syscall_stack_verify$(PINTOOL_SUFFIX) -o $(OBJDIR)syscall_stack_verify.out \
+	  -- $(TESTAPP) makefile $(OBJDIR)syscall_stack_verify.tmp
+	$(QGREP) "SUCCESS: All syscalls properly paired!" $(OBJDIR)syscall_stack_verify.out
+	$(RM) $(OBJDIR)syscall_stack_verify.out $(OBJDIR)syscall_stack_verify.tmp
+
+ppollEmulationSuccessful.test: $(OBJDIR)ppollEmulation_app$(EXE_SUFFIX)
+	$(PIN) -- $< 1 $(OBJDIR)$(@:%.test=%.out) $(OBJDIR)$(@:%.test=%Pipe)
+	$(QGREP) "ppoll succeeded" $(OBJDIR)$(@:%.test=%.out)
+	$(RM) $(OBJDIR)$(@:%.test=%.out)
+
+ppollEmulationSignalInterrupt.test: $(OBJDIR)ppollEmulation_app$(EXE_SUFFIX)
+	$(PIN) -- $< 2 $(OBJDIR)$(@:%.test=%.out) $(OBJDIR)$(@:%.test=%Pipe)
+	$(QGREP) "sigalarm interrupted the ppoll system call" $(OBJDIR)$(@:%.test=%.out)
+	$(RM) $(OBJDIR)$(@:%.test=%.out)
+
+ppollEmulationTimeOut.test: $(OBJDIR)ppollEmulation_app$(EXE_SUFFIX)
+	$(PIN) -- $< 3 $(OBJDIR)$(@:%.test=%.out) $(OBJDIR)$(@:%.test=%Pipe)
+	$(QGREP) "The call timed out and no file descriptors were ready" $(OBJDIR)$(@:%.test=%.out)
+	$(RM) $(OBJDIR)$(@:%.test=%.out)
+
+ppollEmulationNullSigmask.test: $(OBJDIR)ppollEmulation_app$(EXE_SUFFIX)
+	$(PIN) -- $< 4 $(OBJDIR)$(@:%.test=%.out) $(OBJDIR)$(@:%.test=%Pipe)
+	$(QGREP) "ppoll succeeded" $(OBJDIR)$(@:%.test=%.out)
+	$(RM) $(OBJDIR)$(@:%.test=%.out)
+
+system_syscall_client_lock.test: $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX) -lock_type 3 \
+	  -- $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) 1
+
+popen_syscall_client_lock.test: $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX) -lock_type 3  \
+	  -- $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) 2
+
+clone_syscall_different_process_client_lock.test: $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX) -lock_type 3 \
+	  -- $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) 3
+
+clone_syscall_same_process_client_lock.test: $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)syscalls_and_locks_tool$(PINTOOL_SUFFIX) -lock_type 3 \
+	  -- $(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX) 4
+
+mmap.test: $(OBJDIR)mmap$(PINTOOL_SUFFIX) $(OBJDIR)mmap_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)mmap$(PINTOOL_SUFFIX) -o $(OBJDIR)mmap.out -- $(OBJDIR)mmap_app$(EXE_SUFFIX) $(OBJDIR)mmap.dat
+	$(QGREP) "Success!" $(OBJDIR)mmap.out
+	$(RM) $(OBJDIR)mmap.dat $(OBJDIR)mmap.out
+
+# This test checks that Pin guards the file descriptors opened by itself and the
+# tool, and doesn't let the application to close them.
+# Checking "exit" string appears in $(OBJDIR)close_all_files_pin.log (when using log_syscall) in order to confirm pin.log 
+# is not closed when application closed all application descriptors. Seeing system exit in the log verifies that.
+close_all_files.test: $(OBJDIR)close_all_files$(PINTOOL_SUFFIX) $(OBJDIR)close_all_files_app$(EXE_SUFFIX)
+	$(PIN) -logfile $(OBJDIR)close_all_files_pin.log  -xyzzy -mesgon log_syscall -t $(OBJDIR)close_all_files$(PINTOOL_SUFFIX) \
+	-o $(OBJDIR)close_all_files.out -f $(OBJDIR)afterForkInChild_tool.log \
+	  -- $(OBJDIR)close_all_files_app$(EXE_SUFFIX) > $(OBJDIR)close_all_files_app.out 2>&1
+	$(QGREP) "exit" $(OBJDIR)close_all_files_pin.log
+	$(QGREP) "success" $(OBJDIR)afterForkInChild_tool.log
+	$(QGREP) "C Success!" $(OBJDIR)close_all_files.out_for_c
+	$(QGREP) "C++ Success!" $(OBJDIR)close_all_files.out_for_cpp
+	$(QGREP) "Application after closeAllFilesExceptStd()" $(OBJDIR)close_all_files_app.out
+	!$(QGREP) "should not reach console" $(OBJDIR)close_all_files_app.out
+	$(QGREP) "STDERR: AfterForkInChild::hello" $(OBJDIR)close_all_files_app.out
+	$(RM) $(OBJDIR)close_all_files.out_for_c $(OBJDIR)close_all_files.out_for_cpp
+	$(PIN) -t $(OBJDIR)close_all_files$(PINTOOL_SUFFIX) -probe -o $(OBJDIR)close_all_files.out -f $(OBJDIR)afterForkInChildProbed_tool.log \
+	  -- $(OBJDIR)close_all_files_app$(EXE_SUFFIX) > $(OBJDIR)close_all_files_app.out 2>&1
+	$(QGREP) "success" $(OBJDIR)afterForkInChildProbed_tool.log
+	$(QGREP) "C Success!" $(OBJDIR)close_all_files.out_for_c
+	$(QGREP) "C++ Success!" $(OBJDIR)close_all_files.out_for_cpp
+	$(QGREP) "Application after closeAllFilesExceptStd()" $(OBJDIR)close_all_files_app.out
+	!$(QGREP) "should not reach console" $(OBJDIR)close_all_files_app.out
+	$(QGREP) "STDERR: AfterForkInChild::hello" $(OBJDIR)close_all_files_app.out
+	$(RM) $(OBJDIR)close_all_files.out_for_c $(OBJDIR)close_all_files.out_for_cpp $(OBJDIR)close_all_files_app.out 
+
+# This test checks that close_range closes application-owned file descriptors
+# while preserving file descriptors opened by Pin before application execution.
+# Probe mode is currently expected to close the Pin-owned descriptors and fail.
+close_range.test: $(OBJDIR)close_range_tool$(PINTOOL_SUFFIX) $(OBJDIR)close_range_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)close_range_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)close_range_app$(EXE_SUFFIX) > $(OBJDIR)close_range_jit.out 2>&1
+	$(QGREP) "Application close_range succeeded" $(OBJDIR)close_range_jit.out
+	$(QGREP) "Pin close_range succeeded" $(OBJDIR)close_range_jit.out
+	$(RM) $(OBJDIR)close_range_jit.out
+
+close_range_probed.test: $(OBJDIR)close_range_tool$(PINTOOL_SUFFIX) $(OBJDIR)close_range_app$(EXE_SUFFIX)
+	$(PIN) -probe -t $(OBJDIR)close_range_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)close_range_app$(EXE_SUFFIX) > $(OBJDIR)close_range_probe.out 2>&1
+	$(QGREP) "Application close_range succeeded" $(OBJDIR)close_range_probe.out
+	$(QGREP) "Pin close_range succeeded" $(OBJDIR)close_range_probe.out
+	$(RM) $(OBJDIR)close_range_probe.out
+
+# This test verifies that posix_spawn close-from actions preserve file descriptors opened by Pin and the tool.
+# In JIT this test is expected to pass because the close_range syscall is intercepted and emulated.
+posix_spawn_closefrom.test: $(OBJDIR)posix_spawn_closefrom_tool$(PINTOOL_SUFFIX) $(OBJDIR)posix_spawn_closefrom_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)posix_spawn_closefrom_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)posix_spawn_closefrom_app$(EXE_SUFFIX) > $(OBJDIR)posix_spawn_closefrom_jit.out 2>&1
+	$(QGREP) "Application posix_spawn closefrom succeeded" $(OBJDIR)posix_spawn_closefrom_jit.out
+	$(QGREP) "Pin posix_spawn closefrom succeeded" $(OBJDIR)posix_spawn_closefrom_jit.out
+	$(RM) $(OBJDIR)posix_spawn_closefrom_jit.out
+
+# This test verifies that posix_spawn close-from actions preserve file descriptors opened by Pin and the tool.
+# Currently, Pin is unable to locate __spawni_child because we don't support compressed debug info,
+# so this test passes but prevents close-from altogether by replacing posix_spawn_file_actions_addclosefrom_np
+# with a no-op.
+posix_spawn_closefrom_probed.test: $(OBJDIR)posix_spawn_closefrom_tool$(PINTOOL_SUFFIX) $(OBJDIR)posix_spawn_closefrom_app$(EXE_SUFFIX)
+	$(PIN) -probe -follow_execv 1 -t $(OBJDIR)posix_spawn_closefrom_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)posix_spawn_closefrom_app$(EXE_SUFFIX) > $(OBJDIR)posix_spawn_closefrom_probe.out 2>&1
+	$(QGREP) "Application posix_spawn closefrom succeeded" $(OBJDIR)posix_spawn_closefrom_probe.out
+	$(QGREP) "Pin posix_spawn closefrom succeeded" $(OBJDIR)posix_spawn_closefrom_probe.out
+	$(RM) $(OBJDIR)posix_spawn_closefrom_probe.out
+
+dup23.test: $(OBJDIR)dup23_tool$(PINTOOL_SUFFIX) $(OBJDIR)dup23_app_jit$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)dup23_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)dup23_pin.out \
+	  -- $(OBJDIR)dup23_app_jit$(EXE_SUFFIX) > $(OBJDIR)dup23_jit.out 2>&1
+	$(QGREP) "Application dup2 errno checks succeeded" $(OBJDIR)dup23_jit.out
+	$(QGREP) "Application dup2 succeeded" $(OBJDIR)dup23_jit.out
+	$(QGREP) "Application dup3 errno checks succeeded" $(OBJDIR)dup23_jit.out
+	$(QGREP) "Application dup3 succeeded" $(OBJDIR)dup23_jit.out
+	$(QGREP) "Pin generic file descriptor survived application duplication" $(OBJDIR)dup23_pin.out
+	$(RM) $(OBJDIR)dup23_pin.out $(OBJDIR)dup23_jit.out
+
+dup23_probed.test: $(OBJDIR)dup23_tool$(PINTOOL_SUFFIX) $(OBJDIR)dup23_app_probe$(EXE_SUFFIX)
+	$(PIN) -probe -t $(OBJDIR)dup23_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)dup23_pin_probe.out \
+	  -- $(OBJDIR)dup23_app_probe$(EXE_SUFFIX) > $(OBJDIR)dup23_probe.out 2>&1
+	$(QGREP) "Application dup2 errno checks succeeded" $(OBJDIR)dup23_probe.out
+	$(QGREP) "Application dup2 succeeded" $(OBJDIR)dup23_probe.out
+	$(QGREP) "Application dup3 errno checks succeeded" $(OBJDIR)dup23_probe.out
+	$(QGREP) "Application dup3 succeeded" $(OBJDIR)dup23_probe.out
+	$(QGREP) "Pin generic file descriptor survived application duplication" $(OBJDIR)dup23_pin_probe.out
+	$(RM) $(OBJDIR)dup23_pin_probe.out $(OBJDIR)dup23_probe.out
+
+pin_clone.test: $(OBJDIR)pin_clone_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)pin_clone_app$(EXE_SUFFIX)
+
+clone3.test: $(OBJDIR)clone3_app$(EXE_SUFFIX)
+	$(OBJDIR)clone3_app$(EXE_SUFFIX) > $(OBJDIR)clone3.reference
+	$(PIN) -- $(OBJDIR)clone3_app$(EXE_SUFFIX) > $(OBJDIR)clone3.out
+	$(DIFF) $(OBJDIR)clone3.reference $(OBJDIR)clone3.out
+	$(RM)   $(OBJDIR)clone3.reference $(OBJDIR)clone3.out
+
+exit_restartable_syscall.test: $(OBJDIR)exit_restartable_syscall_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)exit_restartable_syscall_app$(EXE_SUFFIX)
+
+syscall_time.test: $(OBJDIR)syscall_time$(PINTOOL_SUFFIX) $(THREAD_APP)
+	$(PIN) -assert_on_memory_conflict FIXED_ONLY -t $(OBJDIR)syscall_time$(PINTOOL_SUFFIX) \
+	  -- $(THREAD_APP) > $(OBJDIR)syscall_time.out 2>&1
+	$(RM) $(OBJDIR)syscall_time.out
+
+check_prctl.test: $(OBJDIR)check_prctl_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)check_prctl_app$(EXE_SUFFIX)
+
+ptrace_deny_attach.test: $(OBJDIR)ptrace_deny_attach_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)ptrace_deny_attach_app$(EXE_SUFFIX) > $(OBJDIR)ptrace_deny_attach.out 2>&1 
+	$(QGREP) "Application Finished" $(OBJDIR)ptrace_deny_attach.out
+	$(RM) $(OBJDIR)ptrace_deny_attach.out
+	
+set_syscall_return_and_errno_value.test: $(OBJDIR)set_syscall_return_and_errno_value$(PINTOOL_SUFFIX) $(OBJDIR)getsid_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)set_syscall_return_and_errno_value$(PINTOOL_SUFFIX)  \
+		-- $(OBJDIR)getsid_app$(EXE_SUFFIX) > $(OBJDIR)set_syscall_return_and_errno_value.out 2> $(OBJDIR)set_syscall_return_and_errno_value.err 
+	$(QGREP) "return = 0xdeadbeaf" $(OBJDIR)set_syscall_return_and_errno_value.out
+	$(QGREP) "errno = Invalid argument" $(OBJDIR)set_syscall_return_and_errno_value.out
+	$(RM) $(OBJDIR)set_syscall_return_and_errno_value.err $(OBJDIR)set_syscall_return_and_errno_value.out
+
+# This tests verifies that after a syscall instruction RCX holds the next instruction pointer and R11 holds RFLAGS for linux
+check_rcx_r11_return_value.test: $(OBJDIR)check_rcx_r11_return_value$(PINTOOL_SUFFIX) $(OBJDIR)signal_syscall_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)check_rcx_r11_return_value$(PINTOOL_SUFFIX) -- $(OBJDIR)signal_syscall_app$(EXE_SUFFIX)
+
+# This tests verifies that after a syscall instruction RCX holds the next instruction pointer and R11 holds RFLAGS for windows
+check_rcx_r11_return_value_win.test: $(OBJDIR)check_rcx_r11_return_value$(PINTOOL_SUFFIX) $(OBJDIR)windows_syscall_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)check_rcx_r11_return_value$(PINTOOL_SUFFIX) -- $(OBJDIR)windows_syscall_app$(EXE_SUFFIX)
+
+# This tests verifies NtContinue syscall emulation on windows
+check_ntcontinue_win.test: $(OBJDIR)windows_exception_ntcontinue_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)windows_exception_ntcontinue_app$(EXE_SUFFIX)
+
+# This test checks that the tool catches the app syscalls and translates their numbers to keys and get the right keys.
+# The app calls createThread and prints the created thread TID. 
+# In syscall exit callback in the tool, we check for NtCreateThread or NtCreateThreadEx using the SYSCALL_KEY and if found, also print the TID. 
+# Then, we check that tool found the syscall that created the same thread from the app.
+syscall_key_and_number.test: $(OBJDIR)windows_syscall_key_app$(EXE_SUFFIX) $(OBJDIR)windows_syscall_key_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)windows_syscall_key_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)syscall_key_and_number.log -- $(OBJDIR)windows_syscall_key_app$(EXE_SUFFIX)  > $(OBJDIR)windows_syscall_key_app.out 2>&1
+	THREAD_ID=$$(awk '/\[APP\] thread ID is/ {print $$NF}' $(OBJDIR)windows_syscall_key_app.out);
+	$(QGREP) 'tid is '"$$THREAD_ID"  $(OBJDIR)syscall_key_and_number.log
+	$(RM) $(OBJDIR)syscall_key_and_number.log $(OBJDIR)windows_syscall_key_app.out
+
+# This test runs the Ex syscall app natively and under Pin, then diffs the output to verify Pin preserves behavior
+# while the tool log confirms Ex syscall callbacks, or both sides agree on the unsupported-syscall skip path.
+ex_syscalls.test: $(OBJDIR)ex_syscalls_tool$(PINTOOL_SUFFIX) $(OBJDIR)ex_syscalls_app$(EXE_SUFFIX)
+	$(OBJDIR)ex_syscalls_app$(EXE_SUFFIX) > $(OBJDIR)ex_syscalls.reference
+	$(PIN) -t $(OBJDIR)ex_syscalls_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)ex_syscalls_tool.log -- \
+	  $(OBJDIR)ex_syscalls_app$(EXE_SUFFIX) > $(OBJDIR)ex_syscalls.out
+	$(DIFF) $(OBJDIR)ex_syscalls.reference $(OBJDIR)ex_syscalls.out
+	if $(QGREP) -q "PASSED: (skipped - Ex syscall exports unavailable)" $(OBJDIR)ex_syscalls.reference; then \
+	  :; \
+	elif $(QGREP) -q "PASSED: (skipped - Ex syscalls not supported)" $(OBJDIR)ex_syscalls.reference; then \
+	  $(QGREP) "SKIP: Ex map syscalls returned STATUS_NOT_SUPPORTED" $(OBJDIR)ex_syscalls_tool.log; \
+	else \
+	  $(QGREP) "SUCCESS: observed expected Ex syscalls" $(OBJDIR)ex_syscalls_tool.log; \
+	fi
+	$(RM) $(OBJDIR)ex_syscalls.reference $(OBJDIR)ex_syscalls.out $(OBJDIR)ex_syscalls_tool.log
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+###### Special applications' build rules ######
+
+$(OBJDIR)syscalls_and_locks_app$(EXE_SUFFIX): syscalls_and_locks_app.cpp
+	$(APP_CXX) $(APP_CXXFLAGS_NOOPT) $(COMP_EXE)$@ $< $(APP_LDFLAGS_NOOPT) $(APP_LIBS) $(CXX_LPATHS) $(CXX_LIBS)
+	
+$(OBJDIR)getsid_app$(EXE_SUFFIX): getsid_app.cpp
+		$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS)
+
+$(OBJDIR)windows_syscall_app$(EXE_SUFFIX): windows_syscall_app.cpp
+		$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS)
+
+$(OBJDIR)windows_exception_ntcontinue_app$(EXE_SUFFIX): windows_exception_ntcontinue_app.cpp
+		$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS)
+
+$(OBJDIR)dup23_app_jit$(EXE_SUFFIX): dup23_app.c
+	$(APP_CC) $(APP_CFLAGS) -DUSE_SYSCALLS $(COMP_EXE)$@ $^ $(APP_LDFLAGS)
+
+$(OBJDIR)dup23_app_probe$(EXE_SUFFIX): dup23_app.c
+	$(APP_CC) $(APP_CFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS)
+	
+$(OBJDIR)ex_syscalls_app$(EXE_SUFFIX): ex_syscalls_app.cpp
+		$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS)

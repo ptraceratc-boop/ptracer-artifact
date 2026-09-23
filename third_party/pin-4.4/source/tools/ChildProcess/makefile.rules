@@ -1,0 +1,1029 @@
+#
+# Copyright (C) 2012-2026 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS :=
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS := tool_logger_overwrite get_pin_cmd_line get_pin_cmd_line_mman get_pin_cmd_line_mman_no_value
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS := basic_tool get_pin_cmd_line_tool get_pin_cmd_line_child_tool
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS :=
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS := get_pin_cmd_line_app
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Place OS-specific definitions here ######
+
+# Linux
+ifeq ($(TARGET_OS),linux)
+    TEST_TOOL_ROOTS += fork_probed2 pind_fork
+    TEST_ROOTS += fork_hang badexec fork_jit sigchld bind_now follow_execv_with_config1 follow_execv_with_config2 \
+                  follow_execv_with_config3 apparmor unique_logfile injectparent selfexec selfexeclog sigchld2 \
+                  unix_launcher null_argument fork_probed vfork_probed fork_probed_static vfork_probed_static execve_errno \
+                  follow_execv_with_config1_probe follow_execv_with_config2_probe follow_execv_with_config3_probe \
+                  null_argument_probed parent_injection_ppid pind_fork_probed execveat_jit_tool tool_log_with_many_forks \
+                  tool_log_with_many_forks_probe tool_log_with_many_forks_and_execv
+	# execveat() system function is available in libc starting from GLIBC 2.34
+	GLIBC_GE_2_34 := $(shell $(TOOLS_ROOT)/Utils/testLibcVersion ge 2.34)
+	ifeq ($(LIBC_VERSION_GE_2_34),1)
+		TEST_ROOTS += execveat_probe_tool
+	endif
+    TOOL_ROOTS += fork_hang_tool fork_jit_tool fork_probed_tool follow_child unix_parent_tool null_arg_check_tool \
+                  simple_tool simple_fork_tool
+    APP_ROOTS += fork_hang_app fork_app vfork_app fork_app_static vfork_app_static parent_process child_process \
+                 injection_test_app sigchld_app null_check_app1 null_check_app2 bind_now_app badexec selfexec_app \
+                 fork_app2 parent_injection_ppid execveat_main_app execveat_execed_app many_forks_app
+    DLL_ROOTS += rpc_plugin
+endif
+
+# Windows
+ifeq ($(TARGET_OS),windows)
+    TEST_ROOTS += win_parent_process1 win_parent_process1_probed win_parent_process1_unicode_probed \
+                  win_parent_process2_jjj win_parent_process2_jjp win_parent_process2_jpj win_parent_process2_jpp \
+                  win_parent_process2_pjj win_parent_process2_pjp win_parent_process2_ppj win_parent_process2_ppp \
+                  win_parent_process2_unicode_ppp win_parent_process2_mt_ppp win_parent_process1_unicode_probed_withsym \
+                  win_early_termination win_early_termination_debugged win_early_termination_probed \
+                  win_early_termination_probed_debugged win_env_inheritance \
+				  win_followexecv_probe_no_syscall_discovery
+    TOOL_ROOTS += follow_child_3gen_tool follow_child_3gen_tool_initsym grand_parent_tool parent_tool follow_child_tool syscall_discovery_check_tool
+    APP_ROOTS += win_parent_process win_child_process win_launcher_process win_launcher_debugged_process win_launcher_process_list_app \
+                 win_early_termination win_parent_process_unicode win_parent_process_mt win_create_process_recursive 
+    DLL_ROOTS += win_terminate_process_dll
+endif
+
+###### Handle exceptions here (OS/arch related) ######
+
+ifeq ($(TARGET_OS),linux)
+    ifeq ($(shell $(TOOLS_ROOT)/Utils/testStaticLibs),1)
+        TEST_ROOTS := $(filter-out vfork_probed_static fork_probed_static, $(TEST_ROOTS))
+        APP_ROOTS := $(filter-out fork_app_static vfork_app_static , $(APP_ROOTS))
+    endif
+endif
+
+# The following tests are launched using shell scripts and therefore can't run on cross-architecture.
+ifeq ($(TARGET_OS),linux)
+    ifeq ($(HOST_ARCH),intel64)
+        ifeq ($(TARGET),ia32)
+            TEST_ROOTS := $(filter-out sigchld2 execve_errno, $(TEST_ROOTS))
+        endif
+    endif
+endif
+
+# Old GCC versions can't compile rscproto.h
+ifeq ($(TARGET_OS),linux)
+	GCC_VERSION_LE_4_8_5 := $(shell $(TOOLS_ROOT)/Utils/testToolVersion $(APP_CXXPATH) le 4.8.5)
+	ifeq ($(GCC_VERSION_LE_4_8_5),1)
+		TEST_TOOL_ROOTS := $(filter-out pind_fork, $(TEST_TOOL_ROOTS))
+		TEST_ROOTS := $(filter-out pind_fork_probed, $(TEST_ROOTS))
+		DLL_ROOTS := $(filter-out rpc_plugin, $(DLL_ROOTS))
+	endif
+endif
+
+RUNNABLE_TESTS := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+###### Handle exceptions here (bugs related) ######
+
+
+# See Mantis 2603
+ifeq ($(TARGET_OS),windows)
+    TEST_ROOTS := $(filter-out win_early_termination_debugged win_early_termination_probed_debugged, $(TEST_ROOTS))
+endif
+
+###### Define the serial subset ######
+
+# Defines which tests need to be run serially as may cause issues when running in parallel 
+
+# This is temporary until CrowdStrike is removed from from out lab machines. See PINT-6764.
+ifeq ($(TARGET_OS),windows)
+    SERIAL_SUBSET := win_parent_process2_mt_ppp
+endif
+
+###### Define the sanity subset ######
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+
+
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+ifeq ($(HOST_ARCH),intel64)
+    ifeq ($(TARGET),ia32)
+        # On Intel64 systems /bin/sh is 64 bit executable.
+        # To follow the process of /bin/sh on 32 bit test we need the 64 bit counterpart of the Pin tool.
+        UNIX_PARENT_TOOL_CROSS := obj-intel64/unix_parent_tool$(PINTOOL_SUFFIX)
+        UNIX_PARENT_TOOL_CROSS_KNOB := -t64 $(UNIX_PARENT_TOOL_CROSS)
+        NULL_CHECK_TOOL_CROSS := obj-intel64/null_arg_check_tool$(PINTOOL_SUFFIX)
+        NULL_CHECK_TOOL_CROSS_KNOB := -t64 $(NULL_CHECK_TOOL_CROSS)
+    endif
+endif
+
+FOLLOW_CHILD_3GEN_TOOL_CROSS_64 := obj-intel64/follow_child_3gen_tool$(PINTOOL_SUFFIX)
+FOLLOW_CHILD_3GEN_TOOL_CROSS_64_KNOB := -t64 $(FOLLOW_CHILD_3GEN_TOOL_CROSS_64)
+FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_64 := obj-intel64/follow_child_3gen_tool_initsym$(PINTOOL_SUFFIX)
+FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_64_KNOB := -t64 $(FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_64)
+GRAND_PARENT_TOOL_CROSS_64 := obj-intel64/grand_parent_tool$(PINTOOL_SUFFIX)
+GRAND_PARENT_TOOL_CROSS_64_KNOB := -t64 $(GRAND_PARENT_TOOL_CROSS_64)
+
+FOLLOW_CHILD_3GEN_TOOL_CROSS_32 := obj-ia32/follow_child_3gen_tool$(PINTOOL_SUFFIX)
+FOLLOW_CHILD_3GEN_TOOL_CROSS_32_KNOB := -t $(FOLLOW_CHILD_3GEN_TOOL_CROSS_32)
+FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_32 := obj-ia32/follow_child_3gen_tool_initsym$(PINTOOL_SUFFIX)
+FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_32_KNOB := -t $(FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_32)
+GRAND_PARENT_TOOL_CROSS_32 := obj-ia32/grand_parent_tool$(PINTOOL_SUFFIX)
+GRAND_PARENT_TOOL_CROSS_32_KNOB := -t $(GRAND_PARENT_TOOL_CROSS_32)
+
+ifeq (Cygwin, $(SHELL_TYPE))
+    TOOLS_PATH := $(shell cygpath -a -m $(OBJDIR))
+else
+	TOOLS_PATH := $(realpath $(OBJDIR))
+endif
+
+injectparent.test: $(OBJDIR)injection_test_app$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)injection_test_app$(EXE_SUFFIX) pa_file
+
+fork_jit.test: $(OBJDIR)fork_jit_tool$(PINTOOL_SUFFIX) $(OBJDIR)fork_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)fork_jit_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)fork_jit.out -- $(OBJDIR)fork_app$(EXE_SUFFIX)
+	$(QGREP) "correct in child process" $(OBJDIR)fork_jit.out*
+	$(QGREP) "correct in parent process" $(OBJDIR)fork_jit.out*
+	$(RM) $(OBJDIR)fork_jit.out*
+
+fork_probed.test: $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) $(OBJDIR)fork_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)fork_probed.out -- $(OBJDIR)fork_app$(EXE_SUFFIX)
+	$(QGREP) "After fork in parent" $(OBJDIR)fork_probed.out*
+	$(QGREP) "After fork in child" $(OBJDIR)fork_probed.out*
+	$(RM) $(OBJDIR)fork_probed.out*
+
+vfork_probed.test: $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) $(OBJDIR)vfork_app$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+	$(PIN) -follow_execv -t $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)vfork_probed.out \
+	  --  $(OBJDIR)vfork_app$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+	$(QGREP) Before $(OBJDIR)vfork_probed.out*
+	$(QGREP) "After fork in parent" $(OBJDIR)vfork_probed.out*
+	$(QGREP) "After fork in child" $(OBJDIR)vfork_probed.out*
+	$(QGREP) "At follow child callback in child process" $(OBJDIR)vfork_probed.out*
+	$(QGREP) "At follow child callback in parent process" $(OBJDIR)vfork_probed.out*
+	$(RM) -f $(OBJDIR)vfork_probed.out*
+
+fork_probed_static.test: $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) $(OBJDIR)fork_app_static$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)fork_probed_static.out*
+	$(PIN) -t $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)fork_probed_static.out \
+	  -- $(OBJDIR)fork_app_static$(EXE_SUFFIX)
+	$(QGREP) "After fork in parent" $(OBJDIR)fork_probed_static.out*
+	$(QGREP) "After fork in child" $(OBJDIR)fork_probed_static.out*
+	$(RM) $(OBJDIR)fork_probed_static.out*
+
+vfork_probed_static.test: $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) $(OBJDIR)vfork_app_static$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)vfork_probed_static.out*
+	$(PIN) -follow_execv -t $(OBJDIR)fork_probed_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)vfork_probed_static.out \
+	  --  $(OBJDIR)vfork_app_static$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+	$(QGREP) Before $(OBJDIR)vfork_probed_static.out*
+	$(QGREP) "After fork in parent" $(OBJDIR)vfork_probed_static.out*
+	$(QGREP) "After fork in child" $(OBJDIR)vfork_probed_static.out*
+	$(RM) -f  $(OBJDIR)vfork_probed_static.out*
+
+fork_probed2.test: $(OBJDIR)fork_probed2$(PINTOOL_SUFFIX) $(OBJDIR)fork_app2$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)fork_probed2.out*
+	$(PIN) -t $(OBJDIR)fork_probed2$(PINTOOL_SUFFIX) -o $(OBJDIR)fork_probed2.out -- $(OBJDIR)fork_app2$(EXE_SUFFIX)
+	$(QGREP) "After fork in parent" $(OBJDIR)fork_probed2.out*
+	$(QGREP) "After fork in child" $(OBJDIR)fork_probed2.out*
+	$(RM) $(OBJDIR)fork_probed2.out*
+
+pind_fork.test: $(OBJDIR)pind_fork$(PINTOOL_SUFFIX) $(OBJDIR)fork_app$(EXE_SUFFIX) $(OBJDIR)rpc_plugin$(DLL_SUFFIX)
+	# Run pin on an application that forks once - check that pind created a process for each forked child
+	$(PIN) -rpc_plugin rpc_plugin_config.json -t $(OBJDIR)pind_fork$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:.test=.out) -- $(OBJDIR)fork_app$(EXE_SUFFIX)
+	# Verify we had remote::do_rpc calls made from two different processes in pin & pind
+	$(GREP) "SUCCESS: remote::do_rpc< TEST_SCHEMA >()" $(OBJDIR)$(@:.test=.out) |sort|uniq|cut -d ' ' -f 9|uniq|wc --lines|$(QGREP) 2
+	$(RM) -f $(OBJDIR)$(@:.test=.out)
+
+pind_fork_probed.test: $(OBJDIR)pind_fork$(PINTOOL_SUFFIX) $(OBJDIR)fork_app$(EXE_SUFFIX) $(OBJDIR)rpc_plugin$(DLL_SUFFIX)
+	# Run pin on an application that forks once - check that pind created a process for each forked child
+	$(PIN) -probe -rpc_plugin rpc_plugin_config.json -t $(OBJDIR)pind_fork$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:.test=.out) -- $(OBJDIR)fork_app$(EXE_SUFFIX)
+	# Verify we had remote::do_rpc calls made from two different processes in pin & pind
+	$(GREP) "SUCCESS: remote::do_rpc< TEST_SCHEMA >()" $(OBJDIR)$(@:.test=.out) |sort|uniq|cut -d ' ' -f 9|uniq|wc --lines|$(QGREP) 2
+	$(RM) -f $(OBJDIR)$(@:.test=.out)
+
+sigchld.test: $(OBJDIR)sigchld_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv -- $(OBJDIR)sigchld_app$(EXE_SUFFIX)
+	$(DIFF) sigchld_app.out sigchld_app.reference
+
+sigchld2.test: $(OBJDIR)simple_tool$(PINTOOL_SUFFIX) uname_script.sh
+	$(PIN) -follow_execv -t $(OBJDIR)simple_tool$(PINTOOL_SUFFIX) -probe \
+	  -- ./uname_script.sh $(OBJDIR)sigchld2.out 
+	uname -s > $(OBJDIR)uname_expected.out
+	$(CMP) $(OBJDIR)uname_expected.out $(OBJDIR)sigchld2.out
+	$(RM) -f $(OBJDIR)uname_expected.out $(OBJDIR)sigchld2.out
+
+fork_hang.test: $(OBJDIR)fork_hang_tool$(PINTOOL_SUFFIX) $(OBJDIR)fork_hang_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv -t $(OBJDIR)fork_hang_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)fork_hang_app$(EXE_SUFFIX) 
+
+# (1) do not run child under the Pin
+follow_execv_with_config1.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)$(@:test=tool.out) -app ./child_process_xxx \
+	    -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)$(@:test=app.out)
+	## child_process_xxx is not equal to child_process, do not run child under Pin at all
+	$(QGREP) "Do not run Pin under the child process" $(OBJDIR)$(@:test=tool.out)
+	## unix_parent_tool should appear 1 time in the output since it was used in parent only
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)$(@:test=tool.out)` -eq "1"
+	## Verify child was executed natively
+	$(QGREP) "Child report:" $(OBJDIR)$(@:test=app.out)
+	$(RM) $(OBJDIR)$(@:test=app.out) $(OBJDIR)$(@:test=tool.out)
+
+# (1-probe) do not run child under the Pin
+follow_execv_with_config1_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_with_config1_probe.tool.out -xyzzy -probe -app ./child_process_xxx \
+	    -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_execv_with_config1_probe.app.out
+	## child_process_xxx is not equal to child_process, do not run child under Pin at all
+	$(QGREP) "Do not run Pin under the child process" $(OBJDIR)follow_execv_with_config1_probe.tool.out
+	## unix_parent_tool should appear 1 time in the output since it was used in parent only
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_with_config1_probe.tool.out` -eq "1"
+	## Verify child was executed natively
+	$(QGREP) "Child report:" $(OBJDIR)follow_execv_with_config1_probe.app.out
+	$(RM) -f $(OBJDIR)follow_execv_with_config1_probe.tool.out $(OBJDIR)follow_execv_with_config1_probe.app.out
+
+# (2) run child under the Pin, but don't change Pin command line
+follow_execv_with_config2.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_with_config2.tool.out -xyzzy -app $(OBJDIR)child_process$(EXE_SUFFIX) \
+	    -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_execv_with_config2.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_execv_with_config2.tool.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_with_config2.tool.out` -eq "2"
+	$(QGREP) "ParentEnv=1" $(OBJDIR)follow_execv_with_config2.app.out
+	$(RM) $(OBJDIR)follow_execv_with_config2.tool.out $(OBJDIR)follow_execv_with_config2.app.out
+
+# (2-probe) run child under the Pin, but don't change Pin command line
+follow_execv_with_config2_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_with_config2_probe.tool.out -xyzzy -probe -app $(OBJDIR)child_process$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_execv_with_config2_probe.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_execv_with_config2_probe.tool.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_with_config2_probe.tool.out` -eq "2"
+	$(RM) $(OBJDIR)follow_execv_with_config2_probe.app.out $(OBJDIR)follow_execv_with_config2_probe.tool.out
+
+# (3) run child under the Pin, and change Pin command line
+follow_execv_with_config3.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) $(OBJDIR)follow_child$(PINTOOL_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_with_config3.tool.out -xyzzy -app $(OBJDIR)child_process$(EXE_SUFFIX) \
+	    -pin "$(PIN) -t $(OBJDIR)follow_child$(PINTOOL_SUFFIX) -o $(OBJDIR)follow_execv_with_config3.childtool.out" \
+	      -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	        > $(OBJDIR)follow_execv_with_config3.app.out
+	## change Pin command line
+	$(QGREP) "Process to execute" $(OBJDIR)follow_execv_with_config3.tool.out
+	## unix_parent_tool should appear 1 time in the output since it was used in the parent only
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_with_config3.tool.out` -eq "1"
+	## follow_child tool should appear 1 time in the output since it was used in the child only
+	$(BASHTEST) `$(CGREP) "In follow_child PinTool" $(OBJDIR)follow_execv_with_config3.childtool.out` -eq "1"
+	$(RM) $(OBJDIR)follow_execv_with_config3.tool.out $(OBJDIR)follow_execv_with_config3.app.out \
+	  $(OBJDIR)follow_execv_with_config3.childtool.out
+
+# (3-probe) run child under the Pin, and change Pin command line
+follow_execv_with_config3_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) $(OBJDIR)follow_child$(PINTOOL_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)$(@:test=tool.out) -xyzzy -probe -app $(OBJDIR)child_process$(EXE_SUFFIX) \
+	    -pin "$(PIN) -t ./$(OBJDIR)follow_child$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=childtool.out)" \
+	      -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	        > $(OBJDIR)$(@:test=app.out)
+	## change Pin command line
+	$(QGREP) "Process to execute" $(OBJDIR)$(@:test=tool.out)
+	## unix_parent_tool should appear 1 time in the output since it was used in the parent only
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)$(@:test=tool.out)` -eq "1"
+	## follow_child tool should appear 1 time in the output since it was used in the child only
+	$(BASHTEST) `$(CGREP) "In follow_child PinTool" $(OBJDIR)$(@:test=childtool.out) ` -eq "1"
+	$(RM) $(OBJDIR)$(@:test=*.out)
+
+# Test CHILD_PROCESS_GetPinCommandLine API: get pin cmd line, replace tool, verify, run child with new tool
+get_pin_cmd_line.test: $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) $(OBJDIR)get_pin_cmd_line_child_tool$(PINTOOL_SUFFIX) $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool.out $(OBJDIR)get_pin_cmd_line_child_tool.out
+	$(PIN) -follow_execv 1 -t $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)get_pin_cmd_line_tool.out \
+	  -child_tool $(OBJDIR)get_pin_cmd_line_child_tool$(PINTOOL_SUFFIX) \
+	  -child_tool_output $(OBJDIR)get_pin_cmd_line_child_tool.out \
+	    -- $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX) 1
+	## Tool A: verify modified Pin command line matches what was set
+	$(QGREP) "Modified command line matches expected: yes" $(OBJDIR)get_pin_cmd_line_tool.out
+	## Tool B: verify Pin command line in child matches what Tool A set
+	$(QGREP) "Pin command line argc matches expected: yes" $(OBJDIR)get_pin_cmd_line_child_tool.out
+	$(QGREP) "Pin command line content matches expected: yes" $(OBJDIR)get_pin_cmd_line_child_tool.out
+	## Tool B: verify child tool ran successfully
+	$(QGREP) "get_pin_cmd_line_child_tool ran successfully" $(OBJDIR)get_pin_cmd_line_child_tool.out
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool.out $(OBJDIR)get_pin_cmd_line_child_tool.out
+
+ifeq ($(TARGET),ia32)
+    FOLLOW_CHILD_PIN_MEMORY_RANGE := 0x10000000:0x30000000
+else
+    FOLLOW_CHILD_PIN_MEMORY_RANGE := 0x20Bad0000:0x26Bad0000
+endif
+FOLLOW_CHILD_RESTRICT_MEMORY_RANGE := 0x40000000:0x40010000
+# Test CHILD_PROCESS_GetPinCommandLine API: Make sure MMAN knobs get removed from Pin command line before the callback
+get_pin_cmd_line_mman.test: $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool_for_mman.out
+	## This test ends after validating the callback; get_pin_cmd_line.test covers reinjecting the child.
+	$(PIN) -follow_execv 1 -pin_memory_range $(FOLLOW_CHILD_PIN_MEMORY_RANGE) -pin_memory_size 0 \
+	  -cc_memory_size 0x01000000 -restrict_memory $(FOLLOW_CHILD_RESTRICT_MEMORY_RANGE) \
+	  -enforce_pin_range_allocations 0 -t $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)get_pin_cmd_line_tool_for_mman.out -run_child_under_pin 0 \
+	  -child_tool $(OBJDIR)get_pin_cmd_line_child_tool$(PINTOOL_SUFFIX) \
+	  -child_tool_output $(OBJDIR)get_pin_cmd_line_child_tool.out \
+	    -- $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX) 2
+	## Tool A: verify MMAN knobs were removed before the callback
+	$(QGREP) "MMAN knobs removed from follow-child callback: yes" $(OBJDIR)get_pin_cmd_line_tool_for_mman.out
+	## Tool A: verify modified Pin command line matches what was set
+	$(QGREP) "Modified command line matches expected: yes" $(OBJDIR)get_pin_cmd_line_tool_for_mman.out
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool_for_mman.out
+
+# Verify that removing a valueless boolean MMAN knob does not remove the following Pin knob.
+get_pin_cmd_line_mman_no_value.test: $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool_for_mman_no_value.out
+	## The tool asserts that -follow_execv, placed immediately after the valueless MMAN knob, reaches the callback.
+	$(PIN) -pin_memory_range $(FOLLOW_CHILD_PIN_MEMORY_RANGE) -pin_memory_size 0 \
+	  -cc_memory_size 0x01000000   -enforce_pin_range_allocations -follow_execv 1 -t $(OBJDIR)get_pin_cmd_line_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)get_pin_cmd_line_tool_for_mman_no_value.out -run_child_under_pin 0 \
+	  -child_tool $(OBJDIR)get_pin_cmd_line_child_tool$(PINTOOL_SUFFIX) \
+	  -child_tool_output $(OBJDIR)get_pin_cmd_line_child_tool.out \
+	    -- $(OBJDIR)get_pin_cmd_line_app$(EXE_SUFFIX) 2
+	## Reaching this output proves that the following -follow_execv knob was preserved.
+	$(QGREP) "MMAN knobs removed from follow-child callback: yes" $(OBJDIR)get_pin_cmd_line_tool_for_mman_no_value.out
+	$(QGREP) "Modified command line matches expected: yes" $(OBJDIR)get_pin_cmd_line_tool_for_mman_no_value.out
+	$(RM) -f $(OBJDIR)get_pin_cmd_line_tool_for_mman_no_value.out
+
+# This test checks the execveat system call handling at JIT mode with follow_execv option set or not.
+# The main application calls execveat to launch the child application.
+# It includes 15 different tests, some positive flows (execveat should succeed) and some negative flows.
+# The tool verifies that the Fini function is called in the tool when follow_execv is enabled.
+execveat_jit_tool.test: $(OBJDIR) $(OBJDIR)execveat_jit_tool$(PINTOOL_SUFFIX) $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX)
+	# tests with follow_execv enabled
+	@for i in $$(seq 1 15); do \
+		set -x; \
+		echo "Running execveat_jit_tool test $$i with follow_execv enabled"; \
+		$(PIN) -xyzzy -follow_execv 1 -t $(OBJDIR)execveat_jit_tool$(PINTOOL_SUFFIX) \
+		-- $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX) $$i > $(OBJDIR)execveat_jit_tool_test.out || \
+		{ echo "test $$i failed"; exit 1; }; \
+		$(BASHTEST) `$(CGREP) "JIT Fini called" $(OBJDIR)execveat_jit_tool_test.out ` -eq "1" || { echo "no JIT Fini output in test $$i"; exit 1; }; \
+		set +x; \
+	done
+	# tests with follow_execv disabled
+	@for i in $$(seq 1 15); do \
+		set -x; \
+		echo "Running execveat_jit_tool test $$i with follow_execv disabled"; \
+		$(PIN) -xyzzy -t $(OBJDIR)execveat_jit_tool$(PINTOOL_SUFFIX) \
+		-- $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX) $$i > $(OBJDIR)execveat_jit_tool_test.out || \
+		{ echo "test $$i failed"; exit 1; }; \
+		set +x; \
+	done
+	$(RM) $(OBJDIR)execveat_jit_tool_test.out
+
+# This test checks the execveat system call handling at probe mode with follow_execv option set or not.
+# The main application calls execveat to launch the child application.
+# It includes 15 different tests, some positive flows (execveat should succeed) and some negative flows.
+# The tool verifies that the Fini function is called in the tool when follow_execv is enabled.
+execveat_probe_tool.test: $(OBJDIR) $(OBJDIR)execveat_probe_tool$(PINTOOL_SUFFIX) $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX)
+	# tests with follow_execv enabled
+	@for i in $$(seq 1 15); do \
+		echo "Running execveat_probe_tool test $$i with follow_execv enabled"; \
+		$(PIN) -xyzzy -follow_execv 1 -t $(OBJDIR)execveat_probe_tool$(PINTOOL_SUFFIX) \
+		-- $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX) $$i > $(OBJDIR)execveat_probe_tool_test.out || \
+		{ echo "test $$i failed"; exit 1; }; \
+		$(BASHTEST) `$(CGREP) "Probe Fini called" $(OBJDIR)execveat_probe_tool_test.out` -eq "1" || { echo "no Probe Fini output in test $$i"; exit 1; }; \
+	done
+	# tests with follow_execv disabled
+	@for i in $$(seq 1 15); do \
+		echo "Running execveat_probe_tool test $$i with follow_execv disabled"; \
+		$(PIN) -xyzzy -t $(OBJDIR)execveat_probe_tool$(PINTOOL_SUFFIX) \
+		-- $(OBJDIR)execveat_main_app$(EXE_SUFFIX) $(OBJDIR)execveat_execed_app$(EXE_SUFFIX) $$i > $(OBJDIR)execveat_probe_tool_test.out || \
+		{ echo "test $$i failed"; exit 1; }; \
+	done
+	$(RM) $(OBJDIR)execveat_probe_tool_test.out
+
+follow_posix_spawn.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_posix_spawn.tool.out -xyzzy -app $(OBJDIR)child_process$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_posix_spawn.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_posix_spawn.tool.out
+	$(QGREP) "Child report: The process works correctly" $(OBJDIR)follow_posix_spawn.app.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_posix_spawn.tool.out` -eq "2"
+	$(RM) $(OBJDIR)follow_posix_spawn.app.out $(OBJDIR)follow_posix_spawn.tool.out
+
+follow_posix_spawn_badexec.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_spawn$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_posix_spawn_badexec.tool.out -xyzzy -app $(OBJDIR)child_process_xxx$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process_xxx$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_posix_spawn_badexec.app.out
+	$(QGREP) "posix_spawn failed with errno 2" $(OBJDIR)follow_posix_spawn_badexec.app.out
+	$(RM) $(OBJDIR)follow_posix_spawn_badexec.app.out $(OBJDIR)follow_posix_spawn_badexec.tool.out
+
+follow_posix_spawn_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_posix_spawn_probe.tool.out -xyzzy -probe -app $(OBJDIR)child_process$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_posix_spawn_probe.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_posix_spawn_probe.tool.out
+	$(QGREP) "Child report: The process works correctly" $(OBJDIR)follow_posix_spawn_probe.app.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_posix_spawn_probe.tool.out` -eq "2"
+	$(RM) $(OBJDIR)follow_posix_spawn_probe.app.out $(OBJDIR)follow_posix_spawn_probe.tool.out
+
+follow_posix_spawn_probe_badexec.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_spawn$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_posix_spawn_probe_badexec.tool.out -xyzzy -probe -app $(OBJDIR)child_process_xxx$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_spawn$(EXE_SUFFIX) $(OBJDIR)child_process_xxx$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_posix_spawn_probe_badexec.app.out
+	$(QGREP) "posix_spawn failed with errno 2" $(OBJDIR)follow_posix_spawn_probe_badexec.app.out
+	$(RM) $(OBJDIR)follow_posix_spawn_probe_badexec.app.out $(OBJDIR)follow_posix_spawn_probe_badexec.tool.out
+
+follow_posix_spawn2.test:  $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_spawn2$(EXE_SUFFIX) $(TESTAPP)
+	$(CP) $(TESTAPP) $(OBJDIR)"App With Space"$(EXE_SUFFIX)
+	$(OBJDIR)parent_process_spawn2$(EXE_SUFFIX) $(OBJDIR)"App With Space"$(EXE_SUFFIX) > $(OBJDIR)follow_posix_spawn2.reference
+	$(PIN) -probe -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)follow_posix_spawn2.out -app ALL \
+	  -- $(OBJDIR)parent_process_spawn2$(EXE_SUFFIX) $(OBJDIR)"App With Space"$(EXE_SUFFIX) > $(OBJDIR)follow_posix_spawn2_probe.out
+	$(DIFF) $(OBJDIR)follow_posix_spawn2.reference $(OBJDIR)follow_posix_spawn2_probe.out
+	$(RM) $(OBJDIR)follow_posix_spawn2_probe.out 
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) -o $(OBJDIR)follow_posix_spawn2.out -app ALL \
+	  -- $(OBJDIR)parent_process_spawn2$(EXE_SUFFIX) $(OBJDIR)"App With Space"$(EXE_SUFFIX) > $(OBJDIR)follow_posix_spawn2_jit.out
+	$(DIFF) $(OBJDIR)follow_posix_spawn2.reference $(OBJDIR)follow_posix_spawn2_jit.out
+	$(RM) $(OBJDIR)"App With Space"$(EXE_SUFFIX) $(OBJDIR)follow_posix_spawn2.out $(OBJDIR)follow_posix_spawn2.reference \
+	  $(OBJDIR)follow_posix_spawn2_jit.out
+
+follow_popen.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_popen$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) $(UNIX_PARENT_TOOL_CROSS)
+	$(PIN) -follow_execv 1 $(UNIX_PARENT_TOOL_CROSS_KNOB) -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_popen.tool.out -xyzzy -app ALL -- \
+	    $(OBJDIR)parent_process_popen$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_popen.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_popen.tool.out
+	$(QGREP) "yltcerroc skrow ssecorp ehT :troper dlihC" $(OBJDIR)follow_popen.app.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_popen.tool.out` -eq "2"
+	$(RM) $(OBJDIR)follow_popen.app.out $(OBJDIR)follow_popen.tool.out
+
+follow_popen_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_popen$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) $(UNIX_PARENT_TOOL_CROSS)
+	$(PIN) -follow_execv 1 $(UNIX_PARENT_TOOL_CROSS_KNOB) -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_popen_probe.tool.out -xyzzy -probe -app ALL -- \
+	    $(OBJDIR)parent_process_popen$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_popen_probe.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_popen_probe.tool.out
+	$(QGREP) "yltcerroc skrow ssecorp ehT :troper dlihC" $(OBJDIR)follow_popen_probe.app.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_popen_probe.tool.out` -eq "2"
+	$(RM) $(OBJDIR)follow_popen_probe.app.out $(OBJDIR)follow_popen_probe.tool.out
+
+follow_execv_waitpid_bug.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_waitpid_bug$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_waitpid_bug.tool.out -xyzzy -app $(OBJDIR)child_process$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_waitpid_bug$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_execv_waitpid_bug.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_execv_waitpid_bug.tool.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_waitpid_bug.tool.out` -eq "3"
+	$(RM) $(OBJDIR)follow_execv_waitpid_bug.app.out $(OBJDIR)follow_execv_waitpid_bug.tool.out
+
+follow_execv_waitpid_bug_probe.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_process_waitpid_bug$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) \
+	  -o $(OBJDIR)follow_execv_waitpid_bug_probe.tool.out -xyzzy -probe -app $(OBJDIR)child_process$(EXE_SUFFIX) -- \
+	    $(OBJDIR)parent_process_waitpid_bug$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)follow_execv_waitpid_bug_probe.app.out
+	## -app argument is equal to application name, run the child process under the Pin
+	$(QGREP) "Pin command line remains unchanged" $(OBJDIR)follow_execv_waitpid_bug_probe.tool.out
+	## unix_parent_tool should appear 2 times in the output since it was used in the parent and in the child
+	$(BASHTEST) `$(CGREP) "In unix_parent_tool PinTool" $(OBJDIR)follow_execv_waitpid_bug_probe.tool.out` -eq "3"
+	$(RM) $(OBJDIR)follow_execv_waitpid_bug_probe.app.out $(OBJDIR)follow_execv_waitpid_bug_probe.tool.out
+
+# launcher runs parent_process twice; parent_process runs child_process
+unix_launcher.test: $(OBJDIR)follow_child$(PINTOOL_SUFFIX) $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) parent_process_launcher.sh
+	$(SH) ./parent_process_launcher.sh $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) \
+	  > $(OBJDIR)unix_launcher.reference
+	-$(PIN) -follow_execv 1 -t $(OBJDIR)follow_child$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=tool.out) \
+	  -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) > $(OBJDIR)$(@:test=app.out)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)follow_child$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=tool.out) \
+	  -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	    >> $(OBJDIR)$(@:test=app.out)
+	$(DIFF) $(OBJDIR)$(@:test=app.out) $(OBJDIR)unix_launcher.reference
+	## PinTool should appear 4 times: 
+	## parent_process - 2 child_process - 2
+	$(BASHTEST) `$(CGREP) PinTool $(OBJDIR)$(@:test=tool.out)` -eq "4"
+	$(RM) $(OBJDIR)$(@:test=*.out) $(OBJDIR)unix_launcher.reference
+
+selfexec.test: $(OBJDIR)selfexec_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -- $(OBJDIR)selfexec_app$(EXE_SUFFIX) > $(OBJDIR)selfexec.out
+	$(QGREP) "Number of recursive calls" $(OBJDIR)selfexec.out
+	$(RM) $(OBJDIR)selfexec.out
+
+selfexeclog.test: $(OBJDIR)selfexec_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv 1 -xyzzy -mesgon log_syscall -logfile $(OBJDIR)selfexeclog.log \
+	  -- $(OBJDIR)selfexec_app$(EXE_SUFFIX) > $(OBJDIR)selfexeclog.out
+	$(QGREP) "Number of recursive calls" $(OBJDIR)selfexeclog.out
+	$(RM) $(OBJDIR)selfexeclog.out $(OBJDIR)selfexeclog.log
+
+# Execve with 0 in second argument execv(app, NULL)
+null_argument.test: $(OBJDIR)null_arg_check_tool$(PINTOOL_SUFFIX) $(OBJDIR)null_check_app1$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX) $(NULL_CHECK_TOOL_CROSS)
+	$(PIN) -follow_execv 1 $(NULL_CHECK_TOOL_CROSS_KNOB) -t $(OBJDIR)null_arg_check_tool$(PINTOOL_SUFFIX) \
+	  -- $(OBJDIR)null_check_app1$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+
+null_argument_probed.test: $(OBJDIR)null_arg_check_tool$(PINTOOL_SUFFIX) $(OBJDIR)null_check_app1$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX) $(NULL_CHECK_TOOL_CROSS)
+	$(PIN) -follow_execv 1 -probe $(NULL_CHECK_TOOL_CROSS_KNOB) -t $(OBJDIR)null_arg_check_tool$(PINTOOL_SUFFIX) \
+	  -- $(OBJDIR)null_check_app1$(EXE_SUFFIX) $(OBJDIR)null_check_app2$(EXE_SUFFIX)
+
+# Execve fails and returns with error code
+badexec.test: $(OBJDIR)badexec$(EXE_SUFFIX)
+	$(OBJDIR)badexec$(EXE_SUFFIX) > $(OBJDIR)badexec.reference
+	$(PIN) -xyzzy -follow_execv 1 -- $(OBJDIR)badexec$(EXE_SUFFIX) > $(OBJDIR)badexec.out 2>&1
+	$(DIFF) $(OBJDIR)badexec.out $(OBJDIR)badexec.reference
+	$(RM) $(OBJDIR)badexec.out $(OBJDIR)badexec.reference 
+
+# Execve fails and and sets errno
+# Bash checks errno value after execve return
+execve_errno.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) 1.sh 2.sh
+	$(PIN) -follow_execv -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) -o $(@:test=tool.out) -probe -app "$(SH) ./2.sh" \
+	  -- $(SH) ./1.sh > $(@:test=app.out) 2>&1
+	$(QGREP) SUCCESS $(@:test=app.out)
+	$(RM) $(@:test=*.out)
+
+parent_injection_ppid.test: $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)child_injection_ppid$(EXE_SUFFIX)
+	$(PIN) -xyzzy -follow_execv -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) -o $(@:test=tool.out) \
+	  -probe -app ALL -- $(OBJDIR)child_injection_ppid$(EXE_SUFFIX)
+	$(PIN) -xyzzy -follow_execv -t $(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX) -o $(@:test=tool.out) \
+	  -app ALL -- $(OBJDIR)child_injection_ppid$(EXE_SUFFIX)
+
+# Test for getpid() inside Pin; -unique_logfile calls to getpid()
+# Also test -unique_logfile (creation of unique log files) (in both child injection and in parent injection). 
+# Comparing number of files might be too strict (might use -gt instead)
+unique_logfile.test: $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)unique_logfile.log.*
+	$(PIN) -follow_execv 1 -xyzzy -mesgon log_injector -logfile $(OBJDIR)unique_logfile.log -unique_logfile \
+	    -- $(OBJDIR)parent_process$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) "param1 param2" param3 \
+	      > $(OBJDIR)unique_logfile.out
+	$(BASHTEST) `ls $(OBJDIR)unique_logfile.log.* | $(LINECOUNT)` -eq 2
+	$(RM) $(OBJDIR)unique_logfile.log.* $(OBJDIR)unique_logfile.out
+
+# Test for LD_BIND_NOW
+bind_now.test: $(OBJDIR)bind_now_app$(EXE_SUFFIX)
+	$(PIN) -follow_execv -- $(OBJDIR)bind_now_app$(EXE_SUFFIX) -child > $(OBJDIR)bind_now.out 2>&1
+	$(RM) $(OBJDIR)bind_now.out
+
+# Test for Pin injection in application guarded by AppArmor
+apparmor.test:
+	if $(BASHTEST) -f /etc/apparmor.d/bin.netstat && $(BASHTEST) -f /bin/netstat ; then \
+	  $(PIN) -- netstat -g > $(OBJDIR)apparmor.out 2>&1 || $(GREP) AppArmor $(OBJDIR)apparmor.out; \
+	  $(RM) $(OBJDIR)apparmor.out; \
+	fi
+	if $(BASHTEST) -f /etc/apparmor.d/usr.sbin.nscd && $(BASHTEST) -f /usr/sbin/nscd ; then \
+	  $(PIN) -- /usr/sbin/nscd -V > $(OBJDIR)apparmor.out 2>&1 || $(GREP) AppArmor $(OBJDIR)apparmor.out; \
+	  $(RM) $(OBJDIR)apparmor.out; \
+	fi
+
+ENV_PARENT_LOG :=  $(OBJDIR)EnvInheritanceParent.log
+ENV_CHILD_LOG :=  $(OBJDIR)EnvInheritanceChild.log
+ENV_GRANDCHILD_LOG :=  $(OBJDIR)EnvInheritanceGrandchild.log
+win_env_inheritance.test: $(OBJDIR) $(OBJDIR)win_env_inheritance$(PINTOOL_SUFFIX) $(OBJDIR)win_create_process_recursive$(EXE_SUFFIX)
+	$(RM) -f $(ENV_PARENT_LOG) $(ENV_CHILD_LOG) $(ENV_GRANDCHILD_LOG)
+	$(PIN) -follow_execv -t $(OBJDIR)win_env_inheritance$(PINTOOL_SUFFIX) \
+	  -parentEnvLog $(ENV_PARENT_LOG) -childEnvLog $(ENV_CHILD_LOG) -grandChildEnvLog $(ENV_GRANDCHILD_LOG)\
+	    -- $(OBJDIR)win_create_process_recursive.exe -currentGeneration 1 -totalGenerations 3 \
+	    > $(OBJDIR)win_env_inheritance.out 2>&1
+	$(QGREP) "Parent process finished successfully" $(OBJDIR)win_env_inheritance.out 
+	$(SORT) -o $(ENV_PARENT_LOG) $(ENV_PARENT_LOG)
+	$(SORT) -o $(ENV_CHILD_LOG) $(ENV_CHILD_LOG)
+	$(SORT) -o $(ENV_GRANDCHILD_LOG) $(ENV_GRANDCHILD_LOG)
+	# Remove the __injector_* and __pinos_* variables which have special PIN values
+	$(GREP) -v "__injector_\|__pinos_" $(ENV_CHILD_LOG) > $(OBJDIR)K0
+	$(GREP) -v "__injector_\|__pinos_" $(ENV_PARENT_LOG) > $(OBJDIR)K1
+	$(GREP) -v "__injector_\|__pinos_" $(ENV_GRANDCHILD_LOG) > $(OBJDIR)K2
+	$(CP) $(OBJDIR)K0 $(ENV_CHILD_LOG)
+	$(CP) $(OBJDIR)K1 $(ENV_PARENT_LOG)
+	$(CP) $(OBJDIR)K2 $(ENV_GRANDCHILD_LOG)	$(eval PARENT_CHILD_DIFF:= $(DIFF) -y --suppress-common-lines $(ENV_PARENT_LOG) $(ENV_CHILD_LOG))
+	$(eval CHILD_GCHILD_DIFF:= $(DIFF) -y --suppress-common-lines $(ENV_CHILD_LOG) $(ENV_GRANDCHILD_LOG))	
+	$(PARENT_CHILD_DIFF) | $(QGREP) "CHILD=LEIA_ORGANA"
+	$(BASHTEST) `$(PARENT_CHILD_DIFF) | wc -l` -eq "1"
+	$(CHILD_GCHILD_DIFF) | $(QGREP) "GRANDCHILD=BEN_SOLO"
+	$(BASHTEST) `$(PARENT_CHILD_DIFF) | wc -l` -eq "1"	
+	$(RM) -f $(ENV_PARENT_LOG) $(ENV_CHILD_LOG) $(ENV_GRANDCHILD_LOG) $(OBJDIR)win_env_inheritance.out $(OBJDIR)K0 $(OBJDIR)K1 $(OBJDIR)K2
+
+win_followexecv.test: $(OBJDIR) $(OBJDIR)win_create_process_recursive$(EXE_SUFFIX) $(OBJDIR)inscount$(PINTOOL_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)inscount$(PINTOOL_SUFFIX) -- $(OBJDIR)win_create_process_recursive.exe -currentGeneration 1 -totalGenerations 2 > $(OBJDIR)win_followexecv.out
+	# check Count (printed by the tool) appears twice one for the parent and one for the child: followexecv worked well
+	$(BASHTEST) `$(CGREP) "Count" $(OBJDIR)win_followexecv.out` -eq "2"
+	$(RM) $(OBJDIR)win_followexecv.out
+
+# In PROBE mode we expect to see that syscall discovery is disabled by getting a bad value from PIN_GetWindowsSyscallFromKey.
+# This test starts in JIT mode and then execs into PROBE mode (the tool adds -probe to the command line in th e follow child callback).
+# The tool will assert that PIN_GetWindowsSyscallFromKey returns a valid value in JIT mode and an invalid value in PROBE mode.
+win_followexecv_probe_no_syscall_discovery.test: $(OBJDIR) $(OBJDIR)win_create_process_recursive$(EXE_SUFFIX) $(OBJDIR)syscall_discovery_check_tool$(PINTOOL_SUFFIX)
+	$(PIN) -follow_execv 1 -t $(OBJDIR)syscall_discovery_check_tool$(PINTOOL_SUFFIX) -- $(OBJDIR)win_create_process_recursive.exe -currentGeneration 1 -totalGenerations 2 > $(OBJDIR)win_followexecv_probe_no_syscall_discovery.out
+	# check message (printed by the tool) appears twice one for the parent and one for the child: followexecv worked well
+	$(BASHTEST) `$(CGREP) "in JIT mode" $(OBJDIR)win_followexecv_probe_no_syscall_discovery.out` -eq "1"
+	$(BASHTEST) `$(CGREP) "in PROBE mode" $(OBJDIR)win_followexecv_probe_no_syscall_discovery.out` -eq "1"
+	$(RM) $(OBJDIR)win_followexecv_probe_no_syscall_discovery.out
+
+# (1) run child under the Pin, but don't change Pin command line
+win_parent_process1.test: $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process1.out
+	$(PIN) -follow_execv -t $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt > $(OBJDIR)win_parent_process1.out
+	$(DIFF) $(OBJDIR)win_parent_process1.out win_parent_process1.reference
+	$(RM) $(OBJDIR)win_parent_process1.out
+
+win_parent_process1_probed.test: $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process1_probed.out
+	$(PIN) -follow_execv -probe -t $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt > $(OBJDIR)win_parent_process1_probed.out
+	$(DIFF) $(OBJDIR)win_parent_process1_probed.out win_parent_process1_probed.reference
+	$(RM) $(OBJDIR)win_parent_process1_probed.out
+
+win_parent_process1_unicode_probed.test: $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process_unicode$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(FOLLOW_CHILD_3GEN_TOOL_CROSS_32)
+	$(RM) -f $(OBJDIR)win_parent_process1_unicode_probed.out
+	$(PIN) $(PIN_TESTFLAGS) $(PINFLAGS) -follow_execv -probe \
+	  $(FOLLOW_CHILD_3GEN_TOOL_CROSS_64_KNOB) \
+	  $(FOLLOW_CHILD_3GEN_TOOL_CROSS_32_KNOB) \
+	    -- $(CMD) win_parent_process_unicode_launcher.bat $(OBJDIR) > $(OBJDIR)win_parent_process1_unicode_probed.out 2>&1
+	$(DIFF) $(OBJDIR)win_parent_process1_unicode_probed.out win_parent_process1_unicode_probed.reference
+	$(RM) $(OBJDIR)win_parent_process1_unicode_probed.out
+
+win_parent_process1_unicode_probed_withsym.test: $(OBJDIR)follow_child_3gen_tool_initsym$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process_unicode$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_32)
+	$(RM) -f $(OBJDIR)win_parent_process1_unicode_probed_withsym.out
+	$(PIN) $(PIN_TESTFLAGS) $(PINFLAGS) -follow_execv -probe \
+	  $(FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_64_KNOB) \
+	  $(FOLLOW_CHILD_3GEN_TOOL_INITSYM_CROSS_32_KNOB) \
+	    -- $(CMD) win_parent_process_unicode_launcher.bat $(OBJDIR) \
+	      > $(OBJDIR)win_parent_process1_unicode_probed_withsym.out 2>&1
+	$(DIFF) $(OBJDIR)win_parent_process1_unicode_probed_withsym.out win_parent_process1_unicode_probed_withsym.reference
+	$(RM) $(OBJDIR)win_parent_process1_unicode_probed_withsym.out
+
+win_early_termination.test: $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_launcher_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_early_termination.out
+	$(PIN) -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination.out 2>&1
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination.out
+	$(RM) $(OBJDIR)win_early_termination.out
+
+	$(PIN) -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) -load_system_dlls 1 \
+	    -- $(OBJDIR)win_launcher_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 0" $(OBJDIR)win_early_termination.out` -eq "2"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination.out
+	$(RM) $(OBJDIR)win_early_termination.out
+
+win_early_termination_debugged.test: $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_launcher_debugged_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_early_termination_debugged.out
+	$(PIN) $(PIN_TESTFLAGS) $(PINFLAGS) -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_debugged_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination_debugged.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 0" $(OBJDIR)win_early_termination_debugged.out` -eq "1"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination_debugged.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination_debugged.out
+	$(RM) $(OBJDIR)win_early_termination_debugged.out
+
+	$(PIN) $(PIN_TESTFLAGS) $(PINFLAGS) -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) -load_system_dlls 1 \
+	    -- $(OBJDIR)win_launcher_debugged_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination_debugged.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 0" $(OBJDIR)win_early_termination_debugged.out` -eq "1"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination_debugged.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination_debugged.out
+	$(RM) $(OBJDIR)win_early_termination_debugged.out
+
+win_early_termination_probed.test: $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_launcher_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_early_termination_probed.out
+	$(PIN) -probe -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination_probed.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 1" $(OBJDIR)win_early_termination_probed.out` -eq "2"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination_probed.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination_probed.out
+	$(RM) $(OBJDIR)win_early_termination_probed.out
+
+	$(PIN) -probe -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) -load_system_dlls 1\
+	    -- $(OBJDIR)win_launcher_process $(OBJDIR)win_early_termination$(EXE_SUFFIX) > $(OBJDIR)win_early_termination_probed.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 1" $(OBJDIR)win_early_termination_probed.out` -eq "2"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination_probed.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination_probed.out
+	$(RM) $(OBJDIR)win_early_termination_probed.out
+
+win_early_termination_probed_debugged.test: $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_launcher_debugged_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_early_termination_probed_debugged.out
+	$(PIN) $(PIN_TESTFLAGS) $(PINFLAGS) -probe -follow_execv \
+	  -t $(OBJDIR)follow_child_tool$(PINTOOL_SUFFIX) \
+	    -- $(OBJDIR)win_launcher_debugged_process$(EXE_SUFFIX) $(OBJDIR)win_early_termination$(EXE_SUFFIX) \
+	      > $(OBJDIR)win_early_termination_probed_debugged.out 2>&1
+	$(BASHTEST) `$(CGREP) "In tool's main, probed = 1" $(OBJDIR)win_early_termination_probed_debugged.out` -eq "1"
+	$(BASHTEST) `$(CGREP) "At follow child callback" $(OBJDIR)win_early_termination_probed_debugged.out` -eq "1"
+	$(QGREP) "Terminating process in DllMain(PROCESS_ATTACH)" $(OBJDIR)win_early_termination_probed_debugged.out
+	$(RM) $(OBJDIR)win_early_termination_probed_debugged.out
+
+# (2) run child processes under Pin for some processes (filter by name), and change Pin command line for them.
+# j means jitted, p means probed - so win_parent_process2_jjp.test means:
+# grandparent jitted, parent jitted, child probed
+
+#jjj
+win_parent_process2_jjj.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_jjj.out
+	$(PIN) -follow_execv -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	    -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+		> $(OBJDIR)win_parent_process2_jjj.out
+	$(DIFF) $(OBJDIR)win_parent_process2_jjj.out win_parent_process2_jjj.reference
+	$(RM) $(OBJDIR)win_parent_process2_jjj.out
+
+#jjp
+win_parent_process2_jjp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_jjp.out
+	 $(PIN) -follow_execv -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	 -probe_grand_child 1 -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	 > $(OBJDIR)win_parent_process2_jjp.out
+	$(DIFF) $(OBJDIR)win_parent_process2_jjp.out win_parent_process2_jjp.reference
+	$(RM) $(OBJDIR)win_parent_process2_jjp.out
+
+#jpj
+win_parent_process2_jpj.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_jpj.out
+	$(PIN) -follow_execv -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	  -probe_child 1 -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	  > $(OBJDIR)win_parent_process2_jpj.out
+	$(DIFF) $(OBJDIR)win_parent_process2_jpj.out win_parent_process2_jpj.reference
+	$(RM) $(OBJDIR)win_parent_process2_jpj.out
+
+#jpp
+win_parent_process2_jpp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_jpp.out
+	$(PIN) -follow_execv -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	  -probe_child 1 -probe_grand_child 1 -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	    > $(OBJDIR)win_parent_process2_jpp.out
+	$(DIFF) $(OBJDIR)win_parent_process2_jpp.out win_parent_process2_jpp.reference
+	$(RM) $(OBJDIR)win_parent_process2_jpp.out
+
+#pjj
+win_parent_process2_pjj.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_pjj.out
+	$(PIN) -follow_execv -probe -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	  -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	  > $(OBJDIR)win_parent_process2_pjj.out
+	$(DIFF) $(OBJDIR)win_parent_process2_pjj.out win_parent_process2_pjj.reference
+	$(RM) $(OBJDIR)win_parent_process2_pjj.out
+
+#pjp
+win_parent_process2_pjp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_pjp.out
+	$(PIN) -follow_execv -probe -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	-probe_grand_child 1 -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	    > $(OBJDIR)win_parent_process2_pjp.out
+	$(DIFF) $(OBJDIR)win_parent_process2_pjp.out win_parent_process2_pjp.reference
+	$(RM) $(OBJDIR)win_parent_process2_pjp.out
+
+#ppj
+win_parent_process2_ppj.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	$(RM) -f $(OBJDIR)win_parent_process2_ppj.out
+	$(PIN) -follow_execv -probe -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	-probe_child 1 -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	> $(OBJDIR)win_parent_process2_ppj.out
+	$(DIFF) $(OBJDIR)win_parent_process2_ppj.out win_parent_process2_ppj.reference
+	$(RM) $(OBJDIR)win_parent_process2_ppj.out
+
+#ppp
+win_parent_process2_ppp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX)
+	touch win_parent_process2_ppp.out; $(RM) win_parent_process2_ppp.out
+	$(PIN) -follow_execv -probe -t $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) -pin_path $(INJ_ROOT)/ -tools_path $(TOOLS_PATH) \
+	-probe_child 1 -probe_grand_child -- $(OBJDIR)win_launcher_process_list_app$(EXE_SUFFIX) $(OBJDIR) win_parent_process_launcher_list.txt \
+	    > $(OBJDIR)win_parent_process2_ppp.out
+	$(DIFF) $(OBJDIR)win_parent_process2_ppp.out win_parent_process2_ppp.reference
+	$(RM) $(OBJDIR)win_parent_process2_ppp.out
+
+win_parent_process2_unicode_ppp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process_unicode$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(GRAND_PARENT_TOOL_CROSS_32)
+	$(RM) -f $(OBJDIR)win_parent_process2_unicode_ppp.out
+	$(CMD) win_parent_process_test_launcher_w_pintool_args.bat "$(PIN)" "$(PIN_TESTFLAGS) \
+	  $(PINFLAGS) -follow_execv -probe $(GRAND_PARENT_TOOL_CROSS_64_KNOB) $(GRAND_PARENT_TOOL_CROSS_32_KNOB) \
+	  -probe_child 1 -probe_grand_child 1 -pin_path \"$(INJ_ROOT)/\" -tools_path \"$(TOOLS_PATH)\"" "$(OBJDIR)" \
+	    > $(OBJDIR)win_parent_process2_unicode_ppp.out 2>&1
+	$(DIFF) $(OBJDIR)win_parent_process2_unicode_ppp.out win_parent_process2_unicode_ppp.reference
+	$(RM) $(OBJDIR)win_parent_process2_unicode_ppp.out
+
+#multi-threaded processes
+
+#ppp
+win_parent_process2_mt_ppp.test: $(OBJDIR)grand_parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)parent_tool$(PINTOOL_SUFFIX) $(OBJDIR)follow_child_3gen_tool$(PINTOOL_SUFFIX) $(OBJDIR)win_parent_process_mt$(EXE_SUFFIX) $(OBJDIR)win_child_process$(EXE_SUFFIX) $(GRAND_PARENT_TOOL_CROSS_32)
+	$(RM) -f $(OBJDIR)win_parent_process2_mt_ppp.out
+	$(CMD) win_parent_process_mt_test_launcher_w_pintool_args.bat "$(PIN)" "$(PIN_TESTFLAGS) \
+	  $(PINFLAGS) -follow_execv -probe $(GRAND_PARENT_TOOL_CROSS_64_KNOB) $(GRAND_PARENT_TOOL_CROSS_32_KNOB) \
+	  -probe_child 1 -probe_grand_child 1 -pin_path \"$(INJ_ROOT)/\" -tools_path \"$(TOOLS_PATH)\"" "$(OBJDIR)" \
+	    > $(OBJDIR)win_parent_process2_mt_ppp.out 2>&1
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(LINECOUNT)` -eq 22
+	$(BASHTEST) `$(SORT) $(OBJDIR)win_parent_process2_mt_ppp.out | $(UNIQ) | $(LINECOUNT)` -eq 6
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "In grand_parent_tool PinTool is probed 1" | $(LINECOUNT)` -eq 1
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "In parent_tool PinTool is probed 1" | $(LINECOUNT)` -eq 3
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "In follow_child PinTool is probed 1" | $(LINECOUNT)` -eq 9
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "First Process was created successfully!" | $(LINECOUNT)` -eq 3
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "Second Process was created successfully!" | $(LINECOUNT)` -eq 3
+	$(BASHTEST) `$(UNIQ) $(OBJDIR)win_parent_process2_mt_ppp.out | $(GREP) "Third Process was created successfully!" | $(LINECOUNT)` -eq 3
+	$(RM) $(OBJDIR)win_parent_process2_mt_ppp.out
+
+parent_process_waitpid_bug2.test: $(OBJDIR)parent_process_waitpid_bug2$(EXE_SUFFIX)
+	$(PIN) -- $(OBJDIR)parent_process_waitpid_bug2$(EXE_SUFFIX)
+
+# Logger tests
+
+# Test that pintool.log is being overwritten on each run of pin In order to test that we run pin twice and 
+# check that the log file contains only one "Hello from tool" line (i.e., the second run overwrote the log
+# created by the first run, instead of appending to it)
+tool_logger_overwrite.test: $(TESTAPP) $(OBJDIR)basic_tool$(PINTOOL_SUFFIX)
+	$(PIN) -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -logfile $(OBJDIR)tool_logger_overwrite.log -- $(TESTAPP) makefile $(OBJDIR)tool_logger_overwrite.makefile.copy
+	#  run again and make sure there isd only 1 "Hello from tool" (i.e., file was overwritten, not appended)
+	$(PIN) -t $(OBJDIR)basic_tool$(PINTOOL_SUFFIX) -logfile $(OBJDIR)tool_logger_overwrite.log -- $(TESTAPP) makefile $(OBJDIR)tool_logger_overwrite.makefile.copy
+	$(BASHTEST) `$(CGREP) "Hello from tool" $(OBJDIR)tool_logger_overwrite.log` -eq "1"
+	$(RM) $(OBJDIR)tool_logger_overwrite.log $(OBJDIR)tool_logger_overwrite.makefile.copy
+
+# Test that Tool logs are not missing after fork when -unique_log is used
+
+# Applicaiton does many consecutive forks (10 - paramater). Parent waits for each child to terminate before forking the next one.
+# Each child does very little and exit. Pin doesn't follow child
+# This tests that with -unique_logfile 1 each forked child process gets its own log file and no logs are lost.
+# In order to do so, we check that there are 11 log files created (1 for parent and 10 for children)
+# and that each child log file has the expected line written by the tool after fork in child
+tool_log_with_many_forks.test: $(OBJDIR)many_forks_app$(EXE_SUFFIX) $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX)
+	$(PIN) -unique_logfile -t $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX) -sanity -unique_logfile -logfile $(OBJDIR)tool_log_with_many_forks.log -- $(OBJDIR)many_forks_app$(EXE_SUFFIX) 10 > $(OBJDIR)tool_log_with_many_forks.out 2>&1
+	# make sure that there are 11 new log files created - tool_log_with_many_forks.log.pid (one per forked child)
+	$(BASHTEST) `ls $(OBJDIR)tool_log_with_many_forks.log.* | $(LINECOUNT)` -eq 11
+	# make sure each one has the "AfterForkInChild:  hello from".. line (except the parent so must equal to 10)
+	@count=0; \
+	for f in `ls $(OBJDIR)tool_log_with_many_forks.log.*`; do \
+	  if $(QGREP) "AfterForkInChild:  hello from" $$f; then \
+	  	count=$$((count + 1)); \
+	  fi; \
+	done; \
+	echo "Found $$count files with the line"; \
+	if [ $$count -ne 10 ]; then \
+	    echo "Error: expected 10, got $$count" >&2; \
+	    exit 1; \
+	fi
+	$(RM) $(OBJDIR)tool_log_with_many_forks.out $(OBJDIR)tool_log_with_many_forks.log*
+
+# The test above for Probe mode
+tool_log_with_many_forks_probe.test: $(OBJDIR)many_forks_app$(EXE_SUFFIX) $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX)
+	$(PIN) -unique_logfile -t $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX) -probe -sanity -unique_logfile -logfile $(OBJDIR)tool_log_with_many_forks_probe.log -- $(OBJDIR)many_forks_app$(EXE_SUFFIX) 10 > $(OBJDIR)tool_log_with_many_forks_probe.out 2>&1
+	# make sure that there are 11 new log files created - tool_log_with_many_forks_probe.log.pid (one per forked child)
+	$(BASHTEST) `ls $(OBJDIR)tool_log_with_many_forks_probe.log.* | $(LINECOUNT)` -eq 11
+	# make sure each one has the "AfterForkInChild:  hello from".. line (except the parent so must equal to 10)
+	@count=0; \
+	for f in `ls $(OBJDIR)tool_log_with_many_forks_probe.log.*`; do \
+	  if $(QGREP) "AfterForkInChild:  hello from" $$f; then \
+	  	count=$$((count + 1)); \
+	  fi; \
+	done; \
+	echo "Found $$count files with the line"; \
+	if [ $$count -ne 10 ]; then \
+	    echo "Error: expected 10, got $$count" >&2; \
+	    exit 1; \
+	fi
+	$(RM) $(OBJDIR)tool_log_with_many_forks_probe.out $(OBJDIR)tool_log_with_many_forks_probe.log*
+
+# Many consecutive forks (parent wait for each child to end before doing the next fork). 
+# Each child process execv application that prints and exit. Pin does follow child (-follow-execv enabled)
+# This tests that with -unique_logfile 1 each forked child process gets its own log file and no logs are lost.
+# In order to do so, we check that there are 4 log files created (1 for parent and 3 for children)
+# and that each child log file has the expected line written by the tool after fork in child
+tool_log_with_many_forks_and_execv.test: $(OBJDIR)many_forks_app$(EXE_SUFFIX) $(OBJDIR)child_process$(EXE_SUFFIX) $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX)
+	$(PIN) -unique_logfile -follow-execv -t $(OBJDIR)simple_fork_tool$(PINTOOL_SUFFIX) -sanity -unique_logfile -logfile $(OBJDIR)tool_log_with_many_forks_and_execv.log \
+	-- $(OBJDIR)many_forks_app$(EXE_SUFFIX) 3 $(OBJDIR)child_process$(EXE_SUFFIX) > $(OBJDIR)tool_log_with_many_forks_and_execv.out 2>&1
+	# make sure that there are 4 new log files created - tool_log_with_many_forks_and_execv.log.pid (one per forked child and 1 for the parent)
+	$(BASHTEST) `ls $(OBJDIR)tool_log_with_many_forks_and_execv.log.* | $(LINECOUNT)` -eq 4
+	# make sure each one has the "AfterForkInChild:  hello from".. line (except the parent so must equal to 3)
+	@afterForkcount=0; \
+	helloCount=0; \
+	for f in $(OBJDIR)/tool_log_with_many_forks_and_execv.log.*; do \
+	  if $(QGREP) -q "AfterForkInChild:  hello from" $$f; then \
+	    afterForkcount=$$((afterForkcount + 1)); \
+	  fi; \
+	  if $(QGREP) -q "Hello from tool" $$f; then \
+	    helloCount=$$((helloCount + 1)); \
+	  fi; \
+	done; \
+	echo "Found $$afterForkcount files with 'AfterForkInChild:  hello from' line"; \
+	echo "Found $$helloCount files with 'Hello from tool' line"; \
+	# if afterForkcount is not 3 or hello count is not 4 then error \
+	if [ $$afterForkcount -ne 3 ] || [ "$$helloCount" -ne 4 ]; then \
+	  echo "Error: expected 3, got $$afterForkcount" >&2; \
+	  exit 1; \
+	fi
+	$(RM) $(OBJDIR)tool_log_with_many_forks_and_execv.log* $(OBJDIR)tool_log_with_many_forks_and_execv.out	
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+###### Special tools' build rules ######
+
+$(OBJDIR)unix_parent_tool$(PINTOOL_SUFFIX): $(OBJDIR)unix_parent_tool$(OBJ_SUFFIX) $(OBJDIR)arglist$(OBJ_SUFFIX)
+	$(TOOL_LINKER) $(TOOL_LDFLAGS) $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)
+
+###### Special applications' build rules ######
+
+$(OBJDIR)fork_app_static$(EXE_SUFFIX): fork_app.c
+	$(APP_CC) $(APP_CFLAGS) $(DBG_INFO_CXX_ALWAYS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(STATIC) $(APP_LIBS) $(DBG_INFO_LD_ALWAYS)
+
+$(OBJDIR)vfork_app_static$(EXE_SUFFIX): vfork_app.c
+	$(APP_CC) $(APP_CFLAGS) $(DBG_INFO_CXX_ALWAYS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(STATIC) $(APP_LIBS) $(DBG_INFO_LD_ALWAYS)
+
+$(OBJDIR)win_parent_process$(EXE_SUFFIX): win_parent_process.cpp
+	$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(APP_LIBS) Advapi32.lib
+
+$(OBJDIR)win_parent_process_mt$(EXE_SUFFIX): win_parent_process_mt.cpp
+	$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(APP_LIBS) Advapi32.lib
+
+$(OBJDIR)win_parent_process_unicode$(EXE_SUFFIX): win_parent_process_unicode.cpp
+	$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(APP_LIBS) Advapi32.lib
+
+$(OBJDIR)win_early_termination$(EXE_SUFFIX): win_early_termination.cpp $(OBJDIR)$(DLL_PREFIX)win_terminate_process_dll$(DLL_SUFFIX)
+	$(APP_CXX) $(APP_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(APP_LIBS) Advapi32.lib Dbghelp.lib $(OBJDIR)$(DLL_PREFIX)win_terminate_process_dll$(LIB_SUFFIX)
+
+$(OBJDIR)fork_hang_app$(EXE_SUFFIX): fork_hang_app.cpp $(THREADLIB)
+	$(APP_CXX) $(COMPONENT_INCLUDES) $(APP_CXXFLAGS) $(COMP_EXE)$@ $^ $(APP_LDFLAGS) $(APP_LPATHS) $(APP_LIBS) $(CXX_LPATHS) $(CXX_LIBS)
+
+###### Special objects' build rules ######
+
+$(OBJDIR)unix_parent_tool$(OBJ_SUFFIX): unix_parent_tool.cpp arglist.h
+	$(TOOL_CXX) $(TOOL_CXXFLAGS) $(COMP_OBJ)$@ $<
+
+$(OBJDIR)arglist$(OBJ_SUFFIX): arglist.cpp arglist.h
+	$(TOOL_CXX) $(TOOL_CXXFLAGS) $(COMP_OBJ)$@ $<
+
+###### Special dlls' build rules ######
+
+$(OBJDIR)$(DLL_PREFIX)win_terminate_process_dll$(DLL_SUFFIX): win_terminate_process_dll.cpp
+	$(APP_CXX) $(APP_CXXFLAGS) $(DLL_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(DLL_LDFLAGS) $(APP_LIBS)
+
+$(OBJDIR)rpc_plugin$(DLL_SUFFIX): rpc_plugin.cpp
+	$(APP_CXX) $(RPC_PLUGIN_CXXFLAGS) $(DLL_CXXFLAGS) $(COMP_EXE)$@ $< $(APP_LDFLAGS) $(DLL_LDFLAGS) $(APP_LIBS)
+	# Copy test plugin to the pind plugin directory
+	$(CP) $(OBJDIR)rpc_plugin$(DLL_SUFFIX) $(PIN_ROOT)/$(TARGET)/pinrt/bin/plugins/
+
+

@@ -1,0 +1,67 @@
+#
+# Copyright (C) 2023-2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+# A simple PinGlue service that counts instructions for images specified by the client
+
+import json, pin
+
+images_to_instrument = []
+total = 0
+
+# Called to send the results at fini
+def send_result_callback_message():
+    data = {
+        "Count": total
+    }
+    json_string = json.dumps(data)
+    print(f"In send_result_callback_message: JSON data: {json_string}")
+    # Set the service result (as JSON) to the client
+    Glue_SendServiceResultCallback(json_string)
+
+def docount(c):
+    """Analysis callback called for every instrumented BBL
+    Args:
+    c: The instruction count in the BBL
+    """
+    global total
+    total += c
+
+def trace_instrumentation_cb(trace):
+    """Callback function called for every trace to be executed by the application
+    Args:
+    trace: The trace object
+    """
+    traceAddress = pin.TRACE_Address(trace)
+    # We instrument only traces that belongs to image ranges added to images_to_instrument
+    for imageRange in images_to_instrument:
+        if imageRange[0] <= traceAddress and traceAddress <= imageRange[1]:
+            bbl = pin.TRACE_BblHead(trace)
+            while(pin.BBL_Valid(bbl)):
+                pin.BBL_InsertCall(bbl, pin.IPOINT_BEFORE, docount, pin.IARG_UINT32, pin.BBL_NumIns(bbl))
+                bbl = pin.BBL_Next(bbl)
+            break
+
+def image_instrumentation_cb(img):
+    """Callback function for instrumenting images.
+    Args:
+    img: The image object to be instrumented.
+    """
+    # should_instrument_image should be defined by the client of the service
+    if should_instrument_image(pin.IMG_Name(img), pin.IMG_IsMainExecutable(img)):
+        # If the client requested to instrument the image - add the image range
+        images_to_instrument.append([pin.IMG_LowAddress(img), pin.IMG_HighAddress(img)])
+
+def fini(code):
+    """Callback function called when the program exits
+    Args:
+    code: The exit code of the program
+    """
+    global total
+    print(f"inscount: The total number of executed instructions are:{total}")
+    send_result_callback_message()
+
+pin.IMG_AddInstrumentFunction(image_instrumentation_cb)
+pin.TRACE_AddInstrumentFunction(trace_instrumentation_cb)
+pin.PIN_AddFiniFunction(fini)

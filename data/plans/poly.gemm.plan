@@ -1,0 +1,12 @@
+PTPLAN 2
+I suites/polybench/targets/gemm_large
+S 138c B 1 r:rax
+S 14a1 B 5 r:r8 r:rcx r:rdx r:rsi r:rsp
+S 14dc A 1 r:r8
+S 1549 A 1 r:r8
+S 15b0 A 1 r:r8
+S 1616 B 5 r:r9 r:rcx r:rdx r:rsi r:rsp
+S 1652 A 1 r:r9
+S 16fd B 3 r:rdx r:rsi r:rsp
+S 1859 B 3 f r:rsi r:rsp
+S 192a A 1 r:rax

@@ -1,0 +1,10 @@
+Base {
+    global:
+        main;
+        ClientIntC;
+        PinCommitHashC;
+        analysis_function_use_dladdr;
+
+    local:
+        *;
+};

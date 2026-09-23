@@ -1,0 +1,185 @@
+#
+# Copyright (C) 2023-2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+import pin, json
+
+# Global variables and knobs.
+memory_leak_map = {}
+total_allocations = 0
+total_free = 0
+output_file = None
+is_to_instrument_only_main_exe = False
+
+# Note: the following callbacks must be declared as client callbacks: client_timer_cb(), client_stats_cb(json_stats_str)
+
+def collect_stats():
+    """Collects and returns statistics about memory allocations in JSON format."""
+    global total_allocations, total_free
+    stats_data = {}
+    stats_data['total malloc calls'] = total_allocations
+    stats_data['total free calls'] = total_free
+    stats_data['unfreed memory info'] = []
+
+    # Iterate over unfreed memory allocations and collect information
+    for addr, data in memory_leak_map.items():
+        #print(f"GetSourceLocation for {hex(data['return_ip'])}")
+        res = pin.PIN_GetSourceLocation(data['return_ip'])
+        stats_data['unfreed memory info'].append(str({'address':hex(addr), 'allocated_size':data['size'], 
+                                                       'line': res[1], 'column': res[0], 'srcfile': res[2]}))
+        
+    json_stats_str = json.dumps(stats_data)
+    return json_stats_str
+        
+
+def timer_cb():
+    """Timer callback function that handles various commands from the client."""
+    res = client_timer_cb()
+    if "Continue" == res:
+        return
+    if "Detach" == res:
+        print("Detach Requested")
+        pin.PIN_DetachProbed()
+    elif "Reattach" == res:
+        print("Attach Requested")
+        pin.PIN_AttachProbed(attach_cb)
+    elif "CurrentStats" == res:
+        json_stats_str = collect_stats()
+        client_stats_cb(json_stats_str)
+    elif "Exit" == res:
+        # Note in Probe there is no PIN_ExitApplication() so we call to PIN_ExitProcess()
+        new_exit(0,0,0)
+        pin.PIN_ExitProcess(0)
+    else:
+        output_file.write("Error!! invalid res from client_timer_cb, asserting..\n")
+        output_file.close()
+        assert(False)
+     
+
+def new_malloc(org_func_ptr, proto, size, return_ip):
+    """Replacement for the malloc function that logs and tracks allocations."""
+    global total_allocations
+    output_file.write(f"malloc({size})\n")
+    total_allocations += 1
+    
+    # Call the original malloc function
+    ret = pin.GLUE_CallApplicationFunctionProbed(org_func_ptr, proto, size)
+    # Track the allocation
+    memory_leak_map[ret] = {'return_ip': return_ip, 'size': size}
+    
+    output_file.write(f"  returns {hex(ret)}\n")
+    
+    return ret
+
+def new_free(org_func_ptr, proto, addr):
+    """Replacement for the free function that logs and tracks deallocations."""
+    global total_free
+    total_free += 1
+    output_file.write(f"free({hex(addr)})\n")
+    
+    # Call the original free function
+    pin.GLUE_CallApplicationFunctionProbed(org_func_ptr, proto, addr)
+    
+    # Remove the allocation from the tracking map if it exists
+    if addr in memory_leak_map:
+        del memory_leak_map[addr]
+    else:
+        output_file.write(f"ERROR: {hex(addr)} not in memory_leak_map\n") 
+    
+def new_exit(org_func_ptr, proto, code):
+    """Replacement for the exit function that logs and sends final statistics."""
+    output_file.write(f"In new_exit\n")
+    output_file.close()
+    
+    # Collect and send final statistics
+    json_stats_str = collect_stats()
+    Glue_SendServiceResultCallback(json_stats_str)
+    
+    # Call the original exit function if passed
+    if 0 != org_func_ptr:
+        return pin.GLUE_CallApplicationFunctionProbed(org_func_ptr, proto, code)
+
+def detach_cb():
+    """Callback function for when Pin is detached from the application."""
+    output_file.write("Pin detached from application successfully\n")
+    json_stats_str = collect_stats()
+    try:
+        client_detach_cb(json_stats_str)
+    except:
+        """"""
+    
+def attach_cb():
+    """Callback function for when Pin is re-attached to the application."""
+    output_file.write("Pin re-attached to application successfully\n")
+    try:
+        client_attach_cb()
+    except:
+        """"""
+
+    pin.IMG_AddInstrumentFunction(image_instrumentation_cb)
+    pin.PIN_AddDetachFunctionProbed(detach_cb)
+
+
+def image_instrumentation_cb(img):
+    """Image instrumentation callback function for instrumenting the malloc, free, and exit functions."""
+    # Instrument the exit function
+    output_file.write(f"Image Load: {pin.IMG_Name(img)}\n")
+    exitRtn = pin.RTN_FindByName(img, "_exit")
+    if pin.RTN_Valid(exitRtn):
+        assert(pin.RTN_IsSafeForProbedReplacement(exitRtn))
+        proto_exit = pin.PROTO_Allocate(pin.PIN_PARG_VOID, pin.CALLINGSTD_DEFAULT, pin.RTN_Name(exitRtn), pin.PIN_PARG_INT)
+        output_file.write(f"Replacing {pin.RTN_Name(exitRtn)} in {pin.IMG_Name(img)}\n")
+        pin.RTN_ReplaceSignatureProbed(exitRtn, new_exit, proto_exit, 
+                                       pin.IARG_ORIG_FUNCPTR, pin.IARG_PTR, proto_exit,
+                                       pin.IARG_FUNCARG_ENTRYPOINT_VALUE, 0)
+    
+    # Check if we should only instrument the main executable
+    if is_to_instrument_only_main_exe and not pin.IMG_IsMainExecutable(img):
+        return
+    
+    # Instrument the malloc function
+    mallocRtn = pin.RTN_FindByName(img, "malloc")
+    if(pin.RTN_Valid(mallocRtn)):
+        assert(pin.RTN_IsSafeForProbedReplacement(mallocRtn))
+        output_file.write(f"Replacing malloc in {pin.IMG_Name(img)}\n")
+        proto_malloc = pin.PROTO_Allocate(pin.PIN_PARG_POINTER, pin.CALLINGSTD_DEFAULT, "malloc", pin.PIN_PARG_SIZE_T)
+        pin.RTN_ReplaceSignatureProbed(mallocRtn, new_malloc, proto_malloc, pin.IARG_ORIG_FUNCPTR, 
+                                           pin.IARG_PTR, proto_malloc, pin.IARG_FUNCARG_ENTRYPOINT_VALUE, 0, pin.IARG_RETURN_IP)
+	
+    # Instrument the free function
+    freeRtn = pin.RTN_FindByName(img, "free")
+    if (pin.RTN_Valid(freeRtn)):
+        assert(pin.RTN_IsSafeForProbedReplacement(freeRtn))
+        output_file.write(f"Replacing free in {pin.IMG_Name(img)}\n")
+        proto_free = pin.PROTO_Allocate(pin.PIN_PARG_VOID, pin.CALLINGSTD_DEFAULT, "free", pin.PIN_PARG_POINTER)
+        pin.RTN_ReplaceSignatureProbed(freeRtn, new_free, proto_free, pin.IARG_ORIG_FUNCPTR, 
+                                           pin.IARG_PTR, proto_free, pin.IARG_FUNCARG_ENTRYPOINT_VALUE, 0)
+ 
+def main(*knobs):
+    """The main function that sets up the instrumentation."""
+    service_log_file_name = "service.out"
+    timer_interval = 100 # The default interval is 100 milliseconds
+    
+    # Parse command-line arguments (knobs)
+    global is_to_instrument_only_main_exe, output_file
+    for knob in knobs:
+        key, value = knob.split('=')
+        if key == "server_log_file":
+            service_log_file_name = value
+        elif key == "is_to_instrument_only_main_exe":
+            is_to_instrument_only_main_exe = value.lower() == 'true'
+        elif key == "timer_interval":
+            timer_interval = int(value)
+    
+    # Open the output file for logging    
+    output_file = open(service_log_file_name, "w")
+
+    # Add instrumentation callbacks
+    pin.IMG_AddInstrumentFunction(image_instrumentation_cb)
+    pin.PIN_AddDetachFunctionProbed(detach_cb)
+    
+    # Start a timer to periodically invoke the timer callback
+    timer_ID = pin.GLUE_TimerCreate(timer_cb, timer_interval)
+    assert(-1 != timer_ID)
+    assert(pin.GLUE_TimerStart(timer_ID))

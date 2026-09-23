@@ -1,0 +1,4 @@
+TOOL_ROOTS := memtrace
+TEST_ROOTS :=
+TOOL_CXXFLAGS += -I$(CURDIR)/compat
+$(OBJDIR)memtrace$(OBJ_SUFFIX): ../memtrace.cpp

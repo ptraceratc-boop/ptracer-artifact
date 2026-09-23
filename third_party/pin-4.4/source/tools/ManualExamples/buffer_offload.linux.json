@@ -1,0 +1,14 @@
+{
+    "ExtraRPCPlugins": [
+        {
+            "lib": "buffer_offload_plugin.so",
+            "name": "buffer offload plugin",
+            "log" : true,
+            "comment" : "Uncomment below //logfilename in order to use it",
+            "//logfilename" : "my_buffer_offload_plugin.log",
+            "arguments": [
+                "-dummy-knob", "1"
+            ]
+        }
+    ]
+}

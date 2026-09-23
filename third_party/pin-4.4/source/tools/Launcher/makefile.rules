@@ -1,0 +1,383 @@
+#
+# Copyright (C) 2012-2025 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS :=
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS :=
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS :=
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS :=
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS :=
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Place OS-specific definitions here ######
+
+# Linux
+ifeq ($(TARGET_OS),linux)
+    TEST_TOOL_ROOTS += 
+    TEST_ROOTS += ext_launcher_1 ext_launcher_3 ext_launcher_4 ext_launcher_5 ext_launcher_4_attach ext_launcher_5_attach
+	TOOL_ROOTS += inscount1
+    SA_TOOL_ROOTS += 
+    APP_ROOTS += ext_launcher_u simple_wait_app_l
+    DLL_ROOTS += 
+    ifeq ($(TARGET),intel64)
+        TEST_ROOTS += ext_launcher_2
+    endif
+endif
+
+# Windows
+ifeq ($(TARGET_OS),windows)
+    TEST_ROOTS += win_launcher_default_kit win_launcher_custom_kit no_flags_outside_kit_windows bad_path_outside_kit_windows no_flags_outside_kit_windows_attach bad_path_outside_kit_windows_attach
+	TOOL_ROOTS += inscount1
+	APP_ROOTS += simple_wait_app_w win_app_launcher
+    ifeq ($(TARGET),intel64)
+    	TEST_ROOTS += win_launcher_bad_64pind_path
+	endif
+    ifeq ($(TARGET),ia32)
+	    TEST_ROOTS += win_launcher_bad_32pind_path 
+	endif
+endif
+
+###### Handle exceptions here (OS/arch related) ######
+
+RUNNABLE_TESTS := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+###### Handle exceptions here (bugs related) ######
+
+###### Define the sanity subset ######
+
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+# Testing that Pin launcher is able to execute correctly when being launched from a different place than the KIT root
+# by passing it flags stating where executables it needs are located and where to find libraries it need.
+# We copy Pin launcher into ./cloned_pin to emulate running a launcher running from a different place than the KIT root.
+ext_launcher_1.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(TESTAPP) ./cloned_pin
+	export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)ext_launcher_1_tool.log \
+	-- $(TESTAPP) makefile $(OBJDIR)ext_launcher_1.makefile.copy > $(OBJDIR)ext_launcher_1.out 2>&1
+	$(QGREP) "Count " $(OBJDIR)ext_launcher_1_tool.log
+	$(RM) $(OBJDIR)ext_launcher_1.makefile.copy $(OBJDIR)ext_launcher_1.out $(OBJDIR)ext_launcher_1_tool.log
+
+# Test that Pin launcher is able to execute correctly 64 bit test when provided only 64 bit launcher flags
+ext_launcher_2.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(TESTAPP) ./cloned_pin
+	export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_2=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)ext_launcher_2_tool.log \
+	-- $(TESTAPP) makefile $(OBJDIR)ext_launcher_2.makefile.copy > $(OBJDIR)ext_launcher_2.out 2>&1
+	$(QGREP) "Count " $(OBJDIR)ext_launcher_2_tool.log
+	$(RM) $(OBJDIR)ext_launcher_2.makefile.copy $(OBJDIR)ext_launcher_2.out $(OBJDIR)ext_launcher_2_tool.log
+
+# Test that Pin launcher fails with suitable error message when one of the executable flags is missing (-pinbin_path_64 
+# as an example). If one of the executable flags is used all of them needs to be used as well (all 64-bit or all 32-bit)
+# below execution is expected to fail, therefore we have !()
+ext_launcher_3.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(TESTAPP) ./cloned_pin
+	!(export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_3=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)ext_launcher_3_tool.log \
+	-- $(TESTAPP) makefile $(OBJDIR)ext_launcher_3.makefile.copy > $(OBJDIR)ext_launcher_3.out 2>&1)
+	$(QGREP) "all three should be provided" $(OBJDIR)ext_launcher_3.out
+	$(RM) $(OBJDIR)ext_launcher_3.out
+
+# These tests verify that Pin launcher correctly detects when running outside its kit and enforces
+# required location flags. In launch mode tests (ext_launcher_4/5, no_flags/bad_path_outside_kit_windows),
+# the launcher should fail immediately with an error and kill the application. In attach mode tests
+# (ext_launcher_4/5_attach, no_flags/bad_path_outside_kit_windows_attach), a simple_wait_app is started
+# in the background, then ext_launcher_u attempts to attach via the cloned_pin (running outside kit).
+# The launcher should fail with an error but allow the application to continue running natively.
+# Both launcher and app processes are then killed, and the test verifies both the error message and
+# the mode-specific message indicating whether the app was killed (launch) or kept running (attach).
+
+# Test that Pin launcher fails with suitable error message when no flags are used at all
+ext_launcher_4.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(TESTAPP) ./cloned_pin
+	!(export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_4=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)ext_launcher_4_tool.log \
+	-- $(TESTAPP) makefile $(OBJDIR)ext_launcher_4.makefile.copy > $(OBJDIR)ext_launcher_4.out 2>&1)
+	$(QGREP) "LAUNCHER ERROR: Failure to execute pind" $(OBJDIR)ext_launcher_4.out
+	$(QGREP) "Application exits as well" $(OBJDIR)ext_launcher_4.out
+	$(RM) $(OBJDIR)ext_launcher_4.out
+
+# Test that Pin launcher fails with suitable error message when the path of one of the flags is invalid
+ext_launcher_5.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(TESTAPP) ./cloned_pin
+	!(export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_5=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)ext_launcher_5_tool.log \
+	-- $(TESTAPP) makefile $(OBJDIR)ext_launcher_5.makefile.copy > $(OBJDIR)ext_launcher_5.out 2>&1)
+	$(QGREP) "LAUNCHER ERROR: pind not found or not executable" $(OBJDIR)ext_launcher_5.out
+	$(RM) $(OBJDIR)ext_launcher_5.out
+
+# Test that Pin launcher fails with suitable error message when no flags are used at all in attach mode (and Pin is executed outside kit).
+ext_launcher_4_attach.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(OBJDIR)simple_wait_app_l$(EXE_SUFFIX) ./cloned_pin
+	$(OBJDIR)simple_wait_app_l$(EXE_SUFFIX) & \
+	APP_PID=$$!; \
+	sleep 1; \
+	export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_4=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -pid $$APP_PID -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) > $(OBJDIR)ext_launcher_4_attach_error.out 2>&1 & \
+	LAUNCHER_PID=$$!; \
+	sleep 2; \
+	kill -9 $$APP_PID 2>/dev/null || true; \
+	kill -9 $$LAUNCHER_PID 2>/dev/null || true; \
+	wait $$APP_PID 2>/dev/null || true; \
+	wait $$LAUNCHER_PID 2>/dev/null || true
+	$(QGREP) "LAUNCHER ERROR: Failure to execute pind" $(OBJDIR)ext_launcher_4_attach_error.out
+	$(QGREP) "Application will continue to run natively" $(OBJDIR)ext_launcher_4_attach_error.out
+	$(RM) $(OBJDIR)ext_launcher_4_attach_error.out
+
+# Test that Pin launcher fails with suitable error message when the path of one of the flags is invalid in attach mode
+ext_launcher_5_attach.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(OBJDIR)ext_launcher_u$(EXE_SUFFIX) $(OBJDIR)simple_wait_app_l$(EXE_SUFFIX) ./cloned_pin
+	$(OBJDIR)simple_wait_app_l$(EXE_SUFFIX) & \
+	APP_PID=$$!; \
+	sleep 1; \
+	export PIN_KIT_ROOT_PATH=$(PIN_ROOT_ABS); \
+	export TEST_CASE_5=1; \
+	$(OBJDIR)ext_launcher_u$(EXE_SUFFIX) -pid $$APP_PID -t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) > $(OBJDIR)ext_launcher_5_attach_error.out 2>&1 & \
+	LAUNCHER_PID=$$!; \
+	sleep 2; \
+	kill -9 $$APP_PID 2>/dev/null || true; \
+	kill -9 $$LAUNCHER_PID 2>/dev/null || true; \
+	wait $$APP_PID 2>/dev/null || true; \
+	wait $$LAUNCHER_PID 2>/dev/null || true
+	$(QGREP) "LAUNCHER ERROR: pind not found or not executable" $(OBJDIR)ext_launcher_5_attach_error.out
+	$(RM) $(OBJDIR)ext_launcher_5_attach_error.out
+
+# Test that Pin launcher fails with suitable error message when no flags are used at all in windows
+no_flags_outside_kit_windows.test:$(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_tmp/launcher
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_tmp/i64
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_tmp/i32
+	$(CP) $(PIN_ROOT)/$(PIN_EXEC_NAME) $(OBJDIR)/no_flags_outside_kit_windows_tmp/launcher/
+	$(CP) -R $(PIN_ROOT)/intel64/pinrt/bin $(OBJDIR)/no_flags_outside_kit_windows_tmp/i64/bin1
+	$(CP) -R $(PIN_ROOT)/intel64/bin $(OBJDIR)/no_flags_outside_kit_windows_tmp/i64/bin2
+	$(CP) -R $(PIN_ROOT)/ia32/pinrt/bin $(OBJDIR)/no_flags_outside_kit_windows_tmp/i32/bin1
+	$(CP) -R $(PIN_ROOT)/ia32/bin $(OBJDIR)/no_flags_outside_kit_windows_tmp/i32/bin2
+	# Run Pin
+	-$(OBJDIR)/no_flags_outside_kit_windows_tmp/launcher/$(PIN_EXEC_NAME) \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "Create pind process failed" $(OBJDIR)$(@:test=out)
+	$(QGREP) "Application exits as well" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out)
+	$(RM) -rf $(OBJDIR)/no_flags_outside_kit_windows_tmp
+
+# Test that Pin launcher fails with suitable error message when the path of one of the flags is invalid in windows
+bad_path_outside_kit_windows.test:$(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_tmp/launcher
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32
+	$(CP) $(PIN_ROOT)/$(PIN_EXEC_NAME) $(OBJDIR)/bad_path_outside_kit_windows_tmp/launcher/
+	$(CP) -R $(PIN_ROOT)/intel64/pinrt/bin $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64/bin1
+	$(CP) -R $(PIN_ROOT)/intel64/bin $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64/bin2
+	$(CP) -R $(PIN_ROOT)/ia32/pinrt/bin $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32/bin1
+	$(CP) -R $(PIN_ROOT)/ia32/bin $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32/bin2
+	# Run Pin
+	-$(OBJDIR)/bad_path_outside_kit_windows_tmp/launcher/$(PIN_EXEC_NAME) \
+	-pind_path_64 $(OBJDIR)/wrong/path \
+	-pind_path_32 $(OBJDIR)/wrong/path \
+	-pinbin_path_64 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64/bin2 \
+	-pinbin_path_32 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32/bin2 \
+	-pin_ld_path_64 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64/bin1 \
+	-pin_ld_path_32 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32/bin1 \
+	-pin_lib_64 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i64/bin1 \
+	-pin_lib_32 $(OBJDIR)/bad_path_outside_kit_windows_tmp/i32/bin1 \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "LAUNCHER ERROR: pind.exe not found" $(OBJDIR)$(@:test=out)
+	$(QGREP) "Application exits as well" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out)
+	$(RM) -rf $(OBJDIR)/bad_path_outside_kit_windows_tmp
+
+# Test that Pin launcher fails with suitable error message when no flags are used at all in windows attach mode
+no_flags_outside_kit_windows_attach.test:$(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP) $(OBJDIR)simple_wait_app_w$(EXE_SUFFIX) $(OBJDIR)win_app_launcher$(EXE_SUFFIX)
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/launcher
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i64
+	mkdir -p $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i32
+	$(CP) $(PIN_ROOT)/$(PIN_EXEC_NAME) $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/launcher/
+	$(CP) -R $(PIN_ROOT)/intel64/pinrt/bin $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i64/bin1
+	$(CP) -R $(PIN_ROOT)/intel64/bin $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i64/bin2
+	$(CP) -R $(PIN_ROOT)/ia32/pinrt/bin $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i32/bin1
+	$(CP) -R $(PIN_ROOT)/ia32/bin $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/i32/bin2
+	# Start application in background and get Windows PID
+	$(RM) -f $(OBJDIR)simple_wait_app_pid1.log
+	$(OBJDIR)win_app_launcher$(EXE_SUFFIX) $(OBJDIR)simple_wait_app_w$(EXE_SUFFIX) > $(OBJDIR)simple_wait_app_pid1.log & \
+	LAUNCHER_PID=$$!; \
+	sleep 1; \
+	$(OBJDIR)/no_flags_outside_kit_windows_attach_tmp/launcher/$(PIN_EXEC_NAME) -pid `cat $(OBJDIR)simple_wait_app_pid1.log` \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) > $(OBJDIR)$(@:test=out) 2>&1; \
+	kill -9 $$LAUNCHER_PID 2>/dev/null || true
+	$(QGREP) "Create pind process failed" $(OBJDIR)$(@:test=out)
+	$(QGREP) "Application will continue to run natively" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out) $(OBJDIR)simple_wait_app_pid1.log
+	$(RM) -rf $(OBJDIR)/no_flags_outside_kit_windows_attach_tmp
+
+# Test that Pin launcher fails with suitable error message when the path of one of the flags is invalid in windows attach mode
+bad_path_outside_kit_windows_attach.test:$(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP) $(OBJDIR)simple_wait_app_w$(EXE_SUFFIX) $(OBJDIR)win_app_launcher$(EXE_SUFFIX)
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/launcher
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64
+	mkdir -p $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32
+	$(CP) $(PIN_ROOT)/$(PIN_EXEC_NAME) $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/launcher/
+	$(CP) -R $(PIN_ROOT)/intel64/pinrt/bin $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64/bin1
+	$(CP) -R $(PIN_ROOT)/intel64/bin $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64/bin2
+	$(CP) -R $(PIN_ROOT)/ia32/pinrt/bin $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32/bin1
+	$(CP) -R $(PIN_ROOT)/ia32/bin $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32/bin2
+	# Start application in background and get Windows PID
+	$(RM) -f $(OBJDIR)simple_wait_app_pid2.log
+	$(OBJDIR)win_app_launcher$(EXE_SUFFIX) $(OBJDIR)simple_wait_app_w$(EXE_SUFFIX) > $(OBJDIR)simple_wait_app_pid2.log & \
+	WIN_LAUNCHER_PID=$$!; \
+	sleep 1; \
+	$(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/launcher/$(PIN_EXEC_NAME) -pid `cat $(OBJDIR)simple_wait_app_pid2.log` \
+	-pind_path_64 $(OBJDIR)/wrong/path \
+	-pind_path_32 $(OBJDIR)/wrong/path \
+	-pinbin_path_64 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64/bin2 \
+	-pinbin_path_32 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32/bin2 \
+	-pin_ld_path_64 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64/bin1 \
+	-pin_ld_path_32 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32/bin1 \
+	-pin_lib_64 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i64/bin1 \
+	-pin_lib_32 $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp/i32/bin1 \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) > $(OBJDIR)$(@:test=out) 2>&1; \
+	kill -9 $$WIN_LAUNCHER_PID 2>/dev/null || true
+	$(QGREP) "LAUNCHER ERROR: pind.exe not found" $(OBJDIR)$(@:test=out)
+	$(QGREP) "Application will continue to run natively" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out) $(OBJDIR)simple_wait_app_pid2.log
+	$(RM) -rf $(OBJDIR)/bad_path_outside_kit_windows_attach_tmp
+
+# Test that running Pin with all the knobs with the default kit is passing
+win_launcher_default_kit.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -pind_path_64 $(PIN_ROOT)/intel64/pinrt/bin \
+	-pind_path_32 $(PIN_ROOT)/ia32/pinrt/bin \
+	-pinbin_path_64 $(PIN_ROOT)/intel64/bin \
+	-pinbin_path_32 $(PIN_ROOT)/ia32/bin \
+	-pin_ld_path_64 $(PIN_ROOT)/intel64/pinrt/bin \
+	-pin_ld_path_32 $(PIN_ROOT)/ia32/pinrt/bin \
+	-pin_lib_64 $(PIN_ROOT)/intel64/pinrt/bin \
+	-pin_lib_32 $(PIN_ROOT)/ia32/pinrt/bin \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=pintool.out) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "Count " $(OBJDIR)$(@:test=pintool.out)
+	$(RM) $(OBJDIR)$(@:test=out) $(OBJDIR)$(@:test=pintool.out)
+
+# Test that running Pin with all the knobs with a kit in a custom structure is passing.
+# The custom kit structure is the following:
+#└── tmp
+#    ├── i32
+#    │   ├── bin1			(binaries from ia32/pinrt/bin)
+#    │   │   └── plugins	(binaries from ia32/pinrt/bin/plugins)
+#    │   └── bin2			(binaries from ia32/bin)
+#    ├── i64
+#    │   ├── bin1			(binaries from intel64/pinrt/bin)
+#    │   │   └── plugins	(binaries from intel64/pinrt/bin/plugins)
+#    │   └── bin2			(binaries from intel64/bin)
+#    └── launcher			(pin.exe/pin32.exe)
+win_launcher_custom_kit.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	mkdir -p $(OBJDIR)/tmp/launcher
+	mkdir -p $(OBJDIR)/tmp/i64
+	mkdir -p $(OBJDIR)/tmp/i32
+	$(CP) $(PIN_ROOT)/$(PIN_EXEC_NAME) $(OBJDIR)/tmp/launcher/
+	$(CP) -R $(PIN_ROOT)/intel64/pinrt/bin $(OBJDIR)/tmp/i64/bin1
+	$(CP) -R $(PIN_ROOT)/intel64/bin $(OBJDIR)/tmp/i64/bin2
+	$(CP) -R $(PIN_ROOT)/ia32/pinrt/bin $(OBJDIR)/tmp/i32/bin1
+	$(CP) -R $(PIN_ROOT)/ia32/bin $(OBJDIR)/tmp/i32/bin2
+	# Run Pin
+	$(OBJDIR)/tmp/launcher/$(PIN_EXEC_NAME) \
+	-pind_path_64 $(OBJDIR)/tmp/i64/bin1 \
+	-pind_path_32 $(OBJDIR)/tmp/i32/bin1 \
+	-pinbin_path_64 $(OBJDIR)/tmp/i64/bin2 \
+	-pinbin_path_32 $(OBJDIR)/tmp/i32/bin2 \
+	-pin_ld_path_64 $(OBJDIR)/tmp/i64/bin1 \
+	-pin_ld_path_32 $(OBJDIR)/tmp/i32/bin1 \
+	-pin_lib_64 $(OBJDIR)/tmp/i64/bin1 \
+	-pin_lib_32 $(OBJDIR)/tmp/i32/bin1 \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=pintool.out) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "Count " $(OBJDIR)$(@:test=pintool.out)
+	$(RM) $(OBJDIR)$(@:test=out) $(OBJDIR)$(@:test=pintool.out)
+	$(RM) -rf $(OBJDIR)/tmp
+
+# Test that running Pin with the 64 pind knob passing a non existent file is failing
+win_launcher_bad_64pind_path.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	-$(PIN) -pind_path_64 $(PIN_ROOT)/no_such_path \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=pintool.out) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "no_such_path does not exist or is not a directory" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out)
+	-$(RM) $(OBJDIR)$(@:test=pintool.out)
+
+# Test that running Pin with the 32 pind knob passing a non existent file is failing
+win_launcher_bad_32pind_path.test: $(OBJDIR)inscount1$(PINTOOL_SUFFIX) $(TESTAPP)
+	-$(PIN) -pind_path_32 $(PIN_ROOT)/no_such_path \
+	-t $(OBJDIR)inscount1$(PINTOOL_SUFFIX) -o $(OBJDIR)$(@:test=pintool.out) \
+	-- $(TESTAPP) makefile $(OBJDIR)$(@:.test=.makefile.copy) > $(OBJDIR)$(@:test=out) 2>&1
+	$(QGREP) "no_such_path does not exist or is not a directory" $(OBJDIR)$(@:test=out)
+	$(RM) $(OBJDIR)$(@:test=out)
+	-$(RM) $(OBJDIR)$(@:test=pintool.out)
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+# This rule copy original pin laucnher into this folder so that we can emulate running launcher from a place which is the kit root
+./cloned_pin: $(PIN_ROOT)/pin
+	$(CP) $(PIN_ROOT)/pin ./cloned_pin
+
+###### Special applications' build rules ######
+
+###### Special dlls' build rules ######
+

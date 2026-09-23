@@ -1,0 +1,16 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+The run_benchmark will run time_run_command_to_csv.py with 385 runs
+ on the following 4 tools written by script VS their equal native cpp tools
+
+1. instcount_ins
+2. instcount_bbl
+3. staticcount
+4. malloctrace
+
+The output of each benchmark is written to <tool_name>.csv file with 385 entries of time in seconds of each run.
+
+In order to run ./run_benchmark copy run_benchmark and time_run_command_to_csv.py to the parent folder and run it from there.

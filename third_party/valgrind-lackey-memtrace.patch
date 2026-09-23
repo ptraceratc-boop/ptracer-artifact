@@ -1,0 +1,101 @@
+--- a/lackey/lk_main.c
++++ b/lackey/lk_main.c
+@@ -175,6 +175,7 @@
+ #include "pub_tool_libcbase.h"
+ #include "pub_tool_options.h"
+ #include "pub_tool_machine.h"     // VG_(fnptr_to_fnentry)
++#include "pub_tool_libcfile.h"    // VG_(open)/VG_(write)/VG_(close)
+ 
+ /*------------------------------------------------------------*/
+ /*--- Command line options                                 ---*/
+@@ -452,25 +453,46 @@
+ static Int   events_used = 0;
+ 
+ 
+-static VG_REGPARM(2) void trace_instr(Addr addr, SizeT size)
+-{
+-   VG_(printf)("I  %08lx,%lu\n", addr, size);
+-}
+-
+-static VG_REGPARM(2) void trace_load(Addr addr, SizeT size)
+-{
+-   VG_(printf)(" L %08lx,%lu\n", addr, size);
++/* ---- turn lackey into a lightweight binary MEMORY tracer ----
++ * Instead of formatting every access as text via VG_(printf) (the dominant
++ * cost, ~270x), append a fixed 16-byte binary record {addr, size, type} to a
++ * 1 MiB buffer that is bulk-written to "lackey_memtrace.log" (the harness
++ * points that at /dev/null).  trace_instr is a no-op -- we trace data reads and
++ * writes only.  All of lackey's other features (basic/detailed counts, SB
++ * tracing) are disabled in lk_post_clo_init.  See tracers/README.md.          */
++static Int   lk_trace_fd = -1;
++#define LK_BUFSZ (1 << 20)
++static UChar lk_buf[LK_BUFSZ];
++static SizeT lk_bufpos = 0;
++
++static void lk_flush(void)
++{
++   if (lk_bufpos > 0 && lk_trace_fd >= 0)
++      VG_(write)(lk_trace_fd, lk_buf, (Int)lk_bufpos);
++   lk_bufpos = 0;
++}
++
++static inline void lk_emit(Addr addr, SizeT size, HChar type)
++{
++   /* Text format (kept): "<T> <addr>,<size>\n", same as upstream
++    * lackey's --trace-mem, but buffered + bulk-written to the trace fd instead
++    * of VG_(printf)'d line-by-line to the Valgrind log. */
++   HChar tmp[48];
++   Int n = VG_(snprintf)(tmp, sizeof(tmp), "%c %lx,%lu\n",
++                         (HChar)type, addr, size);
++   if (lk_bufpos + n > LK_BUFSZ) lk_flush();
++   VG_(memcpy)(&lk_buf[lk_bufpos], tmp, n);
++   lk_bufpos += n;
+ }
+ 
+-static VG_REGPARM(2) void trace_store(Addr addr, SizeT size)
++static VG_REGPARM(2) void trace_instr(Addr addr, SizeT size)
+ {
+-   VG_(printf)(" S %08lx,%lu\n", addr, size);
++   (void)addr; (void)size;            /* reads/writes only -- ignore I-fetches */
+ }
+ 
+-static VG_REGPARM(2) void trace_modify(Addr addr, SizeT size)
+-{
+-   VG_(printf)(" M %08lx,%lu\n", addr, size);
+-}
++static VG_REGPARM(2) void trace_load(Addr addr, SizeT size)   { lk_emit(addr, size, 'L'); }
++static VG_REGPARM(2) void trace_store(Addr addr, SizeT size)  { lk_emit(addr, size, 'S'); }
++static VG_REGPARM(2) void trace_modify(Addr addr, SizeT size) { lk_emit(addr, size, 'M'); }
+ 
+ 
+ static void flushEvents(IRSB* sb)
+@@ -639,6 +661,18 @@
+ static void lk_post_clo_init(void)
+ {
+    Int op, tyIx;
++   SysRes res;
++
++   /* force memory-tracing-only mode regardless of CLI flags, and open
++    * the binary trace log. */
++   clo_basic_counts    = False;
++   clo_detailed_counts = False;
++   clo_trace_sbs       = False;
++   clo_trace_mem       = True;
++   res = VG_(open)("lackey_memtrace.log",
++                   VKI_O_CREAT | VKI_O_TRUNC | VKI_O_WRONLY, 0644);
++   if (!sr_isError(res))
++      lk_trace_fd = (Int)sr_Res(res);
+ 
+    if (clo_detailed_counts) {
+       for (op = 0; op < N_OPS; op++)
+@@ -996,6 +1030,10 @@
+ 
+ static void lk_fini(Int exitcode)
+ {
++   /* flush the binary memory-trace buffer and close the log. */
++   lk_flush();
++   if (lk_trace_fd >= 0) { VG_(close)(lk_trace_fd); lk_trace_fd = -1; }
++
+    tl_assert(clo_fnname);
+    tl_assert(clo_fnname[0]);
+ 

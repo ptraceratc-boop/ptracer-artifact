@@ -1,0 +1,37 @@
+{
+ "source": "the published paper figure (vector PDF): filled-rectangle heights relative to the uninstrumented (1x) bar, read once and cached here; approximate rendered-figure values, not raw measurements",
+ "suites": [
+  "poly",
+  "mc",
+  "pyperf",
+  "rust",
+  "node",
+  "java"
+ ],
+ "series": {
+  "native": {
+   "poly": 1.0,
+   "mc": 1.0,
+   "pyperf": 1.0,
+   "rust": 1.0,
+   "node": 1.0,
+   "java": 1.0
+  },
+  "hifi": {
+   "poly": 1.3001,
+   "mc": 4.5303,
+   "pyperf": 4.9804,
+   "rust": 1.2701,
+   "node": 10.8108,
+   "java": 10.6408
+  },
+  "fast": {
+   "poly": 1.0602,
+   "mc": 3.7103,
+   "pyperf": 3.2303,
+   "rust": 1.0702,
+   "node": 5.9204,
+   "java": 5.5003
+  }
+ }
+}

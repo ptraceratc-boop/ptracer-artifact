@@ -1,0 +1,62 @@
+/*
+ * Copyright (C) 2012-2025 Intel Corporation.
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <iostream>
+#include <fstream>
+#include <assert.h>
+#include "pin.H"
+
+#include "instrumentation_order_app.h"
+
+
+
+
+// A knob for defining the output file name
+KNOB< std::string > KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool", "o", "instrumentation_order17.out",
+                                   "specify file name for instrumentation order output");
+
+// std::ofstream object for handling the output.
+std::ofstream outstream;
+
+void Emit(char const* message) { outstream << message << std::endl; }
+
+static VOID Image(IMG img, VOID* v)
+{
+    RTN rtn = RTN_FindByName(img, watch_rtn);
+
+    if (!RTN_Valid(rtn))
+    {
+        return;
+    }
+    printf("Image Instrumenting %s\n", watch_rtn);
+    RTN_Open(rtn);
+    INS ins = RTN_InsHeadOnly(rtn);
+    ASSERTX(INS_Valid(ins));
+
+    INS_InsertCall(ins, IPOINT_BEFORE, MAKE_AFUNPTR(Emit), IARG_PTR, "IMG instrumentation2", IARG_CALL_ORDER,
+                   CALL_ORDER_FIRST + 2, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_BEFORE, MAKE_AFUNPTR(Emit), IARG_PTR, "IMG instrumentation1", IARG_CALL_ORDER,
+                   CALL_ORDER_FIRST + 2, IARG_END);
+    RTN_Close(rtn);
+}
+
+static VOID Fini(INT32 code, VOID* v) { outstream.close(); }
+
+int main(int argc, char* argv[])
+{
+    PIN_InitSymbols();
+    PIN_Init(argc, argv);
+
+    outstream.open(KnobOutputFile.Value().c_str());
+
+    IMG_AddInstrumentFunction(Image, 0);
+
+    PIN_AddFiniFunction(Fini, 0);
+
+    // Start the program, never returns
+    PIN_StartProgram();
+
+    return 0;
+}

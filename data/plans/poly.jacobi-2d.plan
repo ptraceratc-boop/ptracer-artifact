@@ -1,0 +1,11 @@
+PTPLAN 2
+I suites/polybench/targets/jacobi-2d_large
+S 138c B 1 r:rax
+S 14a1 B 4 r:rdi r:rdx r:rsi r:rsp
+S 1541 B 2 r:rsi r:rsp
+S 159e A 1 r:r13
+S 1618 B 1 r:r8
+S 1621 A 1 r:r13
+S 1795 A 1 r:rbp
+S 17ee B 3 f r:rsi r:rsp
+S 186f A 1 r:rax

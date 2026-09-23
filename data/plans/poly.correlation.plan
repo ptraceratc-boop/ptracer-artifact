@@ -1,0 +1,8 @@
+PTPLAN 2
+I suites/polybench/targets/correlation_large
+S 13ac B 1 r:rax
+S 14c1 B 4 r:rcx r:rdi r:rdx r:rsp
+S 152e B 6 r:r8 r:r9 r:rcx r:rdi r:rdx r:rsp
+S 1975 A 1 r:rbp
+S 19ce B 3 f r:rsi r:rsp
+S 1a97 A 1 r:rax

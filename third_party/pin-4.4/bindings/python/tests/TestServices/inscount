@@ -1,0 +1,72 @@
+#
+# Copyright (C) 2023-2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+import json, pin
+
+# Global vars
+total = 0
+
+test_all_types_list = ["HELLO", 2.5, -1, 4294967296, True, False, None]
+
+def test_callback_all_types(*args):
+    ret = client_callback_all_types(*args)
+    assert 2.5 == ret
+    ret = foo_all_types(*args)
+    assert 2.5 == ret
+
+def test_callback_no_args():
+    ret = client_callback_no_args()
+    assert None == ret
+    ret = foo_no_args()
+    assert None == ret
+
+def test_callback_in_out_arg(arg):
+    # Client callback
+    arg_type = type(arg)
+    ret = client_callback(arg)
+    assert arg_type == type(ret)
+    assert ret == arg
+    
+    # Server callback
+    ret = foo(arg)
+    assert arg_type == type(ret)
+    assert ret == arg
+    
+
+def send_result_callback_message():
+    test_callback_in_out_arg("Hello") # test str
+    test_callback_in_out_arg(2.5) # test float
+    test_callback_in_out_arg(-1) # test int
+    test_callback_in_out_arg(4294967296) # test unsigned int
+    test_callback_in_out_arg(True) # test bool
+    test_callback_in_out_arg(False) # test bool
+    test_callback_in_out_arg(None) # test None
+    
+    test_callback_no_args()
+    
+    test_callback_all_types(*test_all_types_list)
+    
+    data = {
+        "Count": total
+    }
+    json_string = json.dumps(data)
+    print(f"In send_result_callback_message: JSON data: {json_string}")
+    Glue_SendServiceResultCallback(json_string)
+    
+
+def count():
+    global total
+    total += 1
+
+def instruction_instrumented_func(ins):
+    pin.INS_InsertCall(ins, pin.IPOINT_BEFORE, count)
+    
+def fini(code):
+    global total
+    print(f"inscount: The total number of executed instructions are:{total}")
+    send_result_callback_message()
+
+pin.INS_AddInstrumentFunction(instruction_instrumented_func)
+pin.PIN_AddFiniFunction(fini)

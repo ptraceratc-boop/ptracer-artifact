@@ -1,0 +1,22 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+# A skeleton PinGlue tool that enables client side to compeltely specify the service functionality
+
+import json, pin
+
+def main(*knobs):
+    """The main function that sets up the instrumentation."""
+
+    try:
+        process_knobs(knobs)
+    except Exception as e:
+        print(f"Excpetion processing knobs {e}")
+    
+    try:
+        instrument()
+    except Exception as e:
+        print(f"Excpetion Requesting Instrumentation")
+        send_result_on_error(e)

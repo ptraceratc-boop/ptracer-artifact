@@ -1,0 +1,290 @@
+#
+# Copyright (C) 2012-2026 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Test targets
+#
+##############################################################
+
+###### Place all generic definitions here ######
+
+# This defines tests which run tools of the same name.  This is simply for convenience to avoid
+# defining the test name twice (once in TOOL_ROOTS and again in TEST_ROOTS).
+# Tests defined here should not be defined in TOOL_ROOTS and TEST_ROOTS.
+TEST_TOOL_ROOTS := 
+
+# This defines the tests to be run that were not already defined in TEST_TOOL_ROOTS.
+TEST_ROOTS := pinglueserver_instcount_bbl \
+			  pinglueserver_instcount_ins \
+			 pinglueserver_staticcount \
+			 pinglueserver_staticcount_probe \
+			 pinglueserver_IARGList \
+			 pinglueserver_pinatrace \
+			 pinglueserver_itrace \
+			 pinglueserver_malloctrace \
+			 pinglueserver_malloctrace_probe \
+			 pinglueserver_invocation \
+			 pinglueserver_safecopy \
+			 pinglueserver_detach \
+			 pinglueserver_malloc_mt \
+			 pinglueserver_inscount_tls \
+			 pinglueserver_GetSourceLocation \
+			 pinglueserver_regval \
+			 pinglueserver_fxsave \
+			 pinglueserver_replacesig \
+			 pinglueserver_glue_timer
+
+
+
+
+# This defines the tools which will be run during the the tests, and were not already defined in
+# TEST_TOOL_ROOTS.
+TOOL_ROOTS := pinglueserver staticcount malloctrace IARGList regval
+
+# This defines the static analysis tools which will be run during the the tests. They should not
+# be defined in TEST_TOOL_ROOTS. If a test with the same name exists, it should be defined in
+# TEST_ROOTS.
+# Note: Static analysis tools are in fact executables linked with the Pin Static Analysis Library.
+# This library provides a subset of the Pin APIs which allows the tool to perform static analysis
+# of an application or dll. Pin itself is not used when this tool runs.
+SA_TOOL_ROOTS :=
+
+# This defines all the applications that will be run during the tests.
+APP_ROOTS := regval_app
+
+# This defines any additional object files that need to be compiled.
+OBJECT_ROOTS :=
+
+# This defines any additional dlls (shared objects), other than the pintools, that need to be compiled.
+DLL_ROOTS :=
+
+# This defines any static libraries (archives), that need to be built.
+LIB_ROOTS :=
+
+###### Place OS-specific definitions here ######
+
+###### Handle exceptions here (OS/arch related) ######
+
+RUNNABLE_TESTS := $(TEST_TOOL_ROOTS) $(TEST_ROOTS)
+
+###### Handle exceptions here (bugs related) ######
+
+###### Define the sanity subset ######
+
+# This defines the list of tests that should run in sanity. It should include all the tests listed in
+# TEST_TOOL_ROOTS and TEST_ROOTS excluding only unstable tests.
+SANITY_SUBSET := pinglueserver_instcount_bbl \
+				pinglueserver_inscount_tls \
+				pinglueserver_staticcount \
+				pinglueserver_staticcount_probe \
+				pinglueserver_malloctrace_probe \
+				pinglueserver_itrace \
+				pinglueserver_pinatrace \
+				pinglueserver_invocation \
+				pinglueserver_safecopy \
+				pinglueserver_detach \
+				pinglueserver_malloc_mt \
+				pinglueserver_GetSourceLocation \
+				pinglueserver_regval \
+				pinglueserver_fxsave \
+				pinglueserver_replacesig \
+				pinglueserver_glue_timer
+
+##############################################################
+#
+# Test recipes
+#
+##############################################################
+
+# This section contains recipes for tests other than the default.
+# See makefile.default.rules for the default test rules.
+# All tests in this section should adhere to the naming convention: <testname>.test
+
+VPATH := tests/NativeTools
+
+# build only
+pinglueserver.build: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX)
+
+$(OBJDIR)pinglueserver$(OBJ_SUFFIX): *.h
+
+# tests
+pinglueserver_instcount_bbl.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)instcount_bbl$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/instcount_bbl.py \
+	 -- $(HELLO_APP) \
+	 > $(OBJDIR)script_instcount_bbl.out
+	$(PIN) -t $(OBJDIR)instcount_bbl$(PINTOOL_SUFFIX) -- $(HELLO_APP) \
+	 > $(OBJDIR)instcount_bbl.out
+	-$(DIFF) $(OBJDIR)instcount_bbl.out $(OBJDIR)script_instcount_bbl.out
+	$(RM) $(OBJDIR)instcount_bbl.out $(OBJDIR)script_instcount_bbl.out
+
+pinglueserver_instcount_ins.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)instcount_ins$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/instcount_ins.py \
+	 -- $(HELLO_APP) \
+	 > $(OBJDIR)script_instcount_ins.out
+	$(PIN) -t $(OBJDIR)instcount_ins$(PINTOOL_SUFFIX) -- $(HELLO_APP) \
+	 > $(OBJDIR)instcount_ins.out
+	-$(DIFF) $(OBJDIR)instcount_ins.out $(OBJDIR)script_instcount_ins.out
+	$(RM) $(OBJDIR)instcount_ins.out $(OBJDIR)script_instcount_ins.out
+
+pinglueserver_staticcount.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)staticcount$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/staticcount.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_staticcount.copy \
+	  > $(OBJDIR)script_staticcount.out
+	$(PIN) -t $(OBJDIR)staticcount$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_staticcount.copy \
+	 > $(OBJDIR)staticcount.out
+	-$(DIFF) $(OBJDIR)staticcount.out $(OBJDIR)script_staticcount.out
+	$(RM) $(OBJDIR)staticcount.out $(OBJDIR)script_staticcount.out $(OBJDIR)makefile_staticcount.copy
+
+pinglueserver_staticcount_probe.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)staticcount$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -probe -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/staticcount.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_staticcount_probe.copy \
+	  > $(OBJDIR)script_staticcount_probe.out
+	$(PIN) -probe -t $(OBJDIR)staticcount$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_staticcount_probe.copy \
+	 > $(OBJDIR)staticcount_probe.out 2>&1
+	-$(DIFF) $(OBJDIR)staticcount_probe.out $(OBJDIR)script_staticcount_probe.out
+	$(RM) $(OBJDIR)staticcount_probe.out $(OBJDIR)script_staticcount_probe.out $(OBJDIR)makefile_staticcount_probe.copy
+
+pinglueserver_IARGList.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)IARGList$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/IARGList.py \
+	 -- $(HELLO_APP) \
+	 > $(OBJDIR)script_IARGList.out
+	$(PIN) -t $(OBJDIR)IARGList$(PINTOOL_SUFFIX) -- $(HELLO_APP) \
+	 > $(OBJDIR)IARGList.out 2>&1
+	-$(DIFF) $(OBJDIR)IARGList.out $(OBJDIR)script_IARGList.out
+	$(RM) $(OBJDIR)IARGList.out $(OBJDIR)script_IARGList.out
+
+pinglueserver_pinatrace.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)pinatrace$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/pinatrace.py \
+	 -- $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinatrace$(PINTOOL_SUFFIX) -- $(HELLO_APP)
+	-$(BASHTEST) `wc -l < pinatrace.out` -eq `wc -l < script_pinatrace.out`
+	$(RM) pinatrace.out script_pinatrace.out
+
+pinglueserver_itrace.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)itrace$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/itrace.py \
+	 -- $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)itrace$(PINTOOL_SUFFIX) -- $(HELLO_APP)
+	-$(BASHTEST) `wc -l < itrace.out` -eq `wc -l < script_itrace.out`
+	$(RM) itrace.out script_itrace.out
+
+pinglueserver_malloctrace.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)malloctrace$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/malloctrace.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_malloctrace.copy
+	$(PIN) -t $(OBJDIR)malloctrace$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_malloctrace.copy
+	-$(BASHTEST) `wc -l < malloctrace.out` -eq `wc -l < script_malloctrace.out`
+	$(RM) malloctrace.out script_malloctrace.out $(OBJDIR)makefile_malloctrace.copy
+
+pinglueserver_malloctrace_probe.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)malloctrace_probe$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -probe -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/malloctrace_probe.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_script_malloctrace_probe.copy
+	$(PIN) -t $(OBJDIR)malloctrace_probe$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_malloctrace_probe.copy
+	$(DIFF) $(OBJDIR)makefile_malloctrace_probe.copy $(OBJDIR)makefile_script_malloctrace_probe.copy
+	-$(BASHTEST) `wc -l < malloctrace_probe.out` -eq `wc -l < script_malloctrace_probe.out`
+	$(RM) malloctrace_probe.out script_malloctrace_probe.out $(OBJDIR)makefile_malloctrace_probe.copy $(OBJDIR)makefile_script_malloctrace_probe.copy
+
+pinglueserver_invocation.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)invocation$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/invocation.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)script_makefile_invocation.copy
+	$(PIN) -t $(OBJDIR)invocation$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_invocation.copy
+	$(DIFF) $(OBJDIR)makefile_invocation.copy $(OBJDIR)script_makefile_invocation.copy
+	-$(BASHTEST) `wc -l < invocation.out` -eq `wc -l < script_invocation.out`
+	$(RM) invocation.out script_invocation.out $(OBJDIR)makefile_invocation.copy $(OBJDIR)script_makefile_invocation.copy
+
+pinglueserver_safecopy.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)safecopy$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/safecopy.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_safecopy.copy
+	$(PIN) -t $(OBJDIR)safecopy$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_safecopy.copy
+	$(QGREP) "TOOL: PIN_SafeCopyEx failed as expected" script_safecopy.out
+	-$(BASHTEST) `wc -l < safecopy.out` -eq `wc -l < script_safecopy.out`
+	$(RM) safecopy.out script_safecopy.out $(OBJDIR)makefile_safecopy.copy
+
+pinglueserver_detach.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)detach$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/detach.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_detach.copy \
+	 > $(OBJDIR)script_detach.out
+	$(PIN) -t $(OBJDIR)detach$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_detach.copy \
+	 > $(OBJDIR)detach.out 2>&1
+	$(DIFF) $(OBJDIR)detach.out $(OBJDIR)script_detach.out
+	$(RM) $(OBJDIR)detach.out $(OBJDIR)script_detach.out $(OBJDIR)makefile_detach.copy
+
+pinglueserver_malloc_mt.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)malloc_mt$(PINTOOL_SUFFIX) $(THREAD_APP)
+	$(PIN) -assert_on_memory_conflict FIXED_ONLY -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) \
+	  -gluetool tests/Scripts/malloc_mt.py -- $(THREAD_APP)
+	$(PIN) -assert_on_memory_conflict FIXED_ONLY -t $(OBJDIR)malloc_mt$(PINTOOL_SUFFIX) -- $(THREAD_APP)
+	-$(BASHTEST) `wc -l < malloc_mt.out` -eq `wc -l < script_malloc_mt.out`
+	$(RM) malloc_mt.out script_malloc_mt.out 
+
+pinglueserver_inscount_tls.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)inscount_tls$(PINTOOL_SUFFIX) $(THREAD_APP)
+	$(PIN) -assert_on_memory_conflict FIXED_ONLY -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) \
+	  -gluetool tests/Scripts/inscount_tls.py -- $(THREAD_APP) > $(OBJDIR)script_inscount_tls.out 2>&1
+	$(PIN) -assert_on_memory_conflict FIXED_ONLY -t $(OBJDIR)inscount_tls$(PINTOOL_SUFFIX) \
+	  -- $(THREAD_APP) > $(OBJDIR)inscount_tls.out 2>&1
+	-$(BASHTEST) `wc -l < $(OBJDIR)inscount_tls.out` -eq `wc -l < $(OBJDIR)script_inscount_tls.out`
+	$(RM) $(OBJDIR)inscount_tls.out $(OBJDIR)script_inscount_tls.out
+
+pinglueserver_GetSourceLocation.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)GetSourceLocation$(PINTOOL_SUFFIX) $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/GetSourceLocation.py -- $(HELLO_APP)
+	$(PIN) -t $(OBJDIR)GetSourceLocation$(PINTOOL_SUFFIX) -- $(HELLO_APP)
+	$(DIFF) GetSourceLocation.out script_GetSourceLocation.out
+	$(RM) GetSourceLocation.out script_GetSourceLocation.out
+
+pinglueserver_regval.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)regval$(PINTOOL_SUFFIX) $(OBJDIR)regval_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/regval.py -- $(OBJDIR)regval_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)regval$(PINTOOL_SUFFIX) -o regval.out -- $(OBJDIR)regval_app$(EXE_SUFFIX)
+	-$(BASHTEST) `wc -l < regval.out` -eq `wc -l < script_regval.out`
+	$(RM) regval.out script_regval.out
+
+pinglueserver_fxsave.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)regval_app$(EXE_SUFFIX)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/fxsave.py -- $(OBJDIR)regval_app$(EXE_SUFFIX)
+	$(RM) script_fxsave.out
+
+pinglueserver_replacesig.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(OBJDIR)replacesigprobed$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -probe -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/replacesigprobed.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)script_makefile_probe_replacesig.copy
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/replacesig.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)script_makefile_replacesig.copy
+	$(PIN) -t $(OBJDIR)replacesigprobed$(PINTOOL_SUFFIX) -- $(TESTAPP) makefile $(OBJDIR)makefile_replacesig.copy \
+		> $(OBJDIR)replacesigprobed.out 2>&1
+	$(DIFF) makefile $(OBJDIR)script_makefile_replacesig.copy
+	$(DIFF) makefile $(OBJDIR)script_makefile_probe_replacesig.copy
+	$(QGREP) "NewMalloc (" script_replacesigprobed.out
+	$(QGREP) "NewMalloc (" script_replacesig.out
+	$(QGREP) "In Probe_Exit_IA32" script_replacesigprobed.out
+	$(RM) $(OBJDIR)replacesigprobed.out script_replacesigprobed.out script_replacesig.out $(OBJDIR)script_makefile_replacesig.copy \
+	 $(OBJDIR)script_makefile_probe_replacesig.copy $(OBJDIR)makefile_replacesig.copy
+
+pinglueserver_glue_timer.test: $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) $(TESTAPP)
+	$(PIN) -t $(OBJDIR)pinglueserver$(PINTOOL_SUFFIX) -gluetool tests/Scripts/malloctrace_with_timer.py \
+	 -- $(TESTAPP) makefile $(OBJDIR)makefile_glue_timer.copy
+	$(DIFF) makefile $(OBJDIR)makefile_glue_timer.copy
+	$(RM) malloctrace_with_timer.out $(OBJDIR)makefile_glue_timer.copy
+
+##############################################################
+#
+# Build rules
+#
+##############################################################
+
+# This section contains the build rules for all binaries that have special build rules.
+# See makefile.default.rules for the default build rules.
+
+###### Special tools' build rules ######	
+$(OBJDIR)regval$(PINTOOL_SUFFIX): $(OBJDIR)regval$(OBJ_SUFFIX) $(REGVALLIB)
+	$(TOOL_LINKER) $(TOOL_LDFLAGS) $(LINK_EXE)$@ $^ $(TOOL_LPATHS) $(TOOL_LIBS)
+
+###### Special applications' build rules ######
+
+# This application needs to be compiled without optimizations for the placeholder functions to be available to the tool.
+$(OBJDIR)regval_app$(EXE_SUFFIX): regval_app.cpp
+	$(APP_CXX) $(APP_CXXFLAGS_NOOPT) $(COMP_EXE)$@ $< $(APP_LDFLAGS_NOOPT) $(APP_LIBS) $(CXX_LPATHS) $(CXX_LIBS)

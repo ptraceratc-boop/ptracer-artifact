@@ -1,0 +1,6 @@
+#ifndef PTRACER_COMPAT_LINUX_FUTEX_H
+#define PTRACER_COMPAT_LINUX_FUTEX_H
+#ifndef FUTEX_WAIT
+#define FUTEX_WAIT 0
+#endif
+#endif

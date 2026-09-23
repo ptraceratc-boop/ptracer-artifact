@@ -1,0 +1,58 @@
+#
+# Copyright (C) 2024-2024 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+import json, pin
+
+
+# Global vars
+total = 0
+
+
+def send_result_callback_message():
+    data = {
+        "Count": total
+    }
+    json_string = json.dumps(data)
+    print(f"In send_result_callback_message: JSON data: {json_string}")
+    # Set the service result (as JSON) to the client
+    Glue_SendServiceResultCallback(json_string)
+    
+
+def count():
+    global total
+    total += 1
+
+def instruction_instrumented_func(ins):
+    pin.INS_InsertCall(ins, pin.IPOINT_BEFORE, count)
+    
+def fini(code):
+    global total
+    print(f"inscount: The total number of executed instructions is:{total}")
+    try:
+        ret = foo("Shuki", 2.5, -1, 7, True, False, None)
+        print(f"ret: {ret}")
+        assert ret == "HELLO"
+    except Exception as e:
+        print("An exception occurred: ", e)
+        assert False # Exception should NOT happen here
+        
+    # List is not supported as remote func arg, we should get an exception here
+    try:
+        ret = foo("Shuki", [1, 2])
+        print(f"ret: {ret}")
+        assert False # Exception should happen here
+    except Exception as e:
+        print("An expected exception occurred: ", e)
+    send_result_callback_message()
+
+def main(*args):
+    pin.INS_AddInstrumentFunction(instruction_instrumented_func)
+    pin.PIN_AddFiniFunction(fini)
+    
+    print("inscount knobs:")
+    for x in args:
+        print(x)
+        
+    print("End of unitest inscount service main")

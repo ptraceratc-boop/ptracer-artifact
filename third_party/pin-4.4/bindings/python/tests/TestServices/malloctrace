@@ -1,0 +1,47 @@
+#
+# Copyright (C) 2023-2023 Intel Corporation.
+# SPDX-License-Identifier: MIT
+#
+
+import json, pin
+
+# Note: MallocAfter and Arg1Before functions are not defined here,
+# Client must either register them as remote functions or deliver their definitions through scripts fragments
+
+def send_result_callback_message():
+    data = {
+        "Name": "Dummy"
+    }
+    json_string = json.dumps(data)
+    print(f"In send_result_callback_message: JSON data: {json_string}")
+    # Set the service result (as JSON) to the client
+    Glue_SendServiceResultCallback(json_string)
+ 
+def fini(code):
+    print(f"malloctrace: In script fini")
+    send_result_callback_message()
+
+def image_instrumentation_cb(img):
+    # Instrument the malloc() and free() functions.  Print the input argument
+    # of each malloc() or free(), and the return value of malloc().
+    # Find the malloc() function.
+    mallocRtn = pin.RTN_FindByName(img, "malloc")
+    if(pin.RTN_Valid(mallocRtn)):
+        pin.RTN_Open(mallocRtn)
+        # Instrument malloc() to print the input argument value and the return value.
+        pin.RTN_InsertCall(mallocRtn, pin.IPOINT_BEFORE, Arg1Before, pin.IARG_PYOBJ, "malloc", pin.IARG_FUNCARG_ENTRYPOINT_VALUE, 0)
+        pin.RTN_InsertCall(mallocRtn, pin.IPOINT_AFTER, MallocAfter, pin.IARG_FUNCRET_EXITPOINT_VALUE)
+
+        pin.RTN_Close(mallocRtn)
+	
+    # Find the free() function.
+    freeRtn = pin.RTN_FindByName(img, "free")
+    if (pin.RTN_Valid(freeRtn)):
+        pin.RTN_Open(freeRtn)
+        # Instrument free() to print the input argument value.
+        pin.RTN_InsertCall(freeRtn, pin.IPOINT_BEFORE, Arg1Before, pin.IARG_PYOBJ, "free", pin.IARG_FUNCARG_ENTRYPOINT_VALUE, 0)
+        pin.RTN_Close(freeRtn)
+
+
+pin.IMG_AddInstrumentFunction(image_instrumentation_cb)
+pin.PIN_AddFiniFunction(fini)

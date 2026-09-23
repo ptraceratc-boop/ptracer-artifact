@@ -1,0 +1,32 @@
+
+name: msys2autotool
+
+on: 
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+ msys2_autotools:
+    runs-on: windows-2025-vs2026
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      PYTHONIOENCODING: "utf-8"
+    steps:
+    - uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: base-devel git autoconf automake libtool mingw-w64-x86_64-toolchain mingw-w64-x86_64-zlib
+    - uses: actions/checkout@v6
+    - name: Configure
+      run: autoreconf -vif && ./configure --disable-static --enable-shared
+    - name: Build
+      run:  make
+    - name: Check
+      run:  make check
+    - name: Distcheck
+      run: make distcheck DISTCHECK_CONFIGURE_FLAGS="--disable-static --enable-shared"
