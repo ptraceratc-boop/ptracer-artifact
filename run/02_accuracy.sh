@@ -79,7 +79,7 @@ done
 PYGT="$(bash run/lib/build_fast.sh pytree pygt --gt-all)"
 CPY="$ROOT/suites/pyperformance/cpython-cg/bin/python3.12"
 for b in $PYB; do
-    oracle pyperformance "$b" "$RUN_OUT/build/spec/python3.12.spec.json" "$CPY" "$PYGT/bin/python3.12" \
+    oracle pyperformance "$b" "$RUN_OUT/build/spec/python3.12.gt.spec.json" "$CPY" "$PYGT/bin/python3.12" \
         "$B" "$PYGT/bin/python3.12" "$ROOT/suites/pyperformance/pyperf/run_one.py" "$b"
 done
 "$PYBIN" run/lib/inaccuracy_table.py "$CELLS" > "$TABLE"
