@@ -17,9 +17,10 @@ LDFLAGS  := -L$(PYVEX)/lib -lpyvex -Wl,-rpath,$(PYVEX)/lib $(ZYDIS)/libZydis.a -
 
 all: ptrecon pt_capture2 ptpktscan tests/vextest tests/gtstream_test
 
-HDRS := vexlift.h vexinterp.h ptdecode.h recon.h e9phase.h json.h trace_format.h gtstream.h ../runtime/rt/ptgt_format.h
+HDRS := vexlift.h vexinterp.h vexval.h ptdecode.h decode_progress.h recon.h jitcode.h e9phase.h json.h trace_format.h \
+        gtstream.h ../runtime/rt/ptgt_format.h
 
-ptrecon: main.o recon.o recon_par.o ptdecode.o e9phase.o vexinterp.o vexlift.o
+ptrecon: main.o recon.o recon_par.o mtdemux.o ptdecode.o e9phase.o jitcode.o vexinterp.o vexlift.o
 	$(CXX) -o $@ $^ $(LDFLAGS)
 
 %.o: %.cpp $(HDRS)

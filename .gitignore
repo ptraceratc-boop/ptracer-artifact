@@ -1,4 +1,13 @@
 out/
 __pycache__/
 *.pyc
-suites/node/
+suites/pyperformance/wp/site/
+ptracer/runtime/jit/java/ptjdrain/cls/
+ptracer/runtime/jit/java/ptjdrain/ptjdrain.jar
+third_party/valgrind-build/
+third_party/BASELINES_ABSENT.txt
+third_party/libdft64/src/obj-intel64/
+third_party/libdft64/tools/obj-intel64/
+third_party/spindle-plus/pass/libSTracerPlusPass.so
+third_party/spindle-plus/cpython/
+third_party/spindle-plus/Python-*.tgz

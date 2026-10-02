@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build the HotSpot front end (ptjava.so, a JVMTI agent).
+# Build the HotSpot front end (ptjava.so, a JVMTI agent) and, when a JDK with javac and
+# renaissance.jar are present, the boundary-drain plugin ptjdrain/ptjdrain.jar.
 #   ZYDIS_DIR            as in ../build.sh
 #   JDK_HOME / JAVA_HOME JDK with include/jvmti.h (default <artifact root>/suites/java/jdk17,
 #                        else the JDK of `javac` on PATH, else /usr/lib/jvm/java-17-openjdk-amd64)
@@ -20,3 +21,9 @@ g++ -O2 -std=c++17 -fPIC -shared -fno-exceptions -fno-rtti \
   -I"$ZY/include" -I"$ZY/dependencies/zycore/include" -DZYAN_NO_LIBC=0 \
   -o ptjava.so jvmtiagent.cc "$ZY/libZydis.a" -lpthread
 echo "built $(pwd)/ptjava.so"
+# the Renaissance boundary-drain plugin of the whole-program Fast arm (loaded in every Java arm)
+if [ -x "$JDK/bin/javac" ] && [ -f "${REN:-$ROOT/suites/java/renaissance}/renaissance.jar" ]; then
+  JDK_HOME="$JDK" bash ptjdrain/build.sh
+else
+  echo "ptjdrain.jar not built (needs $JDK/bin/javac and renaissance.jar)" >&2
+fi

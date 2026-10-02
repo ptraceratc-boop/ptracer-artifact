@@ -1,41 +1,36 @@
 /*
  * pt_capture2.c -- capture an Intel PT trace of one command for the offline reconstructor.
+ *   --aux-out FILE    write the raw AUX (PT packet) bytes to FILE
+ *   --sideband FILE   write a JSON sideband: pid, exit status, the union of the
+ *                     traced process's /proc/PID/maps (polled while it runs), CPU
+ *                     family/model/stepping, CPUID.15H, MTC period, perf clock params.
+ * It can also report packet-level statistics, with a focus on OVF (buffer overflow) packets.
  *
- * Approach (raw perf_event_open + libipt, no `perf' CLI needed):
- *   1. Configure an intel_pt event with BRANCH tracing + TSC + MTC timing (user space only),
- *      disabled, enable-on-exec.
- *   2. fork(); the parent opens the event for the child PID, maps a large AUX buffer, then
- *      releases the child (via a pipe) to exec the command.  The trace auto-enables on exec and
- *      flows into AUX, from where a drain thread copies it into --aux-out while the child runs.
- *   3. After the child exits, optionally scan the AUX bytes with libipt's PACKET decoder
+ * Approach (raw perf_event_open + libipt, no `perf` CLI needed):
+ *   1. Configure an intel_pt event with BRANCH tracing + TSC + MTC timing
+ *      (user space only), disabled, enable-on-exec.
+ *   2. fork(); the parent opens the event for the child PID, maps a large AUX
+ *      buffer, then releases the child (via a pipe) to exec the benchmark.  The
+ *      trace auto-enables on exec and flows into AUX.
+ *   3. After the child exits, scan the AUX bytes with libipt's PACKET decoder
  *      (image-free) and count packet types, especially ppt_ovf.
  *
- * Usage: pt_capture2 [--aux-mb N] [--ptw] [--aux-out F] [--sideband F] [--no-decode]
- *                    [--child-core N] [--cpu N]... [--child-env V=X]... [--gt-all]
- *                    [--data-pages N] [--stage-mb N] [--stage-prefault-mb N]
- *                    [--watermark-mb N] -- <cmd> [args...]
- *   --aux-out FILE    write the raw AUX (PT packet) bytes to FILE (/dev/null: time only)
- *   --sideband FILE   write a JSON sideband: pid, exit status, the union of the traced
- *                     process's /proc/PID/maps (polled while it runs), CPU family/model/
- *                     stepping, CPUID.15H, MTC period, perf clock parameters, the threads'
- *                     TLS bases.
- *   --ptw             record PTWRITE packets (the critical-value log of a `ptwrite' sink)
- *   --no-decode       skip the packet scan at the end (overhead runs)
- *   --child-core N    run ONLY the traced child on core N; the tracer's threads leave it
- *   --child-env V=X   set V in the CHILD's environment only (see quarantine_tracee_env)
- *   exit status = the child's; 2 = setup error.
+ * Usage: pt_capture2 [--aux-mb N] [--mtc-period P] [--ptw] [--no-ptw] [--aux-out F] [--sideband F] [--no-decode] [--no-drain] [--child-env V=X] -- <cmd> [args...]
+ *   --scan   packet-count summary (default)
+ *   exit 0 = captured & scanned; 2 = setup error.
  *
- * PER-CPU CAPTURE.  `--cpu N' is REPEATABLE: one per-CPU intel_pt event per core, the child
- * pinned to exactly that set of cores, one AUX file per core (`<aux-out>.cpu<N>' when there is
- * more than one) and ONE sideband.  Every per-CPU event records `context_switch' records
- * (PERF_RECORD_SWITCH_CPU_WIDE / ITRACE_START with PERF_SAMPLE_TID|TIME|CPU) which the drain
- * thread copies into a binary switch file per core (`<sideband>.cpu<N>.sw', struct sw_rec
- * below), so an offline consumer can attribute every [TIP.PGE, TIP.PGD] region of a core's AUX
- * stream to the thread that ran it.  With `--sideband' the child is PTRACE_SEIZEd with
- * PTRACE_O_TRACECLONE as well, so every thread it creates is seen at its first stop and its
- * `fs_base' (set by the kernel from CLONE_SETTLS before the thread runs) is read with
- * PTRACE_GETREGSET and written to the sideband's `threads' list.  All of this is additive: a
- * per-task capture writes exactly the files and JSON keys it always did, plus the new keys.
+ * MULTI-THREADED CAPTURE.  `--cpu N' is REPEATABLE:
+ * one per-CPU intel_pt event per core, the child pinned to exactly that set of cores, one AUX
+ * file per core (`<aux-out>.cpu<N>' when there is more than one) and ONE sideband.  Every
+ * per-CPU event records `context_switch' records (PERF_RECORD_SWITCH_CPU_WIDE /
+ * ITRACE_START with PERF_SAMPLE_TID|TIME|CPU) which the drain thread copies into a binary
+ * switch file per core (`<sideband>.cpu<N>.sw', struct sw_rec below), so the offline stage
+ * can attribute every [TIP.PGE, TIP.PGD] region of a core's AUX stream to the thread that
+ * ran it.  With `--sideband' the child is PTRACE_SEIZEd with PTRACE_O_TRACECLONE as well, so
+ * every thread it creates is seen at its first stop and its `fs_base' (set by the kernel from
+ * CLONE_SETTLS before the thread runs) is read with PTRACE_GETREGSET and written to the
+ * sideband's `threads' list.  A single --cpu / per-task capture writes the same files and
+ * JSON keys, plus the multi-threaded keys.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -63,7 +58,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <poll.h>
-#include "../runtime/rt/ptlog_abi.h"   /* the runtime's spare-TCB ring */
+#include "../runtime/rt/ptlog_abi.h"   /* The runtime's spare-TCB ring */
 
 /* ---- sideband: union of the target's mappings, snapshotted while it runs ----
  *
@@ -82,16 +77,20 @@
  * pt_capture2's OWN image, its libc and libipt, whose addresses overlap the
  * target's mappings and corrupt the decode.
  */
-/* The map list is DYNAMIC: whole-program CPython under E9Patch has ~17 000 distinct
- * mappings (the E9Patch loader maps every trampoline page separately), and a
- * truncated map list makes libipt decode almost nothing, silently.  Nothing is
+/* The map list is DYNAMIC: a whole-program image under E9Patch can have tens of
+ * thousands of distinct mappings (the E9Patch loader maps every trampoline page
+ * separately), and a dropped mapping silently breaks the decode.  Nothing is
  * dropped; if the table cannot grow the capture ABORTS rather than truncate. */
 #define MAPS_HARD_CAP 4000000
 struct mapent { uint64_t start, end, off; char perms[8]; char path[512]; char name[512]; };
 static struct mapent *g_maps = NULL; static size_t g_nmaps = 0, g_capmaps = 0;
 static const char *g_dumpdir = NULL;       /* where anonymous code is dumped (= the sideband path) */
+static const char *g_trace_control_path = NULL;
+static uint64_t g_gate_enabled_ns = 0, g_gate_disabled_ns = 0;
+static unsigned g_gate_transitions = 0;
 static int g_ndumps = 0;
 static uint64_t g_nstops = 0, g_nsigill = 0, g_nsigtrap = 0;   /* SIGTRAP: forwarded */
+static int g_swallow_trap = 0;             /* PT_CAPTURE2_SWALLOW_SIGTRAP=1: suppress SIGTRAP (diagnostic only) */
 static uint64_t g_maps_dropped = 0;        /* must stay 0; reported loudly if not */
 
 /* (start,end,name) -> index, so poll_maps() is O(1) per line instead of O(#maps).
@@ -181,25 +180,22 @@ static void record_failed(uint64_t s, uint64_t e) {
     g_failed[g_nfailed][0] = s; g_failed[g_nfailed][1] = e; g_nfailed++;
 }
 
-/* E9Patch maps its trampolines as thousands of separate VMAs (a rewritten python3.12 +
- * libc.so.6 have ~15 000 mappings), and an E9Patch build takes thousands of SIGILL stops
- * per run (E9Patch's own evicted-instruction handler), so a poll that parsed every line
- * after every stop would dominate the child's run time.  Hence: read the file in ONE read()
- * and skip everything if the bytes are unchanged since the last poll (they almost always
- * are after start-up), and hand-parse the lines that do need parsing. */
+/* E9Patch maps its trampolines as thousands of separate VMAs, and the maps file is polled
+ * often, so parsing every line with fgets()+sscanf() on every poll is too slow.  Read the
+ * file in ONE read(), skip everything if the bytes are unchanged since the last poll (they
+ * almost always are after start-up), and hand-parse the lines that do need parsing. */
 static pthread_mutex_t g_maps_mtx = PTHREAD_MUTEX_INITIALIZER;
 static char *g_maps_prev = NULL; static size_t g_maps_prev_len = 0;
 static unsigned long long g_maps_polls = 0, g_maps_parses = 0;
 static unsigned long long g_map_execs = 0, g_maps_forgotten = 0;
 
-/* ---- exec stops ---------------------------------------------------------------
+/* ---- stale mappings across execve() --------------------
  * execve() REPLACES the address space, so every mapping recorded before it is dead.
- * The map list is a union over time, so a traced command that itself exec's
- * (`-- taskset -c N <prog>', `-- setarch -R ...', `-- /bin/sh -c ...') would produce
- * a sideband holding TWO address spaces.  An image mapped in both -- a rewritten
- * libc.so.6 reached through LD_LIBRARY_PATH always is, because the wrapper links
- * against it too -- then has two load bases, and a reconstructor that picks the
- * DEAD one lands its site map's trampoline addresses on the old space's pages.
+ * The map list is a union over time; spanning the whole traced lifetime, a traced command
+ * that itself exec's (`-- taskset -c N <prog>', `-- setarch -R ...', `-- /bin/sh -c ...')
+ * would produce a sideband holding TWO address spaces.  An image mapped in both -- a
+ * rewritten libc.so.6 reached through LD_LIBRARY_PATH always is, because the wrapper links
+ * against it too -- would then have two load bases, and `ptrecon' could pick the DEAD one.
  * Forget the old space at each exec stop. */
 static void maps_forget_old_address_space(void) {
     g_map_execs++;
@@ -303,20 +299,21 @@ static void poll_maps(pid_t pid) {
  * `%fs' has no architectural read instruction in user space, and PTracer's
  * analyzer anchors `fs_base' only ONCE per thread (at `main'), so a parallel
  * reconstruction chunk that starts mid-stream can never learn it from the value
- * log -- every `%fs:'-based address in that chunk would be unknown.  It is a
- * process constant for a single-threaded target, so read it here with ptrace at
- * a stop (PTRACE_EVENT_EXIT is the last one where the address space is still
- * intact) and put it in the sideband.
+ * log -- every `%fs:'-based address in that chunk is then unknown.
+ * It is a process constant for a single-threaded
+ * target, so read it here with ptrace at a stop (PTRACE_EVENT_EXIT is the last
+ * one where the address space is still intact) and put it in the sideband.
  */
 static unsigned long long g_fs_base = 0;
-extern int g_want_switch;                 /* defined below */
+extern int g_want_switch;                 /* defined below (--no-switch) */
+extern int g_cpu_wide;
 /* Every thread of the traced process (PTRACE_O_TRACECLONE), with the `fs_base' read at its
  * first ptrace stop -- the kernel sets it from CLONE_SETTLS in copy_thread(), before the
  * thread ever runs, so the first stop already shows the final value; a 0 is re-tried at every
  * later stop and at the exit stop.  The main thread's is 0 until the loader's arch_prctl. */
 struct thr { pid_t tid; unsigned long long fs_base; int exited; unsigned long long first_stop_ns;
-             /* runtime/rt/ptlog_abi.h: the spare TCB this thread receives at its first stop,
-              * whether its creator's clone event has been seen, whether it is held stopped. */
+             /* The spare TCB this thread receives at its first
+              * stop, whether its creator's clone event has been seen, whether it is held stopped. */
              unsigned long long tcb; int seen_clone, stopped_once, held; };
 static struct thr *g_thr = NULL; static size_t g_nthr = 0, g_capthr = 0;
 static uint64_t g_nclone = 0, g_tcb_assigned = 0, g_tcb_none = 0, g_tcb_held = 0;
@@ -335,9 +332,9 @@ static void poll_fs_base_tid(pid_t tid, pid_t leader) {
     thr_get(tid)->fs_base = (unsigned long long)r.fs_base;
     if (tid == leader) g_fs_base = (unsigned long long)r.fs_base;
 }
-/* ---- hand every new thread its own %gs region BEFORE its first instruction ---------------
+/* ---- Hand every new thread its own %gs region BEFORE its first instruction --------
  * Linux copies the GS base at clone(2) and glibc blocks all signals around the clone, so the
- * logging runtime cannot give a new pthread its own TCB by a fault: it would log into its
+ * Stage-2 runtime cannot give a new pthread its own TCB by a fault: it would log into its
  * CREATOR's cv/gt/count areas through the inherited base until the shim's wrapper ran.
  * The runtime therefore keeps a ring of SPARE, fully
  * initialised TCBs in its control block (runtime/rt/ptlog_abi.h); at the creator's
@@ -383,11 +380,11 @@ static void tcb_assign(pid_t child, unsigned long long tcb) {
 struct cpu_out { int cpu; const char *aux; const char *sw; uint64_t aux_bytes, lost, trunc, n_sw, n_itrace, data_lost; };
 static void write_sideband(const char *fn, pid_t pid, int status, size_t aux_bytes, int wrapped, long mtc_period, struct perf_event_mmap_page *pc,
                            const struct cpu_out *cpus, int ncpus) {
-    /* Write to a temporary file and rename() it into place only after the last
-     * byte is flushed, so that a consumer never sees a HALF-WRITTEN sideband (a
-     * JSON that ends mid-string reads as "no map list" instead of as an error).
-     * If this process dies before the rename, `fn' simply does not exist and the
-     * caller fails loudly. */
+    /* Write to a temporary file and rename() it into place only after the
+     * last byte is flushed.  A consumer therefore never sees a HALF-WRITTEN
+     * sideband (e.g. a JSON cut off at a 4 KiB stdio boundary, which would read as
+     * "no map list" instead of as an error).  If this process dies before the rename, `fn' simply does not
+     * exist and the caller fails loudly. */
     char tmp[4096];
     if (snprintf(tmp, sizeof tmp, "%s.tmp", fn) >= (int)sizeof tmp) { fprintf(stderr, "sideband: path too long\n"); return; }
     FILE *f = fopen(tmp, "w"); if (!f) { perror("sideband"); return; }
@@ -398,12 +395,15 @@ static void write_sideband(const char *fn, pid_t pid, int status, size_t aux_byt
     fprintf(f, " \"cpu\":{\"family\":%u,\"model\":%u,\"stepping\":%u},\"cpuid15\":{\"eax\":%u,\"ebx\":%u},\n", fam, model, step, a15, b15);
     fprintf(f, " \"time\":{\"mult\":%u,\"shift\":%u,\"zero\":%llu,\"cap_user_time\":%u},\n", pc->time_mult, pc->time_shift, (unsigned long long)pc->time_zero, (unsigned)pc->cap_user_time);
     fprintf(f, " \"fs_base\":%llu,\n", g_fs_base);
-    /* ---- per-CPU capture: additive keys --------------------------------------------------
+    fprintf(f, " \"trace_gate\":{\"controlled\":%d,\"transitions\":%u,\"last_enabled_ns\":%llu,\"last_disabled_ns\":%llu},\n",
+            g_trace_control_path != NULL, g_gate_transitions,
+            (unsigned long long)g_gate_enabled_ns, (unsigned long long)g_gate_disabled_ns);
+    /* ---- multi-threaded capture: additive keys ----------------
      * "sb_version": 2 says the two lists below exist.  `cpus' has one entry per --cpu event
      * (a per-task capture has none); `aux' is that core's AUX file and `switch_file' the
      * binary sw_rec stream drained from its data ring.  `threads' is every thread ptrace saw,
      * with the fs_base the kernel gave it; the main thread is the entry whose tid == pid. */
-    fprintf(f, " \"sb_version\":2,\"capture_mode\":\"%s\",\"switch_records\":%d,\n", ncpus ? "per-task-per-cpu" : "per-task", g_want_switch && ncpus ? 1 : 0);
+    fprintf(f, " \"sb_version\":2,\"capture_mode\":\"%s\",\"switch_records\":%d,\n", ncpus ? (g_cpu_wide ? "cpu-wide" : "per-task-per-cpu") : "per-task", g_want_switch && ncpus ? 1 : 0);
     fprintf(f, " \"cpus\":[");
     for (int i = 0; i < ncpus; i++)
         fprintf(f, "%s{\"cpu\":%d,\"aux\":\"%s\",\"aux_bytes\":%llu,\"lost_bytes\":%llu,\"truncated\":%llu,\"switch_file\":\"%s\",\"n_switch\":%llu,\"n_itrace_start\":%llu,\"data_lost\":%llu}",
@@ -426,9 +426,8 @@ static void write_sideband(const char *fn, pid_t pid, int status, size_t aux_byt
      * different file offset can appear TWICE.  E9Patch does exactly that: its loader MAP_FIXEDs
      * sub-ranges of the image's own text from the patched copy, and the sub-range's end need not
      * equal the original mapping's end, so poll_maps()'s exact-range "supersede" rule does not
-     * catch it.  libipt would then have two sections for the same address and decode the WRONG
-     * bytes (thousands of `trace stream does not match query' resyncs per capture).
-     * Resolution: for EXECUTABLE mappings the NEWEST entry wins --
+     * catch it.  libipt then has two sections for the same address and decodes the WRONG bytes
+     * (`trace stream does not match query' resyncs).  Resolution: for EXECUTABLE mappings the NEWEST entry wins --
      * emit each one minus every range a later executable entry covers, splitting it if necessary.
      * Non-executable entries are left alone; nothing decodes them. */
     size_t emitted = 0, trimmed = 0;
@@ -474,32 +473,61 @@ static void write_sideband(const char *fn, pid_t pid, int status, size_t aux_byt
 }
 
 
-/* ---------------- draining AUX writer -----------------------------------------
+/* Uniform ToPA order: pick the largest page order k <= 10 (= MAX_PAGE_ORDER, 4 MB; a watermark below 4 MB costs one
+ * PMI per 2^k pages, so k stays as large as memory allows) such that the free buddy blocks of order >= k, counted in order-k units,
+ * cover the whole AUX allocation twice.  Returns k; warns when even order 0 would not fit. */
+static int g_topa_order = -1;
+static int topa_safe_order(unsigned long long total_bytes, int quiet) {
+    unsigned long long avail[11] = {0};
+    FILE *f = fopen("/proc/buddyinfo", "r");
+    if (!f) { if (!quiet) fprintf(stderr, "aux: /proc/buddyinfo unreadable, chunk order 8 assumed\n"); return 8; }
+    char line[512];
+    while (fgets(line, sizeof line, f)) {
+        char zone[32]; int node, pos = 0;
+        if (sscanf(line, "Node %d, zone %31s %n", &node, zone, &pos) < 2) continue;
+        if (strcmp(zone, "Normal") && strcmp(zone, "DMA32")) continue;
+        char *p = line + pos;
+        for (int o = 0; o <= 10; o++) {
+            char *e; unsigned long long c = strtoull(p, &e, 10);
+            if (e == p) break;
+            p = e;
+            for (int k = 0; k <= o; k++) avail[k] += c << (o - k);   /* an order-o block = 2^(o-k) order-k blocks */
+        }
+    }
+    fclose(f);
+    for (int k = 10; k >= 0; k--) {
+        unsigned long long need = (total_bytes >> 12 >> k) + 1;
+        if (avail[k] >= 2 * need) return k;
+    }
+    if (!quiet) fprintf(stderr, "aux: WARNING free memory cannot hold the AUX rings twice even in 4 KB pages; "
+                                "ToPA chunks may be mixed -- lower --aux-mb\n");
+    return 0;
+}
+
+/* ---------------- draining AUX writer ------------
  *
  * The AUX area is mapped PROT_READ|PROT_WRITE, which puts the PT event in
  * perf's NON-overwrite mode: the kernel fills [aux_tail, aux_tail+aux_size)
- * and then simply STOPS.  If nobody advanced aux_tail, `aux_head' would saturate
- * at `aux_size' and every capture would be a PREFIX.  So a reader thread drains
- * the ring while the child runs and publishes aux_tail, exactly as perf's own
+ * and then simply STOPS.  If nobody advances aux_tail, `aux_head' saturates at
+ * `aux_size' and every capture is a PREFIX.  So a reader thread drains the
+ * ring while the child runs and publishes aux_tail, exactly as perf's own
  * auxtrace_mmap__read() does: aux_head/aux_tail are FREE-RUNNING 64-bit byte
  * counters, the buffer position is (counter % aux_size), so a window that
  * straddles the end of the ring is two memcpy()s.
  *
- * Draining straight into the file is not enough, for two reasons that are one:
+ * Draining straight into the file is unreliable:
  *
- *   - A disk sustains well under 1 GB/s while instrumented CPython generates
- *     1.5-3.5 GB/s of PT.  fwrite() keeps up only while the page cache absorbs
- *     it; once a few GB of dirty pages accumulate the kernel throttles the
- *     writer to device speed and a single drain pass takes hundreds of ms.  The
- *     AUX ring (256 MB, i.e. ~150 ms of trace) fills during that stall, and
- *     perf_aux_output_begin() then DISABLES the event (PERF_AUX_FLAG_TRUNCATED).
- *   - If the re-enable is issued only after that slow write returns, and the
- *     ioctl loses the race against the kernel's pending irq_work disable (or the
- *     child exits first), the event stays off for the rest of the run: the
- *     capture "ends early".
+ *   (1)     A disk can be slower than the PT stream an instrumented program
+ *           generates.  Once enough dirty pages accumulate the kernel throttles
+ *           the writer to device speed, a drain pass stalls, the AUX ring fills
+ *           during that stall, and perf_aux_output_begin() then DISABLES the
+ *           event (PERF_AUX_FLAG_TRUNCATED).
+ *   (2)     A re-enable issued only after that same slow write returns, and only
+ *           when the truncation COUNT has grown, can lose the race against the
+ *           kernel's pending irq_work disable, or come after the child exited;
+ *           the event then stays off for the rest of the run.
  *
- * The disk is not fixable (O_DIRECT measures slower), so the burst is absorbed
- * in RAM instead:
+ * So the burst is absorbed in RAM instead:
  *
  *   - the drain thread only ever memcpy()s the ring into a chunked STAGING
  *     queue (~10 GB/s) and publishes aux_tail immediately;
@@ -530,12 +558,21 @@ static uint64_t g_aux_trunc_recs = 0;      /* PERF_RECORD_AUX with PERF_AUX_FLAG
 static uint64_t g_aux_max_fill = 0;        /* high-water mark of the ring occupancy */
 static uint64_t g_data_lost_recs = 0;      /* PERF_RECORD_LOST* in the data ring */
 static uint64_t g_aux_resumed = 0;         /* times the event was re-enabled after a truncation */
+static uint64_t g_aux_fulllap = 0;        /* AUX records larger than half the ring */
 static uint64_t g_aux_rearm = 0;           /* watchdog PERF_EVENT_IOC_ENABLEs (aux_head stalled) */
-/* The watchdog (and the truncation-resume) must not re-arm an event after the final disable
- * at the end of the run, so both are gated on this flag under g_pt_control_mtx. */
-static volatile int g_pt_armed = 1;
+/* --trace-after S deliberately leaves the
+ * PT event DISABLED for the first S seconds, so aux_head does not advance -- which is exactly the
+ * condition the watchdog below exists to repair.  The watchdog (and the truncation-resume) must
+ * not arm an event that was never armed, so both are gated on this flag, which only
+ * pt_delay_enable() (or the trace-control thread) sets. */
+static volatile int g_pt_armed = 1;        /* 0 while --trace-after is still counting down */
 static pthread_mutex_t g_pt_control_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int g_control_stop = 0;
 static double   g_aux_stall_s = 0;         /* seconds aux_head did not advance while the child ran */
+static int g_zero_drained = 0;
+static uint64_t g_zero_holes = 0, g_stale = 0;            /* --zero-drained: memset each drained ring region */
+static FILE *g_auxlog = NULL;             /* --auxrec-log FILE */
+static FILE *g_drainlog = NULL;            /* --drain-log FILE: one line per drain pass */
 
 /* ---- staging queue: RAM between the AUX ring and the file ----------------
  *
@@ -639,7 +676,15 @@ static void *writer_thread(void *arg) {
         pthread_mutex_unlock(&g_stage_mtx);
         double w0 = now_sec();
         FILE *sk = c->sink ? c->sink : g_sink;
-        if (sk && c->len && fwrite(c->p, 1, c->len, sk) != c->len) perror("aux-out write");
+        if (sk && c->len && g_zero_drained) {  /* all-zero MB pieces become holes (sparse file) */
+            static const unsigned char zmb[1u << 20];
+            for (size_t o = 0; o < c->len; ) {
+                size_t n = c->len - o < sizeof zmb ? c->len - o : sizeof zmb;
+                if (n == sizeof zmb && !memcmp(c->p + o, zmb, n)) { if (fseeko(sk, (off_t)n, SEEK_CUR)) perror("aux-out seek"); g_zero_holes += n; }
+                else if (fwrite(c->p + o, 1, n, sk) != n) perror("aux-out write");
+                o += n;
+            }
+        } else if (sk && c->len && fwrite(c->p, 1, c->len, sk) != c->len) perror("aux-out write");
         g_sink_s += now_sec() - w0;
         g_sink_bytes += c->len;
         c->len = 0;
@@ -698,8 +743,27 @@ struct sw_rec {
 #ifndef PERF_RECORD_MISC_SWITCH_OUT_PREEMPT
 #define PERF_RECORD_MISC_SWITCH_OUT_PREEMPT (1 << 14)
 #endif
-int g_want_switch = 1;                    /* switch records: only with --cpu */
+int g_want_switch = 1;                    /* --no-switch turns the records off */
+int g_cpu_wide = 0;                       /* --cpu-wide (sideband capture_mode) */
 
+/* --trace-after S: enable every PT event S seconds after the child was released (see the
+ * comment at attr.enable_on_exec).  A thread, not an alarm, so that it cannot interrupt the
+ * ptrace waitpid loop. */
+void *pt_delay_enable(void *arg);
+void *pt_delay_enable(void *arg)
+{
+    struct { long *fds; int n; double after; } *d = arg;   /* fds is long[] (main) */
+    struct timespec ts;
+    ts.tv_sec = (time_t)d->after;
+    ts.tv_nsec = (long)((d->after - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+    pthread_mutex_lock(&g_pt_control_mtx);
+    for (int i = 0; i < d->n; i++) ioctl((int)d->fds[i], PERF_EVENT_IOC_ENABLE, 0);
+    g_pt_armed = 1;                        /* The watchdog may re-arm from here on */
+    pthread_mutex_unlock(&g_pt_control_mtx);
+    fprintf(stderr, "trace enabled after %.2f s (--trace-after)\n", d->after);
+    return NULL;
+}
 static uint64_t perf_time_to_tsc(const struct perf_event_mmap_page *pc, uint64_t t) {
     if (!pc->cap_user_time_zero || !pc->time_mult) return 0;
     uint64_t d = t - pc->time_zero;
@@ -707,9 +771,41 @@ static uint64_t perf_time_to_tsc(const struct perf_event_mmap_page *pc, uint64_t
     return (quot << pc->time_shift) + (rem << pc->time_shift) / pc->time_mult;
 }
 
+/* A bounded workload-window capture, not a full-process trace. The caller owns
+ * a one-byte regular control file: '0' disables, '1' enables. Polling happens on
+ * the collector's cores. Serialize disable against watchdog re-enables. */
+struct trace_control { long *fds; int n; int fd; };
+static void *trace_control_thread(void *arg) {
+    struct trace_control *c = arg;
+    char previous = '0';
+    while (!__atomic_load_n(&g_control_stop, __ATOMIC_ACQUIRE)) {
+        char value;
+        if (pread(c->fd, &value, 1, 0) == 1 && (value == '0' || value == '1') && value != previous) {
+            pthread_mutex_lock(&g_pt_control_mtx);
+            g_pt_armed = 0;
+            for (int i = 0; i < c->n; ++i) {
+                if (ioctl((int)c->fds[i], value == '1' ? PERF_EVENT_IOC_ENABLE : PERF_EVENT_IOC_DISABLE, 0)) {
+                    perror("trace-control ioctl"); _exit(74);
+                }
+            }
+            g_pt_armed = value == '1';
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t ns = (uint64_t)now.tv_sec * 1000000000ull + now.tv_nsec;
+            if (value == '1') g_gate_enabled_ns = ns; else g_gate_disabled_ns = ns;
+            g_gate_transitions++;
+            fprintf(stderr, "trace-control state=%c ns=%llu\n", value, (unsigned long long)ns);
+            pthread_mutex_unlock(&g_pt_control_mtx);
+            previous = value;
+        }
+        struct timespec delay = {0, 1000000}; nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
 struct drain_ctx {
     struct perf_event_mmap_page *pc;
     void *aux; size_t aux_len;
+    uint64_t *phash; uint64_t stale;   /* --zero-drained: per-ring-page content hash, stale bytes staged as zeros */
     unsigned char *data; size_t data_len;
     int staging;                 /* 1 = copy the ring into the staging queue */
     int fd;
@@ -741,6 +837,21 @@ static void drain_data_ring(struct drain_ctx *c) {
             size_t fo = off + sizeof hdr + 16;
             for (size_t k = 0; k < 8; k++) ((unsigned char *)&flags)[k] = c->data[(fo + k) % c->data_len];
             if (flags & PERF_AUX_FLAG_TRUNCATED) { g_aux_trunc_recs++; c->aux_trunc_recs++; }
+            {   /* Mixed-ToPA signature: one AUX record claiming more than half the ring (impossible with
+                 * watermark PMIs unless the kernel mis-programmed the ToPA offset) */
+                uint64_t as = 0; for (size_t k = 0; k < 8; k++) ((unsigned char *)&as)[k] = c->data[(off + sizeof hdr + 8 + k) % c->data_len];
+                if (as > c->aux_len / 2) g_aux_fulllap++;
+            }
+            if (g_auxlog) {   /* Every PERF_RECORD_AUX (offset, size, flags, sample_id) */
+                unsigned char rec[96]; size_t n = hdr.size < sizeof rec ? hdr.size : sizeof rec;
+                for (size_t k = 0; k < n; k++) rec[k] = c->data[(off + k) % c->data_len];
+                uint64_t ao = 0, as = 0; uint32_t spid = 0, stid = 0; uint64_t stime = 0;
+                memcpy(&ao, rec + sizeof hdr, 8); memcpy(&as, rec + sizeof hdr + 8, 8);
+                if (n >= sizeof hdr + 24 + 16) { memcpy(&spid, rec + sizeof hdr + 24, 4); memcpy(&stid, rec + sizeof hdr + 28, 4); memcpy(&stime, rec + sizeof hdr + 32, 8); }
+                fprintf(g_auxlog, "%.6f cpu=%d t=%llu tid=%u off=%llu size=%llu flags=0x%llx tail=%llu%s\n", now_sec(), c->cpu,
+                        (unsigned long long)stime, stid, (unsigned long long)ao, (unsigned long long)as, (unsigned long long)flags,
+                        (unsigned long long)c->pc->aux_tail, as >= c->aux_len / 2 ? " BIG" : "");
+            }
         } else if (hdr.type == PERF_RECORD_LOST || hdr.type == PERF_RECORD_LOST_SAMPLES) {
             g_data_lost_recs++; c->data_lost_recs++; c->lost_pending = 1;
         } else if (c->swf && (hdr.type == PERF_RECORD_SWITCH_CPU_WIDE || hdr.type == PERF_RECORD_ITRACE_START
@@ -773,8 +884,33 @@ static void drain_data_ring(struct drain_ctx *c) {
     __atomic_store_n(&c->pc->data_tail, tail, __ATOMIC_RELEASE);
 }
 
+/* --zero-drained: the kernel sometimes advances aux_head over ring bytes the hardware did not
+ * write this lap (never-written zeros followed by an exact copy of an older lap's
+ * data, same TSCs).  Every full 4 KB ring page carries the hash of the content drained from it last
+ * time; a page that comes back byte-identical is STALE and is staged as zeros (PAD), so the decoder
+ * never replays an old lap as new trace.  Partial pages are passed through. */
+static inline uint64_t page_hash(const unsigned char *p) {
+    const uint64_t *w = (const uint64_t *)p; uint64_t h = 0x243F6A8885A308D3ull;
+    for (int i = 0; i < 512; i++) { h ^= w[i]; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    return h | 1;
+}
+static void stage_ring(struct drain_ctx *c, size_t off, size_t len) {
+    static const unsigned char zpage[4096];
+    const unsigned char *base = c->aux;
+    if (!g_zero_drained || !c->phash) { stage_append(&c->cur, c->sink, base + off, len); return; }
+    while (len) {
+        size_t pg_off = off & 4095, n = 4096 - pg_off; if (n > len) n = len;
+        if (pg_off == 0 && n == 4096) {
+            uint64_t h = page_hash(base + off); size_t pg = off >> 12;
+            if (c->phash[pg] == h) { stage_append(&c->cur, c->sink, zpage, 4096); c->stale += 4096; g_stale += 4096; }
+            else { c->phash[pg] = h; stage_append(&c->cur, c->sink, base + off, 4096); }
+        } else stage_append(&c->cur, c->sink, base + off, n);
+        off += n; len -= n;
+    }
+}
+
 /* One pass over the AUX ring: copy everything the kernel produced into the
- * staging queue and publish aux_tail.  No I/O happens here. */
+ * staging queue and publish aux_tail.  No I/O happens here (see the draining writer above). */
 static size_t drain_aux_once(struct drain_ctx *c) {
     uint64_t head = __atomic_load_n(&c->pc->aux_head, __ATOMIC_ACQUIRE);
     uint64_t tail = c->pc->aux_tail;
@@ -787,13 +923,12 @@ static size_t drain_aux_once(struct drain_ctx *c) {
     if (avail > g_aux_max_fill) g_aux_max_fill = avail;
     if (avail > c->aux_max_fill) c->aux_max_fill = avail;
     size_t t_off = (size_t)(tail % c->aux_len), h_off = (size_t)(head % c->aux_len);
-    const unsigned char *base = c->aux;
     if (c->staging) {
         if (h_off > t_off) {
-            stage_append(&c->cur, c->sink, base + t_off, (size_t)avail);
+            stage_ring(c, t_off, (size_t)avail);
         } else {                              /* wraps around the end of the ring */
-            stage_append(&c->cur, c->sink, base + t_off, c->aux_len - t_off);
-            if (h_off) stage_append(&c->cur, c->sink, base, h_off);
+            stage_ring(c, t_off, c->aux_len - t_off);
+            if (h_off) stage_ring(c, 0, h_off);
         }
     }
     g_aux_written += avail; c->aux_written += avail;
@@ -830,11 +965,13 @@ static void *drain_thread(void *arg) {
         else usleep(2000);
         double t_pass = now_sec();
         uint64_t head0 = __atomic_load_n(&c->pc->aux_head, __ATOMIC_ACQUIRE);
-        drain_aux_once(c);
+        size_t n = drain_aux_once(c);
         drain_data_ring(c);
+        int trunc = 0, rearm = 0;
         pthread_mutex_lock(&g_pt_control_mtx);
         if (c->aux_trunc_recs > seen_trunc) {          /* the ring filled: the kernel disabled us */
             seen_trunc = c->aux_trunc_recs;
+            trunc = 1;
             if (g_pt_armed && c->fd >= 0 && ioctl(c->fd, PERF_EVENT_IOC_ENABLE, 0) == 0) { g_aux_resumed++; c->aux_resumed++; }
         }
         if (head0 != last_head) { last_head = head0; last_progress = t_pass; }
@@ -845,8 +982,12 @@ static void *drain_thread(void *arg) {
              * effect is the one it exists for -- an event the kernel disabled behind our back. */
             g_aux_stall_s += t_pass - last_progress; c->aux_stall_s += t_pass - last_progress; last_progress = t_pass;
             if (c->fd >= 0 && ioctl(c->fd, PERF_EVENT_IOC_ENABLE, 0) == 0) { g_aux_rearm++; c->aux_rearm++; }
+            rearm = 1;
         }
         pthread_mutex_unlock(&g_pt_control_mtx);
+        if (g_drainlog)
+            fprintf(g_drainlog, "%.6f cpu=%d head=%llu drained=%zu stage=%zu trunc=%d rearm=%d\n",
+                    t_pass, c->cpu, (unsigned long long)head0, n, g_stage_bytes, trunc, rearm);
     }
     /* final pass: the event is already disabled by the time the flag is set */
     drain_aux_once(c);
@@ -894,36 +1035,62 @@ static double now_sec(void) {
 /* Periodic /proc/PID/maps snapshots, off the ptrace loop's critical path.  Dense for
  * `burst_ms' after the exec stop (that is when the loader dlopen()s and unmaps things), then
  * every `every_ms'; an unchanged maps file costs one read() and a memcmp. */
-struct mp_arg_t { pid_t pid; volatile int *alive; volatile int *execed; double burst_ms, every_ms; };
+struct mp_arg_t { pid_t pid; volatile int *alive; volatile int *execed; double burst_ms, every_ms; int gate; };
+/* --map-poll-gate (default off): after the burst, a steady-state poll first reads
+ * /proc/PID/status (O(1) in the kernel: mm counters, no VMA walk) and re-reads /proc/PID/maps
+ * only when VmExe/VmLib/VmSize changed since the last full poll.  Reading the maps file of a
+ * whole-process image (tens of thousands of VMAs, mostly E9Patch trampoline maps) at every poll
+ * slows the traced program down.  Executable-mapping changes always
+ * move VmExe/VmLib (exec_vm); VmSize catches the rest.  Blind spot: an unmap +
+ * map of the SAME size inside one --map-poll-ms period leaves all three counters unchanged. */
+static unsigned long long g_gate_skips = 0;
+static int vm_sig(pid_t pid, char *out, size_t n) {
+    char fn[64], buf[4096]; snprintf(fn, sizeof fn, "/proc/%d/status", (int)pid);
+    int fd = open(fn, O_RDONLY); if (fd < 0) return -1;
+    ssize_t r = read(fd, buf, sizeof buf - 1); close(fd); if (r <= 0) return -1; buf[r] = 0;
+    size_t k = 0; out[0] = 0;
+    for (char *l = buf; l && *l; ) { char *e = strchr(l, '\n'); if (e) *e = 0;
+        if (!strncmp(l, "VmSize:", 7) || !strncmp(l, "VmExe:", 6) || !strncmp(l, "VmLib:", 6)) {
+            size_t m = strlen(l); if (k + m + 1 < n) { memcpy(out + k, l, m); k += m; out[k++] = '|'; out[k] = 0; } }
+        l = e ? e + 1 : NULL; }
+    return 0;
+}
 static void *map_poll_thread(void *arg) {
     struct mp_arg_t *a = arg;
     double t0 = 0;
     while (*a->alive) {
         /* Nothing is sampled before the exec stop: pt_capture2's own pre-exec image must never
-         * end up in the sideband. */
+         * end up in the sideband (the reconstructor depends on that). */
         if (!*a->execed) { usleep(200); continue; }
         if (t0 == 0) t0 = now_sec();
         double now = now_sec();
-        double every = (now - t0) * 1000.0 < a->burst_ms ? 1.0 : a->every_ms;
+        int burst = (now - t0) * 1000.0 < a->burst_ms;
+        double every = burst ? 1.0 : a->every_ms;
+        static char last_sig[512]; char sig[512];
+        if (a->gate && !burst && vm_sig(a->pid, sig, sizeof sig) == 0 && last_sig[0] && !strcmp(sig, last_sig)) {
+            g_gate_skips++; usleep((useconds_t)(every * 1000)); continue; }
+        if (a->gate && vm_sig(a->pid, sig, sizeof sig) == 0) memcpy(last_sig, sig, sizeof sig);
         pthread_mutex_lock(&g_maps_mtx); poll_maps(a->pid); pthread_mutex_unlock(&g_maps_mtx);
         usleep((useconds_t)(every * 1000));
     }
     return NULL;
 }
 
-/* ---- the TRACED run's environment must not be pt_capture2's own ---------------
+/* ---- The TRACED run's environment must not be pt_capture2's own -----
  *
- * A `--gt-all' build is run with `LD_LIBRARY_PATH=<rewritten libc>' and
- * `PTLOG_GT=1'.  When those are exported around the whole command line -- which
- * is the obvious way to write the script -- *pt_capture2 itself* is dynamically
- * linked against the REWRITTEN libc.so.6 and starts recording its own memory
- * accesses into a ground-truth ring.  Two consequences, both silent:
+ * A `--gt-all' build is run with
+ * `LD_LIBRARY_PATH=<rewritten libc>' and `PTLOG_GT=1'.  When those are exported
+ * around the whole command line -- which is the obvious way to write the script
+ * -- *pt_capture2 itself* is dynamically linked
+ * against the REWRITTEN libc.so.6 and starts recording its own memory accesses
+ * into a ground-truth ring.  Two consequences, both silent:
  *   * every libc call in the tracer goes through an E9Patch trampoline, so the
  *     parent runs ~100x slower and writes its own multi-GB gt file;
  *   * when the tracer's own ring reaches PTLOG_GT_MAX the runtime "flushes and
  *     exits" -- `_exit()' from inside whatever the tracer was doing.  Hitting that
  *     inside write_sideband() leaves the JSON cut off at a 4 KiB stdio boundary;
- *     hitting it earlier loses the AUX file as well.
+ *     hitting it earlier loses the AUX file as well.  It only shows up when the CHILD exits early, because
+ *     only a small PTLOG_GT_MAX is reached by the tracer's own trickle of accesses.
  *
  * So the tracee-only variables are QUARANTINED here: they are removed from our own
  * environment and handed to the child through `--child-env', after which this
@@ -931,7 +1098,7 @@ static void *map_poll_thread(void *arg) {
  * environment is bit-for-bit what the caller asked for; only the tracer's changes.
  * Gated on PTLOG_GT so that no other kind of run (a buffer-sink timing cell, say)
  * changes behaviour.  `--child-env' can also be used directly; the re-exec is the
- * belt-and-braces path for callers that do not.
+ * fallback for callers that export the variables themselves.
  */
 static const char *const TRACEE_ONLY_ENV[] = {
     "LD_LIBRARY_PATH", "LD_PRELOAD",
@@ -972,30 +1139,45 @@ static void quarantine_tracee_env(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    { const char *sw = getenv("PT_CAPTURE2_SWALLOW_SIGTRAP"); g_swallow_trap = sw && atoi(sw) > 0; }
+
     long aux_mb = 128;
-    const long mtc_period = 3; /* MTC frequency selector */
+    long mtc_period = 3;       /* MTC frequency selector; tuned empirically */
     int want_ptw = 0;          /* --ptw: record PTWRITE (PTW) packets too */
+    int no_ptw = 0;            /* --no-ptw (or PT_CAPTURE_NO_PTW=1): never set PTWEn, even with --ptw --
+                                * simulates a PT CPU without PTWRITE */
+    int no_branch = 0;         /* --no-branch: drop control-flow (TNT/TIP) packets */
+    char *timeline = NULL;     /* --timeline FILE: dump each OVF's TSC */
+    char *ptwwin = NULL;       /* --ptw-window FILE: per-window PTW packet counts */
+    long ptwwin_us = 1000;     /* --ptw-window-us: window size in microseconds (default 1ms) */
+    char *ptwdump = NULL;      /* --ptw-dump FILE: dump each PTW packet's payload value (one per line) */
     int no_decode = 0;         /* --no-decode: skip the offline packet scan (overhead runs) */
+    int no_drain = 0;          /* --no-drain: fill the ring once and stop (prefix capture) */
     char *aux_out = NULL;      /* --aux-out FILE: raw AUX bytes for offline reconstruction */
     char *sideband = NULL;     /* --sideband FILE: JSON sideband (maps, cpu, clock) */
+    char *drainlog = NULL;     /* --drain-log FILE: one line per drain pass (diagnostics) */
     long stage_mb = 4096;      /* --stage-mb: RAM between the AUX ring and the file */
     long prefault_mb = 1024;   /* --stage-prefault-mb: pool populated before the child is released */
-    long wm_mb = 0;            /* --watermark-mb: AUX wakeup threshold (default aux_mb/8) */
+    long wm_mb = 0;            /* --watermark-mb: AUX wakeup threshold (default: uniform ToPA order) */
+    long wm_kb = 0;            /* --watermark-kb: the same in KB */
     int child_core = -1;       /* --child-core N: run ONLY the traced child on core N */
-    /* /proc/PID/maps polling: at 1 kHz for `map_burst_ms' after the exec stop (that is when the
-     * loader dlopen()s and unmaps things), then every `map_poll_ms'. */
-    const double map_poll_ms = 20, map_burst_ms = 500;
+    double map_poll_ms = 20;   /* --map-poll-ms: steady-state /proc/PID/maps period, 0 = only at the
+                                * exec and exit stops */
+    double map_burst_ms = 500; int map_poll_gate = 0; /* --map-poll-burst-ms: poll at 1 kHz for this long after exec */
     /* --cpu N (REPEATABLE): per-CPU trace of core N (captures ALL threads on it, needed for
-     * multi-threaded workloads).  Several --cpu open one event per core, pin the child to
-     * exactly that set and write one AUX file per core.  None = per-task (the one thread).
-     * A per-CPU event is per-TASK-per-CPU: (pid = child, cpu = N) with `inherit', which the
-     * child's threads inherit at clone(2), so the PMU is only programmed while one of the
-     * child's threads is on the core -- no other tenant's code is ever in the stream (libipt
-     * has no image for a foreign tenant, errors, and re-synchronises at the next PSB, losing
-     * everything up to it).  Inherited events write into the parent event's buffers
-     * (perf_output_begin/perf_aux_output_begin redirect to the parent). */
+     * multi-threaded/JIT workloads).  Several --cpu open one event per core, pin the child to
+     * exactly that set and write one AUX file per core.  None = per-task (the one thread). */
     #define MAX_CPUS 64
     int cpus[MAX_CPUS]; int ncpu = 0;
+    /* --cpu-wide: whole-core events (pid = -1): EVERY task that runs on the core lands in
+     * its AUX stream.  The default is per-TASK-per-CPU: (pid = child, cpu = N) with
+     * `inherit', which the child's threads inherit at clone(2), so the PMU is only programmed while
+     * one of the child's threads is on the core -- no other tenant's code is ever in the stream.
+     * (libipt has no image for a foreign tenant, errors, and re-synchronises at the next PSB,
+     * losing everything up to it.)  Inherited events write into the parent
+     * event's buffers (perf_output_begin/perf_aux_output_begin redirect to the parent). */
+    int cpu_wide = 0;
+    double trace_after = 0;    /* --trace-after S: keep the PT event DISABLED for S seconds */
     long data_pages = 0;       /* --data-pages N: data ring pages (power of two; default 8, or 1024 with switch records) */
     char *child_env[32]; int n_child_env = 0;   /* --child-env VAR=VALUE (repeatable):
                                 * set in the CHILD only, so the tracer never loads the tracee's
@@ -1004,30 +1186,61 @@ int main(int argc, char **argv) {
     int i = 1;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--aux-mb") && i+1 < argc) aux_mb = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--mtc-period") && i+1 < argc) mtc_period = atol(argv[++i]);
         else if (!strcmp(argv[i], "--ptw")) want_ptw = 1;
+        else if (!strcmp(argv[i], "--no-ptw")) no_ptw = 1;
+        else if (!strcmp(argv[i], "--no-branch")) no_branch = 1;
         else if (!strcmp(argv[i], "--no-decode")) no_decode = 1;
+        else if (!strcmp(argv[i], "--no-drain")) no_drain = 1;
+        else if (!strcmp(argv[i], "--no-switch")) g_want_switch = 0;
+        else if (!strcmp(argv[i], "--timeline") && i+1 < argc) timeline = argv[++i];
+        else if (!strcmp(argv[i], "--ptw-window") && i+1 < argc) ptwwin = argv[++i];
+        else if (!strcmp(argv[i], "--ptw-window-us") && i+1 < argc) ptwwin_us = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--ptw-dump") && i+1 < argc) ptwdump = argv[++i];
         else if (!strcmp(argv[i], "--cpu") && i+1 < argc) {
             int c = atoi(argv[++i]); int dup = 0;
             for (int k = 0; k < ncpu; k++) if (cpus[k] == c) dup = 1;
             if (!dup) { if (ncpu >= MAX_CPUS) { fprintf(stderr, "too many --cpu\n"); return 2; } cpus[ncpu++] = c; }
         }
         else if (!strcmp(argv[i], "--data-pages") && i+1 < argc) data_pages = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--cpu-wide")) cpu_wide = 1;
+        else if (!strcmp(argv[i], "--trace-after") && i+1 < argc) trace_after = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--trace-control") && i+1 < argc) g_trace_control_path = argv[++i];
         else if (!strcmp(argv[i], "--aux-out") && i+1 < argc) aux_out = argv[++i];
         else if (!strcmp(argv[i], "--sideband") && i+1 < argc) sideband = argv[++i];
+        else if (!strcmp(argv[i], "--drain-log") && i+1 < argc) drainlog = argv[++i];
+        else if (!strcmp(argv[i], "--auxrec-log") && i+1 < argc) { g_auxlog = fopen(argv[++i], "w"); if (g_auxlog) setvbuf(g_auxlog, NULL, _IOFBF, 1 << 20); }
+        else if (!strcmp(argv[i], "--zero-drained")) g_zero_drained = 1;
         else if (!strcmp(argv[i], "--stage-mb") && i+1 < argc) stage_mb = atol(argv[++i]);
         else if (!strcmp(argv[i], "--stage-prefault-mb") && i+1 < argc) prefault_mb = atol(argv[++i]);
         else if (!strcmp(argv[i], "--watermark-mb") && i+1 < argc) wm_mb = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--watermark-kb") && i+1 < argc) wm_kb = atol(argv[++i]);
         else if (!strcmp(argv[i], "--child-core") && i+1 < argc) child_core = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--map-poll-ms") && i+1 < argc) map_poll_ms = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--map-poll-burst-ms") && i+1 < argc) map_burst_ms = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--map-poll-gate")) map_poll_gate = 1;
         else if (!strcmp(argv[i], "--child-env") && i+1 < argc) {
             if (n_child_env < 32) child_env[n_child_env++] = argv[++i];
             else { fprintf(stderr, "too many --child-env\n"); return 2; }
         }
+        else if (!strcmp(argv[i], "--scan")) {}
         else if (!strcmp(argv[i], "--")) { i++; break; }
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); return 2; }
     }
     if (i >= argc) { fprintf(stderr, "no command (use -- <cmd>)\n"); return 2; }
+    int control_fd = -1;
+    if (g_trace_control_path) {
+        struct stat st; char initial;
+        control_fd = open(g_trace_control_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        if (trace_after > 0 || control_fd < 0 || fstat(control_fd, &st) || !S_ISREG(st.st_mode) ||
+            pread(control_fd, &initial, 1, 0) != 1 || initial != '0') {
+            fprintf(stderr, "--trace-control needs an existing regular file starting with 0, and no --trace-after\n");
+            return 2;
+        }
+    }
     char **cmd = &argv[i];
     const int per_cpu = ncpu ? cpus[0] : -1;      /* the first core, for the single-event paths */
+    g_cpu_wide = cpu_wide;
     const int nev = ncpu ? ncpu : 1;              /* number of perf events */
     if (!ncpu) g_want_switch = 0;                 /* a per-task event follows one thread: nothing to attribute */
     if (data_pages <= 0) data_pages = g_want_switch ? 1024 : 8;
@@ -1046,6 +1259,18 @@ int main(int argc, char **argv) {
     read_format_bits("mtc_period", &b_mtcp, &mtcp_w);
     read_format_bits("ptw", &b_ptw, NULL);
     if (b_pt < 0) { fprintf(stderr, "error: no pt config bit\n"); return 2; }
+    /* NOPTW: a PT-capable CPU without PTWRITE (CPUID.(14H,0):EBX[4] = 0,
+     * e.g. Ice Lake Xeon) rejects PTWEn, so --ptw is dropped there with a note instead of failing.
+     * Images rewritten with --sync-carrier tnt execute no PTWRITE and need no PTW packets. */
+    { const char *e = getenv("PT_CAPTURE_NO_PTW"); if (e && *e && *e != '0') no_ptw = 1; }
+    if (want_ptw && !no_ptw) {
+        unsigned a14 = 0, b14 = 0, c14 = 0, d14 = 0;
+        if (!__get_cpuid_count(0x14, 0, &a14, &b14, &c14, &d14) || !(b14 & (1u << 4))) {
+            fprintf(stderr, "note: this CPU has no PTWRITE (CPUID.14H:EBX[4] = 0): --ptw ignored\n");
+            no_ptw = 1;
+        }
+    }
+    if (want_ptw && no_ptw) { fprintf(stderr, "note: PTW packets disabled (PTWEn = 0)\n"); want_ptw = 0; }
     if (want_ptw && b_ptw < 0) { fprintf(stderr, "error: PMU has no ptw config bit\n"); return 2; }
 
     struct perf_event_attr attr;
@@ -1053,7 +1278,7 @@ int main(int argc, char **argv) {
     attr.size = sizeof(attr);
     attr.type = pmu_type;
     attr.config = (1ULL << b_pt);
-    if (b_branch >= 0)  attr.config |= (1ULL << b_branch);   /* control flow */
+    if (b_branch >= 0 && !no_branch) attr.config |= (1ULL << b_branch);   /* control flow */
     if (b_tsc >= 0)    attr.config |= (1ULL << b_tsc);      /* wall-clock anchor */
     if (b_mtc >= 0)    attr.config |= (1ULL << b_mtc);      /* fine timing */
     if (b_mtcp >= 0)   attr.config |= ((uint64_t)mtc_period << b_mtcp);
@@ -1061,17 +1286,49 @@ int main(int argc, char **argv) {
     /* Wake the draining reader when --watermark-mb has accumulated (default an EIGHTH of the ring:
      * the copy out of the ring is a memcpy now, so waking more often is nearly free and it keeps
      * the ring emptier, which is the headroom that absorbs a disk stall -- see drain_thread). */
-    { long w = wm_mb > 0 ? wm_mb : (aux_mb / 8);
-      if (w < 4) w = 4;
-      if (w > aux_mb / 2) w = aux_mb / 2;
-      if (w < 1) w = 1;
-      unsigned long long wb = (unsigned long long)w * 1024 * 1024;
-      attr.aux_watermark = (uint32_t)(wb > 0xf0000000ULL ? 0xf0000000ULL : wb); }
+    /* Mixed ToPA chunk orders: the kernel sizes the AUX buffer's high-order chunks by the
+     * WATERMARK (rb_alloc_aux: max_order = get_order(aux_watermark), capped at MAX_PAGE_ORDER = 4 MB)
+     * and falls back to smaller orders when the buddy allocator has no block of that order left.  A
+     * fragmented machine therefore yields MIXED ToPA region sizes (4 MB, 4 MB, 2 MB, 4 MB ...), and a
+     * 4 MB region then starts at a 2 MB-odd buffer offset.  intel_pt's pt_buffer_reset_offsets()
+     * computes the in-region write offset as `head & (region_size - 1)', i.e. it assumes every region
+     * is naturally aligned: on every (re)start inside such a region the hardware is programmed 2 MB
+     * off.  Half the time the kernel then reports aux_head advancing by 2 MB + w (2 MB of stale ring
+     * bytes), the other half by RING - 2 MB + w: a whole stale lap, after which only ~2 MB of the
+     * ring is free, the hardware hits STOP within milliseconds and real trace is lost -- the "stale-AUX
+     * storm".
+     * Fix: keep the chunk order UNIFORM by choosing the watermark's order from /proc/buddyinfo so that
+     * the free blocks of that order cover every ring with 2x headroom; uniform chunks are aligned by
+     * construction.  --watermark-mb/-kb still override (then the check only warns). */
+    { unsigned long long total = (unsigned long long)aux_mb * 1024 * 1024 * (unsigned long long)(ncpu ? ncpu : 1);
+      unsigned long long wb = 0;
+      int k = topa_safe_order(total, (wm_mb > 0 || wm_kb > 0) ? 1 : 0);
+      if (wm_kb > 0) wb = (unsigned long long)wm_kb * 1024;
+      else if (wm_mb > 0) wb = (unsigned long long)wm_mb * 1024 * 1024;
+      else if (k >= 10) { long w = aux_mb / 8; if (w < 4) w = 4; wb = (unsigned long long)w * 1024 * 1024; }  /* 4 MB chunks are safe */
+      else wb = 4096ULL << k;                                         /* smaller uniform chunks: watermark = one chunk */
+      if (wb > (unsigned long long)aux_mb * 1024 * 1024 / 2) wb = (unsigned long long)aux_mb * 1024 * 1024 / 2;
+      if (wb < 4096) wb = 4096;
+      attr.aux_watermark = (uint32_t)(wb > 0xf0000000ULL ? 0xf0000000ULL : wb);
+      int eff = 0; while (eff < 10 && (4096ULL << eff) < (unsigned long long)attr.aux_watermark) eff++;   /* = get_order() */
+      g_topa_order = eff;
+      fprintf(stderr, "aux: %ld MB x%d, watermark %llu KB -> AUX chunk order %d (%llu KB); buddyinfo-safe order %d%s\n",
+              aux_mb, ncpu ? ncpu : 1, (unsigned long long)attr.aux_watermark >> 10, eff, (4096ULL << eff) >> 10, k,
+              eff < 6 ? " -- WARNING: little free memory in large blocks, so the watermark (one PMI per chunk) is small and PT costs more; lower --aux-mb for timing runs" :
+              eff > k ? " -- WARNING: the forced watermark asks for larger chunks than free memory can supply uniformly; mixed chunks trigger the kernel's misplaced-offset bug" : ""); }
     attr.exclude_kernel = 1;
     attr.exclude_hv = 1;
     attr.disabled = 1;
-    attr.enable_on_exec = 1;          /* a per-task property: the trace starts at the exec */
-    if (per_cpu >= 0) attr.inherit = 1;      /* the child's threads inherit the event */
+    /* enable_on_exec is a per-task property; in cpu-wide mode we enable manually. */
+    attr.enable_on_exec = (per_cpu < 0 || !cpu_wide) ? 1 : 0;
+    /* --trace-after S: a SERVER cannot be traced from
+     * its first instruction the way a batch job can -- it needs a start-up and a warm-up first,
+     * and tracing the warm-up of a whole-program instrumented service costs gigabytes of AUX
+     * that are then decoded for nothing.  Keep the event
+     * disabled and enable it S seconds after the child is released; the window is then
+     * [S, child exit], which the caller ends by killing the service. */
+    if (trace_after > 0 || g_trace_control_path) { attr.enable_on_exec = 0; g_pt_armed = 0; }
+    if (per_cpu >= 0 && !cpu_wide) attr.inherit = 1;      /* the child's threads inherit the event */
     if (g_want_switch) {
         /* Thread attribution (see struct sw_rec): every non-sample record in the data ring
          * carries { pid, tid, time, cpu } and a switch record is written at every context
@@ -1081,11 +1338,10 @@ int main(int argc, char **argv) {
         attr.context_switch = 1;
     }
 
-    /* --child-core N: the traced child gets core N to ITSELF.  pt_capture2's own threads (the
-     * map poller and the drain thread) are moved OFF it -- sharing the core with the benchmark
-     * both halves the benchmark's speed and starves the drain thread, i.e. it causes the very
-     * stall it is there to prevent.  With several --cpu the whole set is the child's and the
-     * parent leaves all of them. */
+    /* --child-core N: the traced child gets core N to ITSELF.  pt_capture2's own two
+     * threads (the map poller and the drain thread) are moved OFF it -- sharing the core with
+     * the benchmark would both slow the benchmark down and starve the drain thread.
+     * With several --cpu the whole set is the child's and the parent leaves all of them. */
     {
         cpu_set_t leave; CPU_ZERO(&leave); int nleave = 0;
         if (child_core >= 0) { CPU_SET(child_core, &leave); nleave++; }
@@ -1097,8 +1353,8 @@ int main(int argc, char **argv) {
             if (touched) {
                 if (CPU_COUNT(&self) == 0) {            /* pinned to those cores alone: take the rest */
                     CPU_ZERO(&self);
-                    /* Prefer the first 8 logical CPUs: on a hybrid part they are the P-cores, and
-                     * the drain thread has to memcpy several GB/s out of the ring. */
+                    /* Prefer the first 8 logical CPUs: on hybrid parts they are typically the
+                     * P-cores, and the drain thread has to memcpy several GB/s out of the ring. */
                     for (int k = 0; k < 8; k++) if (!CPU_ISSET(k, &leave)) CPU_SET(k, &self);
                     if (CPU_COUNT(&self) == 0)
                         for (int k = 0; k < CPU_SETSIZE && k < 64; k++) if (!CPU_ISSET(k, &leave)) CPU_SET(k, &self);
@@ -1123,7 +1379,7 @@ int main(int argc, char **argv) {
         if (np && sched_setaffinity(0, sizeof(set), &set)) perror("child sched_setaffinity");
         char c; (void)!read(pipefd[0], &c, 1);   /* block until parent ready */
         close(pipefd[0]);
-        /* the tracee-only variables, applied HERE and nowhere else. */
+        /* The tracee-only variables, applied HERE and nowhere else. */
         for (int k = 0; k < n_child_env; k++)
             if (putenv(child_env[k])) perror("child putenv");
         execvp(cmd[0], cmd);
@@ -1131,8 +1387,8 @@ int main(int argc, char **argv) {
     }
     close(pipefd[0]);
 
-    /* per-task: (pid=child, cpu=-1) follows the one thread.  per-CPU: (pid=child,
-     * cpu=N) with inherit captures every thread of the child on core N. */
+    /* per-task: (pid=child, cpu=-1) follows the one thread. per-CPU: (pid=-1,
+     * cpu=N) captures everything on core N -- required for multi-threaded/JIT. */
     static volatile int child_alive = 1;
     long fds[MAX_CPUS]; void *bases[MAX_CPUS]; void *auxs[MAX_CPUS]; struct perf_event_mmap_page *pcs[MAX_CPUS];
     long page = sysconf(_SC_PAGESIZE);
@@ -1140,7 +1396,7 @@ int main(int argc, char **argv) {
     size_t aux_len = (size_t)aux_mb * 1024 * 1024;   /* power-of-two MB => ok */
     for (int e = 0; e < nev; e++) {
         long fd = (per_cpu < 0) ? perf_event_open(&attr, child, -1, -1, 0)
-                                : perf_event_open(&attr, child, cpus[e], -1, 0);
+                                : perf_event_open(&attr, cpu_wide ? -1 : child, cpus[e], -1, 0);
         if (fd < 0) {
             fprintf(stderr, "error: perf_event_open%s: %s\n", ncpu ? " (per-cpu)" : "", strerror(errno));
             kill_child:
@@ -1174,9 +1430,10 @@ int main(int argc, char **argv) {
         if (sideband && g_want_switch) { size_t n = strlen(sideband) + 24; sw_names[e] = malloc(n); snprintf(sw_names[e], n, "%s.cpu%d.sw", sideband, cpus[e]); }
     }
 
-    /* The draining writer: with --aux-out, a reader thread copies the ring into
-     * the file and publishes aux_tail while the child runs, so the capture is
-     * complete however long the run is. */
+    /* The draining writer: with --aux-out, a reader thread copies
+     * the ring into the file and publishes aux_tail while the child runs, so the
+     * capture is complete however long the run is.  --no-drain gives a
+     * fill-once-and-stop (prefix) capture. */
     static struct drain_ctx dctx[MAX_CPUS]; memset(dctx, 0, sizeof dctx);
     pthread_t wth, ath; int draining = 0, allocating = 0;
     static size_t alloc_target = 24;      /* chunks the allocator tries to keep free (768 MB) */
@@ -1187,15 +1444,17 @@ int main(int argc, char **argv) {
         d->fd = (int)fds[e]; d->child_alive = &child_alive; d->cpu = ncpu ? cpus[e] : -1;
         if (sw_names[e]) { d->swf = fopen(sw_names[e], "wb"); if (!d->swf) perror("switch file"); else setvbuf(d->swf, NULL, _IOFBF, 1 << 20); }
     }
-    if (aux_out) {
+    if (aux_out && !no_drain) {
         g_stage_max = (size_t)stage_mb * 1024 * 1024;
         for (int e = 0; e < nev; e++) {
             dctx[e].staging = 1;
+            if (g_zero_drained) dctx[e].phash = calloc(dctx[e].aux_len / 4096 + 1, sizeof(uint64_t));
             dctx[e].sink = fopen(aux_names[e], "wb");
             if (!dctx[e].sink) { perror("aux-out"); goto kill_child; }
             setvbuf(dctx[e].sink, NULL, _IONBF, 0);            /* the staging queue is the buffer */
         }
         g_sink = dctx[0].sink;
+        if (drainlog) { g_drainlog = fopen(drainlog, "w"); if (g_drainlog) setvbuf(g_drainlog, NULL, _IOLBF, 0); }
         /* Populate the pool BEFORE the child is released, so the first burst never faults. */
         for (long k = 0; k < prefault_mb / (long)(STAGE_CHUNK >> 20); k++) {
             struct stage_chunk *n = chunk_new();
@@ -1219,7 +1478,24 @@ int main(int argc, char **argv) {
         /* PTRACE_O_TRACECLONE: every thread the child creates is auto-attached and stops once
          * before it runs -- where its fs_base is read. */
         if (ptrace(PTRACE_SEIZE, child, 0, PTRACE_O_TRACEEXIT | PTRACE_O_TRACEEXEC | PTRACE_O_TRACECLONE)) perror("ptrace seize (sideband maps unavailable)"); }
-    /* 3. Release the child; the trace auto-enables on exec. */
+    /* 3. Release the child; per-task trace auto-enables on exec, per-CPU must be
+     * enabled manually here (just before the child starts running on core N). */
+    if (per_cpu >= 0 && cpu_wide && trace_after <= 0 && !g_trace_control_path) for (int e = 0; e < nev; e++) ioctl(fds[e], PERF_EVENT_IOC_ENABLE, 0);
+    struct trace_control control = {fds, nev, control_fd};
+    pthread_t control_th;
+    if (g_trace_control_path && pthread_create(&control_th, NULL, trace_control_thread, &control)) {
+        perror("trace-control thread"); goto kill_child;
+    }
+    static struct { long *fds; int n; double after; } g_delay;
+    pthread_t delay_th; int have_delay_th = 0;
+    if (trace_after > 0) {
+        g_delay.fds = fds; g_delay.n = nev; g_delay.after = trace_after;
+        g_pt_armed = 0;                    /* No watchdog re-arm before the delay fires */
+        extern void *pt_delay_enable(void *);
+        if (pthread_create(&delay_th, NULL, pt_delay_enable, &g_delay)) perror("pthread_create (trace-after)");
+        else have_delay_th = 1;
+    }
+    (void)have_delay_th;
     double t0 = now_sec();
     (void)!write(pipefd[1], "g", 1);
     close(pipefd[1]);
@@ -1230,23 +1506,22 @@ int main(int argc, char **argv) {
          * nothing from pt_capture2's own pre-exec image ends up in the sideband -- then it is
          * polled while running (to catch mappings unmapped before exit), and once more at the
          * exit stop, where the address space is still intact. */
-        /* This loop must not re-read /proc/PID/maps at a high rate.  Every read takes the
-         * child's mmap_lock for reading, and CPython's obmalloc mmap()s and munmap()s arenas
-         * constantly (which needs it for WRITING), so a kHz poller from another core starves
-         * the benchmark by orders of magnitude.  The union-over-time only exists to catch
-         * mappings the loader unmaps before the exit stop, and those all happen during
-         * start-up, so poll densely for `map_burst_ms' after the exec stop and then every
-         * `map_poll_ms'. */
+        /* Every read of /proc/PID/maps takes the child's mmap_lock for reading, and CPython's
+         * obmalloc mmap()s and munmap()s arenas constantly (which needs it for WRITING), so a
+         * high-frequency poller from another core starves the benchmark.
+         * The union-over-time only exists to catch mappings the loader unmaps before the exit
+         * stop, and those all happen during start-up, so poll densely for --map-poll-burst-ms
+         * after the exec stop and then every --map-poll-ms. */
         static volatile int execed = 0;
-        /* The main loop BLOCKS in waitpid: an E9Patch-rewritten CPython takes thousands of
-         * SIGILL stops per run (E9Patch's own evicted-instruction handler), and the child is
-         * frozen from the moment it stops until the tracer restarts it, so a polling loop
-         * with a sleep would freeze the benchmark at every stop.  Periodic map polling runs
-         * in its own thread.
+        /* The main loop BLOCKS in waitpid: an E9Patch-rewritten program can take thousands of
+         * SIGILL stops (E9Patch's own evicted-instruction handler), and the child is
+         * frozen from the moment it stops until the tracer restarts it, so a polling
+         * (WNOHANG + sleep) loop would freeze it on every stop.  Periodic map polling runs in
+         * its own thread.
          * MULTI-THREADED: with PTRACE_O_TRACECLONE every thread reports here, so the loop waits
          * for ANY tracee (__WALL) and ends when the thread-group LEADER is reaped -- which the
          * kernel only reports once every other thread is gone. */
-        struct mp_arg_t mpa = { child, &child_alive, &execed, map_burst_ms, map_poll_ms };
+        struct mp_arg_t mpa = { child, &child_alive, &execed, map_burst_ms, map_poll_ms, map_poll_gate };
         pthread_t mth; int mpolling = 0;
         if (map_poll_ms > 0 && !pthread_create(&mth, NULL, map_poll_thread, &mpa)) mpolling = 1;
         thr_get(child);
@@ -1270,7 +1545,7 @@ int main(int argc, char **argv) {
                 else if (ev == PTRACE_EVENT_CLONE) {
                     unsigned long nt = 0; g_nclone++;
                     if (!ptrace(PTRACE_GETEVENTMSG, r, 0, &nt) && nt) {
-                        /* the new thread's TCB comes from ITS CREATOR's spare ring. */
+                        /* The new thread's TCB comes from ITS CREATOR's spare ring. */
                         struct thr *c = thr_get((pid_t)nt);
                         c->seen_clone = 1; c->tcb = tcb_take_spare(r);
                         if (c->held) {                          /* its first stop came first */
@@ -1285,21 +1560,26 @@ int main(int argc, char **argv) {
                     if (!t->seen_clone) { t->held = 1; g_tcb_held++; continue; }   /* wait for the creator's clone event */
                     if (t->tcb) tcb_assign(r, t->tcb);
                 }
-                /* A SIGTRAP stop that is NOT a ptrace event is a real signal the tracee raised
-                 * (an `int3' a program plants on its own account) and it MUST be delivered.
+                /* A SIGTRAP stop that is NOT a ptrace event
+                 * is a real signal the tracee raised -- the `int3' the HotSpot JIT patcher plants
+                 * during its cross-modifying install (runtime/jit/java/jvmtiagent.cc) -- and it MUST
+                 * be delivered: suppressing it would resume the thread one byte into the detour's rel32.
                  * Under PTRACE_SEIZE every tracer-generated stop carries an event number (ev != 0;
                  * group-stops and the auto-attach stop are PTRACE_EVENT_STOP), so ev == 0 with
                  * sig == SIGTRAP is always a genuine signal. */
                 if (ev == 0 && sig == SIGTRAP) g_nsigtrap++;
-                ptrace(PTRACE_CONT, r, 0, ev != 0 ? 0 : sig);
+                /* PT_CAPTURE2_SWALLOW_SIGTRAP=1 suppresses it (diagnostic only; the JVMTI agent's
+                 * VM_INIT self-test must then abort the JVM with exit 72). */
+                ptrace(PTRACE_CONT, r, 0, (ev != 0 || (sig == SIGTRAP && g_swallow_trap)) ? 0 : sig);
             }
         }
         child_alive = 0;
         if (mpolling) pthread_join(mth, NULL);
-        fprintf(stderr, "ptrace: %llu stops (%llu SIGILL, %llu SIGTRAP forwarded), %llu map polls, %llu of them parsed, %zu threads (%llu clone events); "
+        fprintf(stderr, "ptrace: %llu stops (%llu SIGILL, %llu SIGTRAP %s), %llu map polls (%llu gate-skipped), %llu of them parsed, %zu threads (%llu clone events); "
                 "spare TCBs assigned to %llu new threads (%llu had none available, %llu held for their clone event)\n",
                 (unsigned long long)g_nstops, (unsigned long long)g_nsigill, (unsigned long long)g_nsigtrap,
-                g_maps_polls, g_maps_parses, g_nthr, (unsigned long long)g_nclone,
+                g_swallow_trap ? "SWALLOWED (PT_CAPTURE2_SWALLOW_SIGTRAP)" : "forwarded",
+                g_maps_polls, g_gate_skips, g_maps_parses, g_nthr, (unsigned long long)g_nclone,
                 (unsigned long long)g_tcb_assigned, (unsigned long long)g_tcb_none, (unsigned long long)g_tcb_held);
         if (!execed) fprintf(stderr, "warning: never saw the exec stop; the sideband maps may be incomplete\n");
         if (g_map_execs > 1)
@@ -1309,6 +1589,11 @@ int main(int argc, char **argv) {
                             "with --child-core instead of a `taskset' prefix to avoid it.\n",
                     (unsigned long long)g_map_execs, (unsigned long long)g_maps_forgotten);
     } else waitpid(child, &status, 0);
+    if (g_trace_control_path) {
+        __atomic_store_n(&g_control_stop, 1, __ATOMIC_RELEASE);
+        pthread_join(control_th, NULL);
+        close(control_fd);
+    }
     double wall = now_sec() - t0;
     pthread_mutex_lock(&g_pt_control_mtx);
     g_pt_armed = 0;
@@ -1327,10 +1612,14 @@ int main(int argc, char **argv) {
             pthread_mutex_lock(&g_stage_mtx); g_writer_stop = 1;
             pthread_cond_broadcast(&g_stage_more); pthread_mutex_unlock(&g_stage_mtx);
             pthread_join(wth, NULL);
-            for (int e = 0; e < nev; e++) { fflush(dctx[e].sink); fclose(dctx[e].sink); dctx[e].sink = NULL; }
+            for (int e = 0; e < nev; e++) { fflush(dctx[e].sink); if (g_zero_drained && ftruncate(fileno(dctx[e].sink), ftello(dctx[e].sink))) perror("aux-out truncate"); fclose(dctx[e].sink); dctx[e].sink = NULL; }
+            if (g_zero_drained) { fprintf(stderr, "zero-drained: %llu bytes of all-zero MB pieces written as holes; %llu STALE re-reported ring bytes staged as zeros\n", (unsigned long long)g_zero_holes, (unsigned long long)g_stale);
+                for (int e = 0; e < nev; e++) fprintf(stderr, "  cpu %d: stale=%llu\n", dctx[e].cpu, (unsigned long long)dctx[e].stale); }
             g_sink = NULL;
         }
         for (int e = 0; e < nev; e++) if (dctx[e].swf) { fclose(dctx[e].swf); dctx[e].swf = NULL; }
+        if (g_drainlog) { fclose(g_drainlog); g_drainlog = NULL; }
+        if (g_auxlog) { fclose(g_auxlog); g_auxlog = NULL; }
         nbytes = (size_t)g_aux_written;
         wrapped = (g_aux_lost != 0 || g_aux_trunc_recs != 0);
         for (int e = 0; e < nev; e++) {
@@ -1358,6 +1647,11 @@ int main(int argc, char **argv) {
                     (unsigned long long)dctx[e].aux_trunc_recs, (unsigned long long)dctx[e].n_sw,
                     (unsigned long long)dctx[e].n_itrace, (unsigned long long)dctx[e].data_lost_recs,
                     dctx[e].data_lost_recs ? "  [switch records LOST: enlarge --data-pages]" : "");
+        if (g_aux_fulllap || g_stale)
+            fprintf(stderr, "error: ToPA overflow signature: %llu AUX records larger than half the ring, %llu stale ring bytes -- the kernel mis-placed "
+                            "the ToPA write offset (mixed-order AUX chunks, chunk order %d); the capture is NOT trustworthy. Lower --aux-mb or --watermark-kb.\n",
+                    (unsigned long long)g_aux_fulllap, (unsigned long long)g_stale, g_topa_order);
+        fprintf(stderr, "ToPA: full-lap AUX records=%llu stale bytes=%llu chunk order %d\n", (unsigned long long)g_aux_fulllap, (unsigned long long)g_stale, g_topa_order);
         if (g_aux_lost || g_aux_trunc_recs)
             fprintf(stderr, "warning: the AUX reader fell behind the producer -- %llu bytes LOST "
                             "(%llu truncation records, %llu re-enables); the trace has GAPS. "
@@ -1373,14 +1667,19 @@ int main(int argc, char **argv) {
         }
     } else {
         uint64_t aux_head = __atomic_load_n(&pc->aux_head, __ATOMIC_ACQUIRE);
-        /* No --aux-out: the ring holds the (prefix of the) trace.  aux_head saturating
-         * at aux_len means the software AUX buffer filled and the trace was TRUNCATED
-         * (distinct from hardware on-chip OVF). */
+        /* aux_head saturating at aux_len means the software AUX buffer filled and
+         * the trace was TRUNCATED (distinct from hardware on-chip OVF) -- enlarge
+         * --aux-mb, drop --no-drain, or use a smaller dataset. */
         wrapped = (aux_head >= aux_len);
         nbytes = wrapped ? aux_len : (size_t)aux_head;
         fprintf(stderr, "child exit=%d wall=%.4fs aux_bytes=%zu%s (aux_buf=%ldMB)\n",
                 WIFEXITED(status)?WEXITSTATUS(status):-1, wall, nbytes,
-                wrapped ? " [WRAPPED-software loss, enlarge --aux-mb]" : "", aux_mb);
+                wrapped ? " [WRAPPED-software loss, enlarge --aux-mb or drop --no-drain]" : "", aux_mb);
+        if (aux_out) {
+            FILE *af = fopen(aux_out, "wb");
+            if (!af) perror("aux-out"); else { if (fwrite(aux, 1, nbytes, af) != nbytes) perror("aux-out write"); fclose(af); }
+            if (wrapped) fprintf(stderr, "warning: AUX wrapped; the saved trace is TRUNCATED (head lost)\n");
+        }
         for (int e = 0; e < nev; e++) { couts[e].cpu = dctx[e].cpu; couts[e].aux = aux_names[e]; couts[e].sw = NULL; }
     }
     if (g_maps_dropped) fprintf(stderr, "error: %llu mappings were DROPPED from the sideband\n", (unsigned long long)g_maps_dropped);
@@ -1411,7 +1710,22 @@ int main(int argc, char **argv) {
     struct pt_packet_decoder *dec = pt_pkt_alloc_decoder(&cfg);
     if (!dec) { fprintf(stderr, "pt_pkt_alloc_decoder failed\n"); return 2; }
 
+    uint64_t cnt[ppt_mwait+8]; memset(cnt, 0, sizeof(cnt));
     uint64_t n_ovf=0, n_tsc=0, n_mtc=0, n_cyc=0, n_psb=0, n_ptw=0, n_total=0;
+    /* OVF timeline: for each OVF, record (tsc_before, gap) where tsc_before is
+     * the last TSC before the gap and gap = (TSC when PT resumes) - tsc_before
+     * = the duration of control flow LOST to that overflow (in TSC cycles).
+     * Pending OVFs are flushed on the next TSC packet. */
+    FILE *tlf = timeline ? fopen(timeline, "w") : NULL;
+    uint64_t last_tsc = 0, first_tsc = 0, total_lost = 0;
+    uint64_t *pend = NULL; size_t np = 0, pcap = 0;
+    /* --ptw-window: bin PTW packets into fixed TSC windows (real-time rate distribution).
+     * Fixed TSC rate constant (matches the analysis scripts). */
+    const double TSC_PER_US = 3878.205567;
+    uint64_t win_tsc = (uint64_t)(ptwwin_us * TSC_PER_US);
+    FILE *pdf = ptwdump ? fopen(ptwdump, "w") : NULL;   /* --ptw-dump: one PTW payload per line */
+    if (win_tsc == 0) win_tsc = 1;
+    uint64_t *wins = NULL; size_t wcap = 0, wmax = 0;
     int err = pt_pkt_sync_forward(dec);
     while (err >= 0) {
         struct pt_packet pkt;
@@ -1423,16 +1737,61 @@ int main(int argc, char **argv) {
         }
         n_total++;
         switch (pkt.type) {
-            case ppt_ovf: n_ovf++; break;
-            case ppt_tsc: n_tsc++; break;
+            case ppt_ovf: n_ovf++;
+                if (tlf) { if (np == pcap) { pcap = pcap ? pcap*2 : 1024; pend = realloc(pend, pcap*sizeof(*pend)); }
+                           pend[np++] = last_tsc; }
+                break;
+            case ppt_tsc: n_tsc++;
+                { uint64_t t = pkt.payload.tsc.tsc;
+                  if (tlf) for (size_t j = 0; j < np; j++) {
+                      uint64_t g = t > pend[j] ? t - pend[j] : 0; total_lost += g;
+                      fprintf(tlf, "%llu %llu\n", (unsigned long long)pend[j], (unsigned long long)g);
+                  }
+                  np = 0; last_tsc = t; if (!first_tsc) first_tsc = t; }
+                break;
             case ppt_mtc: n_mtc++; break;
             case ppt_cyc: n_cyc++; break;
             case ppt_psb: n_psb++; break;
-            case ppt_ptw: n_ptw++; break;
+            case ppt_ptw: n_ptw++;
+                if (pdf) fprintf(pdf, "%llu\n", (unsigned long long)pkt.payload.ptw.payload);
+                if (ptwwin && first_tsc && last_tsc >= first_tsc) {
+                    size_t w = (size_t)((last_tsc - first_tsc) / win_tsc);
+                    if (w >= wcap) {
+                        size_t nc = wcap ? wcap*2 : 4096; while (w >= nc) nc *= 2;
+                        wins = realloc(wins, nc*sizeof(*wins));
+                        for (size_t z = wcap; z < nc; z++) wins[z] = 0;
+                        wcap = nc;
+                    }
+                    wins[w]++; if (w+1 > wmax) wmax = w+1;
+                }
+                break;
             default: break;
         }
     }
     pt_pkt_free_decoder(dec);
+    if (pdf) fclose(pdf);
+    if (tlf) {
+        for (size_t j = 0; j < np; j++) {            /* OVFs with no resume TSC yet */
+            uint64_t g = last_tsc > pend[j] ? last_tsc - pend[j] : 0; total_lost += g;
+            fprintf(tlf, "%llu %llu\n", (unsigned long long)pend[j], (unsigned long long)g);
+        }
+        fprintf(tlf, "# first_tsc %llu last_tsc %llu n_ovf %llu total_lost_cycles %llu\n",
+                (unsigned long long)first_tsc, (unsigned long long)last_tsc,
+                (unsigned long long)n_ovf, (unsigned long long)total_lost);
+        fclose(tlf); free(pend);
+    }
+
+    if (ptwwin) {
+        FILE *pwf = fopen(ptwwin, "w");
+        if (pwf) {
+            fprintf(pwf, "# window_us %ld win_tsc %llu n_windows %zu (count = PTW packets per window)\n",
+                    ptwwin_us, (unsigned long long)win_tsc, wmax);
+            for (size_t w = 0; w < wmax; w++)
+                fprintf(pwf, "%zu %llu\n", w, (unsigned long long)(wins ? wins[w] : 0));
+            fclose(pwf);
+        }
+        free(wins);
+    }
     printf("OVF=%lu TSC=%lu MTC=%lu CYC=%lu PSB=%lu PTW=%lu total_packets=%lu\n",
            n_ovf, n_tsc, n_mtc, n_cyc, n_psb, n_ptw, n_total);
     printf("aux_bytes=%zu wall=%.4fs aux_rate=%.1f MB/s mtc_rate=%.2f MHz\n",

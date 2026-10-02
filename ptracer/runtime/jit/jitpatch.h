@@ -1,6 +1,6 @@
 // jitpatch.h -- PTracer v2 runtime/jit: E9Patch-equivalent trampoline emission for
 // JIT code objects.  Implements the three spec v2 site kinds (docs/SPEC_FORMAT.md §1)
-// with the same encodings the e9tool `ptlog` plugin uses the design notes:
+// with the same encodings the e9tool `ptlog` plugin uses:
 //   reg   before/after : `ptwrite %reg` per register, >=3 non-PTWRITE instructions apart
 //   load  after        : the displaced load, then `ptwrite %dst`
 //   memop before       : `ptwrite <mem>` with the memory operand re-encoded verbatim
@@ -39,6 +39,7 @@ enum {
   PTJ_DROP_WINDOW_MULTI,      // PTJIT_SINGLE: the 5-byte window needs more than one instruction
   PTJ_DROP_KF_FLAGS,          // resync keyframe site whose EFLAGS the analyzer could not prove dead
   PTJ_DROP_KF_NOCTR,          // the keyframe counter arena is full / out of rip-relative reach
+  PTJ_DROP_VE_HOLE,           // the window would overlap HotSpot's verified-entry patch bytes
   PTJ_DROP_N
 };
 static const char *PTJ_DROP_NAME[PTJ_DROP_N] = {
@@ -46,7 +47,7 @@ static const char *PTJ_DROP_NAME[PTJ_DROP_N] = {
   "site_narrow_branch","window_imm32","window_call","window_extern_branch",
   "window_narrow_branch","window_truncated","window_branch_target","segment_prefix",
   "encode_failed","slab_full","out_of_range","decode_failed","too_many_sites",
-  "data_region","window_multi_insn","keyframe_flags_live","keyframe_no_counter"};
+  "data_region","window_multi_insn","keyframe_flags_live","keyframe_no_counter","window_ve_hole"};
 
 // ------------------------------------------------------------- site map -----
 struct PtjMapEntry {
@@ -54,7 +55,7 @@ struct PtjMapEntry {
   uint32_t obj;
   uint16_t site;
   uint8_t kind, when, size, reg, half, payload_bits;
-  // KEYFRAME guard the design notes; ELF equivalent the design notes.
+  // KEYFRAME guard (same scheme as the ELF emitter).
   // Non-zero `kf_period' means this value is logged only when the site's countdown reaches
   // zero.  `kf_branch'/`kf_join' are what Stage 3 actually consumes: it sees the branch, then
   // decides from the NEXT instruction's ip whether the logging path ran.  So the counter's
@@ -62,7 +63,7 @@ struct PtjMapEntry {
   uint64_t counter, kf_branch, kf_join;
   uint32_t kf_period;
   uint8_t resync;
-  // BUFFER SINK the design notes: this value is a `mov %val,disp(%cur)' store
+  // BUFFER SINK: this value is a `mov %val,disp(%cur)' store
   // into the thread's %gs ring (runtime/rt/ptlogrt.c), not a `ptwrite'.  `tramp_addr' is the
   // store; Stage 3 takes the value positionally from cv.<pid>.<tid>.bin when it sees that ip.
   uint8_t buffer;
@@ -71,12 +72,17 @@ struct PtjMapEntry {
 // 1-in-`sync' values so the reconstructor can realign its positional cv cursor after a PT
 // state loss (SPEC_FORMAT section 3, `sync_markers').
 struct PtjSyncMark { uint64_t tramp_addr, orig_addr; };
-// A same-run ground-truth record site (`role: "gt"', the design notes: the
+// `PTLOG_SYNC_CARRIER=tnt' (the E9Patch `--sync-carrier tnt'): the marker's count travels in the
+// TNT bits of a `shr/jc/nop/jnz' loop instead of a PTWRITE payload, so a JIT Fast run executes NO
+// PTWRITE (PT-capable CPUs without PTWRITE).  One row per loop role: 's' the marker's first
+// instruction, 'b' the `jc' (a bit), 'z' the `nop' (that bit is 0); the END is the `sync_markers' row.
+struct PtjTntMark { uint64_t tramp_addr, orig_addr; char role; };
+// A same-run ground-truth record site (`role: "gt"'): the
 // trampoline logs the effective address of ONE memory access into the process's own gt ring.
 // It is not a critical value -- Stage 3 drops it at load time and it consumes no payload.
 struct PtjGtEnt {
   uint64_t tramp_addr, orig_addr, tsc;
-  // D-J9: the LOCKSTEP KEY this record is written with.  `orig_addr' is not a dynamic
+  // The LOCKSTEP KEY this record is written with.  `orig_addr' is not a dynamic
   // instance -- a JIT address is reused by a later code object (V8 CODE_MOVED, a HotSpot
   // nmethod sweep), and inside a loop the "next ground-truth record with the same ip" is a
   // different iteration -- so the ground-truth record carries the address of the RELOCATED
@@ -100,7 +106,7 @@ struct PtjPatchCtx {
   uint8_t *slab; size_t slab_cap, *slab_used;
   int use_ptwrite;          // 0 = bare detour (A/B control)
   int space;                // non-PTWRITE instructions between consecutive ptwrites
-  // --- BUFFER SINK the design notes ------------------------------------
+  // --- BUFFER SINK ------------------------------------
   // `sink_buffer' = 1: a logged value is STORED through the per-thread cursor at %gs:0 into
   // the ring `runtime/rt/ptlogrt.c' owns (same %gs layout, cv record format and sync markers
   // as the E9Patch buffer sink, so `ptrecon' consumes it unchanged).  `sync' is the marker
@@ -109,7 +115,12 @@ struct PtjPatchCtx {
   int sink_buffer;
   uint32_t sync;
   PtjSyncMark *syncs; uint32_t nsyncs, maxsyncs;
+  int sync_tnt;              // 1 = TNT carrier (PtjTntMark rows), 0 = `ptwrite %gs:16'
+  PtjTntMark *tnts; uint32_t ntnts, maxtnts;
   uint64_t buf_sites, buf_sites_flags_live, buf_values, buf_markers;
+  // `memop' sites on a > 8-byte operand (xmm/ymm/zmm, 16/32/64 bytes) that were
+  // patched.  Each logs its FIRST 8 BYTES as one value with map size 8 -- see ptj_memop_log_size.
+  uint64_t wide_memop_sites;
   PtjMapEntry *entries; uint32_t nentries, maxentries;
   PtjReloc *relocs; uint32_t nrelocs, maxrelocs;
   uint64_t *tramps; uint32_t ntramps, maxtramps;
@@ -117,8 +128,16 @@ struct PtjPatchCtx {
   uint64_t n_values;        // logged values emitted
   uint32_t obj;             // current code object index
   uint64_t tsc;
-  int sparkplug;            // trust the V8-12.4 Sparkplug prologue shape (see jit_runtime.md)
+  int sparkplug;            // trust the V8-12.4 Sparkplug prologue shape
   int single;               // only displace a SINGLE instruction (no interior boundary at all)
+  // --- decode reuse (0 == full decodes) -------
+  // `fastdec' = 1: decode each instruction ONCE (ZydisDecoderDecodeInstruction, no operands)
+  // into the per-object sweep (PtjSweep), reuse it in the descent and the address-order pass,
+  // and decode operands only in that pass.  `data_from_hint' != 0: the caller already computed
+  // ptj_scan_data_from() on these very bytes (the cache key needs it); consumed by the next
+  // ptj_decode_object.  Both produce identical decode tables (PTJIT_DECCHECK=1 proves it).
+  int fastdec;
+  uint32_t data_from_hint;
   // --- VM-supplied structure (HotSpot; all optional, 0/NULL == the V8 behaviour) --------
   // `roots`   extra offsets the code object can be *entered at* indirectly, seeded into
   //           the recursive-descent sweep (JVMTI's jvmtiAddrLocationMap, the interpreter's
@@ -132,6 +151,24 @@ struct PtjPatchCtx {
   const uint32_t *roots; uint32_t nroots;
   const uint32_t *forbid; uint32_t nforbid;
   uint32_t lo, hi;
+  // --- re-admitting refused JIT sites -----------------
+  // `nsoft`   the FIRST nsoft entries of `forbid` are HotSpot PcDescs.  With `pcsoft` they stop
+  //           being forbidden window interiors unless they are also a restart root (`rr`), a
+  //           later `forbid` entry, or the byte after a safepoint poll.  Rationale: JVMTI's
+  //           CompiledMethodLoad capability turns on DebugNonSafepoints, so most PcDescs are
+  //           bci records for profilers, never resumption points; the VM resumes compiled code
+  //           only at call returns (a call is never displaced, so its return address is never
+  //           strictly inside a window) and after a safepoint poll (kept hard).
+  // `hole_lo/hole_hi` bytes no window may overlap (HotSpot's verified-entry patch site); with
+  //           a hole the front end may lower `lo` to 0 so the inline-cache check is patchable.
+  // `slide`   if the forward window [site, ...) fails, try a window that starts up to 4
+  //           instructions BEFORE the site (the site is still logged at its own address).
+  // `shift`   last resort for a `reg`/before site: move it forward past instructions that
+  //           write none of its registers (the value is the same there) and place it there.
+  uint32_t nsoft; const uint32_t *rr; uint32_t nrr;
+  int pcsoft, slide, shift;
+  uint32_t hole_lo, hole_hi;
+  uint64_t slid, shifted;
   // `install` writes the finished window bytes over live code.  NULL = a plain store (the
   // V8 path: the code object cannot be executing yet).  HotSpot nmethods *are* live when
   // the event arrives, so the Java front end supplies the int3-then-jmp protocol here.
@@ -142,26 +179,35 @@ struct PtjPatchCtx {
   // alternative covering set (analyzer v2.18) rather than losing the value.  NULL = do not
   // collect, which is the V8 behaviour.
   uint32_t *unpatched; uint32_t nunpatched, maxunpatched;
-  // `ctr` (measurement only, the design notes: an array of 64-bit counters
+  // `ctr` (measurement only): an array of 64-bit counters
   // reachable rip-relative from the slab.  When non-NULL every trampoline is prefixed with
   // a flags-safe `incq ctr[i](%rip)`, i being the trampoline's index, so a run reports how
   // many times each trampoline actually EXECUTED.  `ctr_orig[i]` records the window's
   // original address.  This changes the trampoline, so it is a counting configuration, not
   // a timing one.
   uint64_t *ctr; uint64_t *ctr_orig; uint32_t ctr_max;
-  // --- keyframes (defect D-J1) --------------------------------------------------------
+  // --- keyframes --------------------------------------------------------
   // `kfctr' is an array of 64-bit countdown cells, one per keyframed SITE, at stride
   // PTJ_KFCTR_STRIDE (one cache line) so that two hot sites -- possibly on two threads --
   // never share a line.  It must be within +-2GB of the slab: the front end maps it right
   // after the slab and the emitter checks the reach per guard.
   uint64_t *kfctr; uint32_t kfctr_used, kfctr_max;
+  // PER-THREAD countdown cells: when `kf_gs_n' > 0 the guard is
+  // `dec %gs:(4096 + 8*(kf_gs_base+i))' -- cell i of the ptlog runtime's per-thread keyframe
+  // array (runtime/rt/ptlogrt.c PTLOG_KF_N, the ELF `--kf-gs' layout), cells [kf_gs_base,
+  // kf_gs_base+kf_gs_n) being reserved for the JIT by raising PTLOG_KF_N.  A shared rip-relative
+  // cell ping-pongs its cache line between every thread running the loop.  The runtime initialises every cell of every
+  // thread to 1, so a thread's first execution of a site is a keyframe, as before.
+  uint32_t kf_gs_base, kf_gs_n;
   int kf_flags_live;          // resync site with live EFLAGS: 0 drop (default), 1 emit anyway
+  int kf_flags_save;          // 1 = wrap a live-EFLAGS keyframe guard in pushfq/popfq instead of dropping it
+  uint64_t kf_flags_saved;    // such guards emitted
   uint64_t kf_sites, kf_values, kf_requested;   // resync sites the analyzer returned / placed
-  // --- same-run ground truth (`gt' role, defect D-J2) -----------------------------------
+  // --- same-run ground truth (`gt' role) -----------------------------------
   // `gt' turns on a SECOND, independent logging sequence at every memory-accessing
   // instruction of a displaced window, writing {effective address, original ip} into the
   // process's own ring at `gt_cur'.  It contains no branch and no ptwrite, so it adds
-  // nothing at all to the Intel PT stream (gt_same_process.md section 3).
+  // nothing at all to the Intel PT stream.
   int gt;
   uint64_t *gt_cur;           // the ring cursor cell; bumped with `lock xadd' (thread safe)
   PtjGtEnt *gtents; uint32_t ngtents, maxgtents;
@@ -185,6 +231,19 @@ static inline void ptj_note_unpatched_s(PtjPatchCtx *cx, const PtjSite *s) {
   ptj_note_unpatched(cx, s->off);
 }
 
+// dropdump: every site the INSTALL pass gave up on, with its reason.
+struct PtjDropRec { uint64_t addr; uint32_t kf; uint8_t reason, kind, when, nregs; };
+static PtjDropRec *g_ptj_dd = nullptr;
+static uint32_t g_ptj_dd_n = 0, g_ptj_dd_max = 0;
+static int g_ptj_dd_active = 0;           // set by the agent around the install pass only
+static inline void ptj_drop_s(PtjPatchCtx *cx, int r, const PtjSite *s, uint64_t lo) {
+  cx->drops[r]++;
+  ptj_note_unpatched_s(cx, s);
+  if (g_ptj_dd_active && g_ptj_dd && g_ptj_dd_n < g_ptj_dd_max && s->kind != PTJ_KIND_GT) {
+    PtjDropRec *q = &g_ptj_dd[g_ptj_dd_n++];
+    q->addr = lo + s->off; q->kf = s->kf; q->reason = (uint8_t)r; q->kind = s->kind; q->when = s->when; q->nregs = s->nregs;
+  }
+}
 static inline int ptj_fits32(int64_t v) { return v >= -2147483648LL && v <= 2147483647LL; }
 
 // ---------------------------------------------------- displaceability -------
@@ -194,6 +253,108 @@ static inline int ptj_fits32(int64_t v) { return v >= -2147483648LL && v <= 2147
 // >=32-bit immediate is -- which is why `masked_hash` already masks displacements too.
 // Off by default (0) so V8, where nothing rewrites a displacement, is unaffected.
 static int g_ptj_no_disp32 = 0;
+// HotSpot's static-call stubs (`CompiledStaticCall::emit_to_interp_stub`,
+// C1 and C2) are `movabs rbx, <Method*>; jmp <self>` in the nmethod's stub section, and the VM
+// REWRITES BOTH when the call resolves (NativeMovConstReg::set_data + NativeJump::
+// set_jump_destination) and again when it is cleaned.  The movabs is already refused (imm64);
+// the jmp was not, so a window could displace the `jmp .' placeholder into a trampoline: the
+// relocated copy keeps jumping to the stub, which now holds our detour -> an endless loop in
+// the trampoline when the object is patched before the call resolves.  Refuse the jmp too, and
+// any `jmp rel32' to itself (the unresolved-placeholder form).  HotSpot only.
+static int g_ptj_hs_callstub = 0;
+static uint64_t g_ptj_callstub_refused = 0;
+// C1 PatchingStub sites.  An unresolved klass/field/mirror access in C1
+// code is emitted as the real instruction, then its first 5 bytes are overwritten with
+// `jmp <stub>' (NativeGeneralJump::insert_unconditional); the stub holds a COPY of the original
+// `bytes_to_copy' bytes, then the 5-byte patch record `b8 00 <being_init_off> <bytes_to_skip>
+// <bytes_to_copy>', then (at the jmp target) `call Runtime1::*_patching'.  When the access
+// resolves, Runtime1::patch_code rewrites the stub copy and copies it back over the site.  So
+// both [site, site+n) and the stub's [copy, record end) are VM-rewritten bytes: nothing may be
+// displaced there, and the site's tail (the old instruction's leftover bytes) is not code --
+// decoding through it loses alignment and a window can end mid-instruction.
+// Calls `fn(site, n, stub_copy_start, record_end)' for every site matching the record exactly.
+static uint64_t g_ptj_c1_beinginit = 0;   // Sites found in the being-initialized form
+template <class F>
+static inline int ptj_hs_c1_patchsites(const uint8_t *code, size_t len, F fn) {
+  int found = 0;
+  for (size_t s = 0; s + 5 <= len; s++) {
+    if (code[s] != 0xe9) continue;
+    int32_t rel; memcpy(&rel, code + s + 1, 4);
+    int64_t t = (int64_t)s + 5 + rel;
+    if (t < 10 || t >= (int64_t)len || t <= (int64_t)s) continue;
+    const uint8_t *r = code + t - 5;
+    uint32_t n = r[4], skip = r[3], bie = r[2];
+    // `bytes_to_skip' is NOT 5 in general.  PatchingStub::emit_code lays
+    // the stub out as  [copy: n bytes][load_mirror only: being-initialized check, ~100 bytes on
+    // x86_64 (get_thread calls Thread::current)][record: 5][entry = jmp target], with
+    // skip = check + 5 and being_initialized_entry_offset = skip + n.  A small size bound on
+    // `skip' would miss every load_mirror site, so both the site's `jmp' and the RECORD
+    // (`b8 00 74 6a 0a' decodes as `mov eax, imm32', which immrule admits) could get windows and
+    // HotSpot's patch_code would read our jmp as the record.  The `bie' identity is the tight
+    // check instead of a size bound.
+    if (r[0] != 0xb8 || r[1] != 0x00 || n < 5 || n > 16 || skip < 5 || bie != skip + n) {
+      // The BEING-INITIALIZED form.  For a getstatic/putstatic
+      // whose holder class is still in <clinit>, Runtime1::patch_code does NOT copy the patch into
+      // place (do_patch = false); it re-points the site's jmp at being_initialized_entry = the
+      // stub's COPY start (c0), so the initializing thread runs the patched copy and every other
+      // thread re-enters the VM.  The record is intact but sits at c0 + bie - 5, not at t - 5, so
+      // the check above misses the site, and a window over the site/copy/check/record would make
+      // patch_code copy garbage when <clinit> finishes.  Search the record from the jmp target: bie is its own third byte.
+      int64_t hit = -1;
+      for (uint32_t b = 10; b <= 255 && t + (int64_t)b <= (int64_t)len; b++) {
+        const uint8_t *q = code + t + b - 5;
+        if (q[0] == 0xb8 && q[1] == 0x00 && q[2] == b && q[4] >= 5 && q[4] <= 16 && q[3] >= 5 &&
+            (uint32_t)q[3] + q[4] == b) { hit = b; break; }
+      }
+      if (hit < 0) continue;
+      n = code[t + hit - 1];
+      if ((int64_t)s + n > t) continue;                   // site must precede the stub copy
+      fn((uint32_t)s, n, (uint32_t)t, (uint32_t)(t + hit));
+      g_ptj_c1_beinginit++;
+      found++;
+      continue;
+    }
+    int64_t c0 = t - (int64_t)skip - (int64_t)n;         // start of the stub's copy
+    if (c0 < 0 || (int64_t)s + n > c0) continue;          // site must precede the stub copy
+    fn((uint32_t)s, n, (uint32_t)c0, (uint32_t)t);
+    found++;
+  }
+  return found;
+}
+static uint64_t g_ptj_c1_patchsites = 0;
+
+// HotSpot immediate rule.  An embedded >=32-bit immediate is refused only when HotSpot can
+// REWRITE it after installation: `movabs r64, imm64' (oops, and inline-cache data 0 -> Method*/Klass*)
+// and `mov dword [r+d], imm32' whose value is a NARROW OOP into the Java heap.  So: imm64 is refused when it is 0, -1 or pointer-like (a canonical user address), except
+// the compressed klass/oop BASE constants; imm32 is refused when it decodes to a Java-heap address.
+// The heap range and bases come from the VM's own vmStructs (the front end fills them); with
+// g_ptj_immrule == 0 or no heap range, every >=32-bit immediate is refused.
+static int g_ptj_immrule = 0;
+static uint64_t g_ptj_heap_lo = 0, g_ptj_heap_hi = 0, g_ptj_obase = 0, g_ptj_kbase = 0;
+static int g_ptj_oshift = 0;
+static uint64_t g_ptj_imm_ok32 = 0, g_ptj_imm_ok64 = 0, g_ptj_imm_ref32 = 0, g_ptj_imm_ref64 = 0;
+static inline int ptj_imm_rewritable(const ZydisDecodedInstruction *ins) {
+  if (!g_ptj_immrule || g_ptj_heap_hi <= g_ptj_heap_lo) return 1;
+  for (int q = 0; q < 2; q++) {
+    const auto *im = &ins->raw.imm[q];
+    if (im->size < 32) continue;
+    if (im->size >= 64) {
+      uint64_t v = im->value.u;
+      if (v == 0 || v == ~0ull) { g_ptj_imm_ref64++; return 1; }
+      if (v >= 0x1000 && v < 0x800000000000ull && !(v == g_ptj_kbase && v) && !(v == g_ptj_obase && v)) {
+        g_ptj_imm_ref64++; return 1; }
+      g_ptj_imm_ok64++;
+    } else {
+      uint64_t u = (uint64_t)(uint32_t)im->value.u;
+      uint64_t a = g_ptj_obase + (u << g_ptj_oshift);
+      uint64_t sx = (uint64_t)(int64_t)(int32_t)(uint32_t)u;          // sign-extended use
+      if ((a >= g_ptj_heap_lo && a < g_ptj_heap_hi) || (sx >= g_ptj_heap_lo && sx < g_ptj_heap_hi) ||
+          (u >= g_ptj_heap_lo && u < g_ptj_heap_hi)) { g_ptj_imm_ref32++; return 1; }
+      g_ptj_imm_ok32++;
+    }
+  }
+  return 0;
+}
 
 // Returns 0 if the instruction may be copied into a trampoline, else a PTJ_DROP_* code
 // (the "site" variants; the caller maps them to the "window" variants when it is not the
@@ -206,7 +367,8 @@ static int ptj_insn_unsafe(const ZydisDecodedInstruction *ins, const ZydisDecode
   // A >=32-bit immediate may be a V8 RelocInfo field (FULL/COMPRESSED_EMBEDDED_OBJECT,
   // EXTERNAL_REFERENCE).  Branch displacements are not immediates in that sense.
   int is_br = (cat == ZYDIS_CATEGORY_COND_BR || cat == ZYDIS_CATEGORY_UNCOND_BR);
-  if (!is_br && (ins->raw.imm[0].size >= 32 || ins->raw.imm[1].size >= 32)) return PTJ_DROP_IMM32;
+  if (!is_br && (ins->raw.imm[0].size >= 32 || ins->raw.imm[1].size >= 32) && ptj_imm_rewritable(ins))
+    return PTJ_DROP_IMM32;
   // a rewritable field offset: mod != 0 or rm != 5 excludes the RIP-relative form, which is
   // not a patch site and which ptj_reloc_insn already relocates correctly
   if (g_ptj_no_disp32 && !is_br && ins->raw.disp.size >= 32 &&
@@ -230,6 +392,30 @@ static int ptj_insn_unsafe(const ZydisDecodedInstruction *ins, const ZydisDecode
 
 // ------------------------------------------------------------- encoders -----
 struct PtjEmit { uint8_t *p; int since_ptw; int any_ptw; int space; };
+
+// ptj_insn_unsafe from raw fields only.  It reads operands for one thing -- a branch's
+// relative target, ops[0] -- which is raw.imm[0] (PTJIT_DECCHECK=1 compares the two).
+static int ptj_insn_unsafe_raw(const ZydisDecodedInstruction *ins, uint64_t lo, uint64_t hi, uint64_t at) {
+  ZydisInstructionCategory cat = ins->meta.category;
+  if (cat == ZYDIS_CATEGORY_CALL) return PTJ_DROP_CALL;
+  if (cat == ZYDIS_CATEGORY_INTERRUPT) return PTJ_DROP_CALL;
+  int is_br = (cat == ZYDIS_CATEGORY_COND_BR || cat == ZYDIS_CATEGORY_UNCOND_BR);
+  if (!is_br && (ins->raw.imm[0].size >= 32 || ins->raw.imm[1].size >= 32) && ptj_imm_rewritable(ins))
+    return PTJ_DROP_IMM32;
+  if (g_ptj_no_disp32 && !is_br && ins->raw.disp.size >= 32 &&
+      !(ins->raw.modrm.mod == 0 && ins->raw.modrm.rm == 5)) return PTJ_DROP_IMM32;
+  if (is_br && ins->raw.imm[0].size && ins->raw.imm[0].is_relative) {
+    switch (ins->mnemonic) {
+      case ZYDIS_MNEMONIC_JRCXZ: case ZYDIS_MNEMONIC_JECXZ:
+      case ZYDIS_MNEMONIC_LOOP: case ZYDIS_MNEMONIC_LOOPE: case ZYDIS_MNEMONIC_LOOPNE:
+        return PTJ_DROP_NARROW_BRANCH;
+      default: break;
+    }
+    uint64_t t = at + ins->length + (uint64_t)ins->raw.imm[0].value.s;
+    if (t < lo || t >= hi) return PTJ_DROP_EXTERN_BRANCH;
+  }
+  return 0;
+}
 
 static inline void ptj_space(PtjEmit *e) {
   if (!e->any_ptw) return;
@@ -288,7 +474,7 @@ static void ptj_emit_counter(PtjEmit *e, uint64_t *slot) {
 
 
 // ================================================================ BUFFER SINK ===========
-// the design notes  The value is STORED into the thread's ring through the
+// The value is STORED into the thread's ring through the
 // cursor at %gs:0 -- the %gs layout, the cv file and the sync markers are those of
 // runtime/rt/ptlogrt.c and runtime/e9plugin/ptlog.cpp (emitBufRun / emitSyncFast), so
 // `ptrecon' consumes a JIT buffer-sink run with no change at all.  A site logging n values:
@@ -305,8 +491,8 @@ static void ptj_emit_counter(PtjEmit *e, uint64_t *slot) {
 //      jg    1f                      ;                              |
 //      mov   %gs:8,%A                ; <= 0: how far it overshot    |  the marker, 1-in-`sync'
 //      sub   $SYNC,%A                ; A = COUNT - SYNC = -(values since the last marker)
-//      sub   %A,%gs:16               ; TOTAL += values since the last marker  => EXACT (D-M4-16)
-//      movq  $SYNC,%gs:8             ; ABSOLUTE re-arm (D-M4-16)
+//      sub   %A,%gs:16               ; TOTAL += values since the last marker  => EXACT
+//      movq  $SYNC,%gs:8             ; ABSOLUTE re-arm
 //      ptwrite %gs:16                ; the marker payload = values this thread has written
 //   1: [ popfq ] [ pop %B ] pop %A ; lea 0x80(%rsp),%rsp
 //
@@ -322,7 +508,7 @@ static void ptj_emit_counter(PtjEmit *e, uint64_t *slot) {
 // mod 0/1 and no index, which is all this emitter produces.  With %gs == 0 the first
 // `mov %gs:0,%A' of a thread faults at address 0 and the same handler gives the thread its
 // own region (the lazy-%gs path); the front ends keep every thread at %gs == 0 until then, so
-// no thread ever inherits its creator's ring .
+// no thread ever inherits its creator's ring.
 static inline void ptj_lea_rsp(PtjEmit *e, int32_t d) {
   uint8_t *p = e->p;
   *p++ = 0x48; *p++ = 0x8d; *p++ = 0xa4; *p++ = 0x24; memcpy(p, &d, 4); p += 4;
@@ -445,6 +631,24 @@ static int ptj_buf_pick(const PtjSite *st, int *A, int *B) {
   return 1;
 }
 
+// A `memop' site on a WIDE operand (16/32/64-byte xmm/ymm/zmm load).
+// What Stage 3 can consume: exactly ONE 64-bit value per map entry, applied at the ORIGINAL
+// instruction's effective address; an entry carries no byte offset, so a second 8-byte slice
+// (HiFi's jitplan.h/hifitool.cpp `off' items) would be filed at the same address and corrupt
+// slice 0.  So Fast logs the first 8 bytes with an 8-byte load and writes the map entry with
+// size 8: bytes 8..N-1 of the operand stay UNKNOWN in the shadow memory, never wrong.  One value
+// per site, as for every other memop site, so sites-per-value and buffer cursor arithmetic are
+// unchanged.  Logging the remaining slices needs an `off' field in the site map + recon first.
+static inline int ptj_memop_log_size(const PtjSite *st) {
+  int size = st->size ? st->size : 8;
+  return size > 8 ? 8 : size;
+}
+static inline void ptj_memop_fix_entry(PtjPatchCtx *cx, const PtjSite *st, uint32_t first) {
+  if (st->size <= 8) return;
+  for (uint32_t q = first; q < cx->nentries; q++) cx->entries[q].size = 8;
+  cx->wide_memop_sites++;
+}
+
 // Forward declarations: the buffer emitter is defined here, beside the %gs encoders it
 // uses, but `ptj_emit_memop' (the memory-operand re-encoder) and `ptj_add_entry' (the
 // site-map row) live further down beside the PTWRITE emitter.
@@ -489,7 +693,7 @@ static int ptj_emit_site_buffer(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
   const int rsp_delta = 0x80 + 8 * (1 + need_b + pushf);
   if (st->kind == PTJ_KIND_MEMOP) {
     // The value FIRST, while every register the operand names still holds its value.
-    int size = st->size ? st->size : 8;
+    int size = ptj_memop_log_size(st);           // a wide operand logs its first 8 bytes
     static const uint8_t OPC_MOV[1] = {0x8b};
     static const uint8_t OPC_MZX[2][2] = {{0x0f, 0xb6}, {0x0f, 0xb7}};
     int ok;
@@ -503,6 +707,7 @@ static int ptj_emit_site_buffer(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
   if (st->kind == PTJ_KIND_MEMOP) {
     uint8_t *at = ptj_store_to_base(e, B, A, 0);
     ptj_add_entry(cx, at, orig_addr, st, 255, 0, 64); cx->entries[cx->nentries - 1].buffer = 1; k++;
+    if (cx->nentries == save_entries + 1u) ptj_memop_fix_entry(cx, st, save_entries);
   } else {
     for (int i = 0; i < st->nregs; i++) {
       int r = st->regs[i];
@@ -533,8 +738,33 @@ static int ptj_emit_site_buffer(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
     ptj_mov_from_gs(e, A, PTJ_GS_COUNT);
     ptj_sub_imm_reg(e, sync, A);
     ptj_sub_reg_gs(e, A, PTJ_GS_TOTAL);
-    ptj_mov_imm_gs(e, sync, PTJ_GS_COUNT);
-    uint8_t *mk = ptj_ptw_gs(e, PTJ_GS_TOTAL);
+    uint8_t *mk;
+    if (cx->sync_tnt) {
+      // TNT carrier (ptlog.cpp emitTntCount): %A (saved above, dead here) = TOTAL, then
+      //   top: shr $1,%A ; jc 1f ; nop ; 1: jnz top      -- LSB first, >= 1 iteration
+      // EFLAGS are dead or pushfq'd whenever sync > 0.  The ABSOLUTE re-arm moves AFTER the loop
+      // so that the marker's END (the `sync_markers' row) runs only on the marker path.
+      uint8_t *s0 = jg + 6;                             // the marker's first instruction
+      ptj_mov_from_gs(e, A, PTJ_GS_TOTAL);
+      uint8_t *top = e->p;
+      *e->p++ = (uint8_t)(0x48 | (A >> 3)); *e->p++ = 0xd1; *e->p++ = (uint8_t)(0xe8 | (A & 7));
+      uint8_t *jc = e->p; *e->p++ = 0x72; *e->p++ = 0x01;
+      uint8_t *nop = e->p; *e->p++ = 0x90;
+      *e->p++ = 0x75; *e->p = (uint8_t)(int8_t)(top - (e->p + 1)); e->p++;
+      mk = e->p;
+      ptj_mov_imm_gs(e, sync, PTJ_GS_COUNT);            // END
+      uint8_t *ra[3] = {s0, jc, nop}; const char ro[3] = {'s', 'b', 'z'};
+      if (cx->tnts && cx->ntnts + 3 <= cx->maxtnts)
+        for (int t = 0; t < 3; t++) {
+          cx->tnts[cx->ntnts].tramp_addr = (uint64_t)(uintptr_t)ra[t];
+          cx->tnts[cx->ntnts].orig_addr = orig_addr;
+          cx->tnts[cx->ntnts].role = ro[t];
+          cx->ntnts++;
+        }
+    } else {
+      ptj_mov_imm_gs(e, sync, PTJ_GS_COUNT);
+      mk = ptj_ptw_gs(e, PTJ_GS_TOTAL);
+    }
     (void)jg;
     { int32_t rel = (int32_t)(int64_t)(e->p - (hole + 4)); memcpy(hole, &rel, 4); }
     if (cx->syncs && cx->nsyncs < cx->maxsyncs) {
@@ -559,7 +789,14 @@ static int ptj_emit_site_buffer(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
 // share one.  Cells start at 1, so a site's FIRST execution is a keyframe: an nmethod or a
 // tiered-up JS function is patched while it is ALREADY RUNNING, and must re-anchor at once.
 #define PTJ_KFCTR_STRIDE 8
+#define PTJ_KF_GS_DATA 4096   /* runtime/rt/ptlogrt.c PTLOG_COUNT_DATA (ABI) */
 static uint64_t *ptj_kf_alloc(PtjPatchCtx *cx) {
+  if (cx->kf_gs_n) {          // per-thread cell: the "pointer" is the %gs offset of the cell
+    if (cx->kfctr_used >= cx->kf_gs_n) return nullptr;
+    uint64_t off = PTJ_KF_GS_DATA + 8ULL * (cx->kf_gs_base + cx->kfctr_used);
+    cx->kfctr_used++;
+    return (uint64_t *)(uintptr_t)off;
+  }
   if (!cx->kfctr || cx->kfctr_used >= cx->kfctr_max) return nullptr;
   uint64_t *c = cx->kfctr + (size_t)cx->kfctr_used * PTJ_KFCTR_STRIDE;
   cx->kfctr_used++;
@@ -570,7 +807,7 @@ static uint64_t *ptj_kf_alloc(PtjPatchCtx *cx) {
 // `dec CNT(%rip); jg join; mov $K,CNT(%rip)' -- the guard, 24 bytes.  The caller emits the
 // site's logging instructions after it and calls ptj_kf_close() to fill the branch's rel32.
 //
-// WHY `jg' WHERE THE ELF EMITTER USES `jnz' the design notes section 1.3):
+// WHY `jg' WHERE THE ELF EMITTER USES `jnz':
 //  * a zero-filled cell is then SAFE: `dec 0' gives -1, which is <= 0, so the guard fires
 //    and re-arms.  With `jnz' a cell that ever reached -1 would not log again for 2^64
 //    executions, which is why the ELF emitter has to initialise its counters to 1.
@@ -581,8 +818,22 @@ static uint64_t *ptj_kf_alloc(PtjPatchCtx *cx) {
 // Neither choice is visible to Stage 3: `offline/recon.cpp' does not replay the arithmetic,
 // it reads the branch DECISION out of the PT stream (`kf_branch' then `ip != kf_join'), so a
 // racy counter can change the keyframe RATE but can never change the reconstruction.
-static int ptj_kf_open(PtjEmit *e, uint64_t *ctr, uint32_t k, uint8_t **branch, uint8_t **hole) {
+static int ptj_kf_open(PtjEmit *e, uint64_t *ctr, uint32_t k, uint8_t **branch, uint8_t **hole, int gs = 0) {
   uint8_t *p = e->p;
+  if (gs) {                   // `dec %gs:D; jg join; mov $K,%gs:D' -- 27 bytes, thread-private
+    uint64_t d = (uint64_t)(uintptr_t)ctr;
+    if (d > 0x7fffffffULL) return 0;
+    *p++ = 0x65; *p++ = 0x48; *p++ = 0xff; *p++ = 0x0c; *p++ = 0x25;   // dec qword ptr gs:[disp32]
+    { int32_t d32 = (int32_t)d; memcpy(p, &d32, 4); p += 4; }
+    *branch = p;
+    *p++ = 0x0f; *p++ = 0x8f;                                           // jg rel32
+    *hole = p; p += 4;
+    *p++ = 0x65; *p++ = 0x48; *p++ = 0xc7; *p++ = 0x04; *p++ = 0x25;   // mov qword ptr gs:[disp32],imm32
+    { int32_t d32 = (int32_t)d; memcpy(p, &d32, 4); p += 4;
+      uint32_t kk = k ? k : 1; memcpy(p, &kk, 4); p += 4; }
+    e->p = p; e->since_ptw += 3;
+    return 1;
+  }
   *p++ = 0x48; *p++ = 0xff; *p++ = 0x0d;                  // dec qword ptr [rip+d]
   { uint8_t *dp = p; p += 4;
     int64_t rel = (int64_t)(uintptr_t)ctr - (int64_t)(uintptr_t)p;
@@ -592,8 +843,8 @@ static int ptj_kf_open(PtjEmit *e, uint64_t *ctr, uint32_t k, uint8_t **branch, 
   *p++ = 0x0f; *p++ = 0x8f;                               // jg rel32
   *hole = p; p += 4;
   // mov qword ptr [rip+d],imm32.  The RIP-relative field is measured from the END of the
-  // instruction, i.e. from past the imm32 -- the same subtlety keyframe_impl.md section 1.3
-  // records for E9Patch's ENTRY_REL32.
+  // instruction, i.e. from past the imm32 -- the same subtlety as
+  // E9Patch's ENTRY_REL32.
   *p++ = 0x48; *p++ = 0xc7; *p++ = 0x05;
   { uint8_t *dp = p; p += 4; uint8_t *imm = p; p += 4;
     int64_t rel = (int64_t)(uintptr_t)ctr - (int64_t)(uintptr_t)p;
@@ -611,7 +862,7 @@ static inline void ptj_kf_close(PtjEmit *e, uint8_t *hole) {
 // --------------------------------------------------- same-run ground truth --
 // Is this instruction one the gt oracle can record with EXACTLY ONE {address, ip} record?
 // That is the requirement for walking the reconstruction and the ground truth in lockstep
-// the design notes section 5).  Returns the index of its single explicit
+// Returns the index of its single explicit
 // memory operand, or -1 to refuse.
 static int ptj_gt_operand(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops) {
   if (ins->attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE | ZYDIS_ATTRIB_HAS_REPNE))
@@ -652,7 +903,7 @@ static int ptj_gt_operand(const ZydisDecodedInstruction *ins, const ZydisDecoded
 // the two extra instructions and the lock cost nothing that is being measured.
 //
 // It contains NO branch and NO ptwrite, so a gt build's Intel PT stream is byte for byte
-// the stream of the build it measures (gt_same_process.md section 3), which is what makes
+// the stream of the build it measures, which is what makes
 // the comparison an oracle for the ordinary build rather than for itself.
 static int ptj_emit_memop(PtjEmit *e, const ZydisDecodedInstruction *ins, const uint8_t *raw,
                           uint64_t orig_addr, const uint8_t *opc, int opclen, int regfield,
@@ -680,7 +931,7 @@ static int ptj_emit_gt(PtjEmit *e, const ZydisDecodedInstruction *ins, const uin
     if (!ptj_fits32(rel)) { e->p = save; return 0; }
     *(int32_t *)dp = (int32_t)rel; }
   *p++ = 0x48; *p++ = 0x89; *p++ = 0x01;                  // mov %rax,(%rcx)
-  // The record's second word is the LOCKSTEP KEY (D-J9), not the original ip: the caller
+  // The record's second word is the LOCKSTEP KEY, not the original ip: the caller
   // back-patches this immediate with the address of the relocated copy it emits next, which
   // is unique for the life of the process.  Written as `orig_addr' first so that a caller
   // that does not back-patch (and check_sitemap.py's decoder) still sees a valid sequence.
@@ -874,6 +1125,9 @@ struct PtjDec {
   uint8_t *fbd;          // 1 at every byte offset the VM says can be entered indirectly
   uint32_t *stk; uint32_t nstk;
   uint32_t data_from;    // first byte of the object's inline data (jump table / constants)
+  // Lazy operands: ops[i] is valid only when opsok[i] == 1 (2 = operand decode failed);
+  // ctxk[i] indexes the instruction's decoder context in g_ptjsweep.  Read through ptj_ops().
+  uint8_t *opsok; uint32_t *ctxk; ZydisDecoder *dec;
 };
 static PtjDec g_ptjdec;
 
@@ -892,10 +1146,51 @@ static int ptj_dec_reserve(PtjDec *d, uint32_t n) {
   if (!a) return 0;
   d->ops = (ZydisDecodedOperand (*)[ZYDIS_MAX_OPERAND_COUNT])a;
   a = realloc(d->tgt, c * 4); if (!a) return 0; d->tgt = (uint32_t *)a;
+  a = realloc(d->opsok, c); if (!a) return 0; d->opsok = (uint8_t *)a;
+  a = realloc(d->ctxk, c * 4); if (!a) return 0; d->ctxk = (uint32_t *)a;
   d->cap = c; d->tcap = c;
   return 1;
 }
 
+// A forward `lea reg,[rip+d]' is NOT always a table address.
+// V8's CallCFunction (and any "record my own return pc" sequence) emits
+//     lea r10,[rip+0xa] ; mov [r13+0x78],r10 ; mov [r13+0x70],rbp ; call rax
+// i.e. the lea names the RETURN ADDRESS of a call a few bytes later.  Taking that as the start of
+// inline data truncates the decode: the deferred blocks after it are never decoded, so their
+// `jmp' back into the main line is an unknown branch target, and a slid window (PTJIT_SLIDE)
+// could displace one of those targets, which the deferred code then enters in the middle of
+// our `jmp rel32'.
+// Rule: a lea target t is a return address -- not data -- when the linear sweep reaches t exactly
+// as the end of a CALL, within PTJ_DF_RA_MAX bytes of the lea, with no JMP in between (a table
+// dispatch is `lea ; jmp [reg+idx*8]', so it always stays data).  Anything else stays data, so the
+// rule can only RAISE data_from where the bytes prove the target is a call's return point.
+// PTJIT_DF_RETADDR=0 disables the rule (every forward lea target is data).
+#define PTJ_DF_RA_MAX 128
+struct PtjDfScan { uint32_t data_from; int np; uint32_t t[8]; uint8_t jmp[8]; };
+static int g_ptj_df_retaddr = -1;
+static inline void ptj_df_init(PtjDfScan *s, size_t len) {
+  if (g_ptj_df_retaddr < 0) { const char *e = getenv("PTJIT_DF_RETADDR"); g_ptj_df_retaddr = e ? atoi(e) != 0 : 1; }
+  s->data_from = (uint32_t)len; s->np = 0;
+}
+static inline void ptj_df_data(PtjDfScan *s, uint32_t t) { if (t < s->data_from) s->data_from = t; }
+static inline void ptj_df_flush(PtjDfScan *s) { for (int q = 0; q < s->np; q++) ptj_df_data(s, s->t[q]); s->np = 0; }
+// one decoded instruction at `o' (length `l'); `lea_t' = its forward in-object lea target or 0
+static inline void ptj_df_insn(PtjDfScan *s, size_t o, uint32_t l, ZydisMnemonic m, int64_t lea_t) {
+  uint64_t e = o + l;
+  for (int q = 0; q < s->np; ) {
+    if (e >= s->t[q]) {
+      if (!(e == s->t[q] && m == ZYDIS_MNEMONIC_CALL && !s->jmp[q])) ptj_df_data(s, s->t[q]);
+      s->t[q] = s->t[s->np - 1]; s->jmp[q] = s->jmp[s->np - 1]; s->np--; continue;
+    }
+    if (m == ZYDIS_MNEMONIC_JMP) s->jmp[q] = 1;
+    q++;
+  }
+  if (lea_t > 0) {
+    if (!g_ptj_df_retaddr || (uint64_t)lea_t <= e || (uint64_t)lea_t - o > PTJ_DF_RA_MAX || s->np == 8)
+      ptj_df_data(s, (uint32_t)lea_t);
+    else { s->t[s->np] = (uint32_t)lea_t; s->jmp[s->np] = 0; s->np++; }
+  }
+}
 // Pass 0 of the sweep, as a standalone function: find the object's inline data.  A
 // `lea reg,[rip+d]` whose target is inside the same code object addresses a table (V8
 // emits `lea r10,[rip+X]; jmp [r10+r8*8]` for a switch and for irregexp dispatch, with
@@ -903,26 +1198,114 @@ static int ptj_dec_reserve(PtjDec *d, uint32_t n) {
 // data: it must not be decoded and must not be displaced.  A linear sweep is used
 // deliberately -- a bogus decode can only LOWER the answer, never raise it.
 //
-// It is separate from ptj_decode_object because the ANALYZER needs the same number
-// (defect D-J6): `"data_from"` clips the analyzer's restart fill, so that the fill never
+// It is separate from ptj_decode_object because the ANALYZER needs the same number:
+// `"data_from"` clips the analyzer's restart fill, so that the fill never
 // walks into a jump table the patcher would refuse to touch anyway.  Both sides must
 // therefore compute it from the same bytes -- the front end passes the SNAPSHOT it hashes.
 static uint32_t ptj_scan_data_from(ZydisDecoder *dec, const uint8_t *code, size_t len) {
-  uint32_t data_from = (uint32_t)len;
+  PtjDfScan df; ptj_df_init(&df, len);
   for (size_t o = 0; o + 1 < len; ) {
     ZydisDecodedInstruction pi;
     ZydisDecodedOperand po[ZYDIS_MAX_OPERAND_COUNT];
     if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(dec, code + o, len - o, &pi, po,
-                                             ZYDIS_MAX_OPERAND_COUNT, 0))) { o++; continue; }
+                                             ZYDIS_MAX_OPERAND_COUNT, 0))) { ptj_df_flush(&df); o++; continue; }
+    int64_t lt = 0;
     if (pi.mnemonic == ZYDIS_MNEMONIC_LEA && pi.raw.modrm.mod == 0 && pi.raw.modrm.rm == 5 &&
         pi.raw.disp.size == 32) {
       int64_t t = (int64_t)o + pi.length + (int64_t)pi.raw.disp.value;
-      if (t > (int64_t)o && t < (int64_t)len && (uint32_t)t < data_from) data_from = (uint32_t)t;
+      if (t > (int64_t)o && t < (int64_t)len) lt = t;
     }
+    ptj_df_insn(&df, o, pi.length, pi.mnemonic, lt);
     o += pi.length;
   }
+  ptj_df_flush(&df);
+  return df.data_from;
+}
+
+// ---- decode once ------------------------------------------
+// Without it the Node front end decodes every new code object FIVE times on the JS thread, always
+// with operands: ptj_scan_data_from + masked_hash for the cache key, then ptj_decode_object's
+// own ptj_scan_data_from, its recursive descent and its address-order pass.  The key, the
+// inline-data boundary and the descent only need raw fields (length, mnemonic, category, the
+// raw imm/disp/modrm), which ZydisDecoderDecodeInstruction produces without the operand pass.
+// PtjSweep keeps each decoded instruction with its decoder context, indexed by byte offset,
+// so the descent reuses the key's linear sweep and the address-order pass only has to run
+// ZydisDecoderDecodeOperands.  Valid only for the (code, len) it was filled for, within one
+// handler invocation (the owner clears `valid').
+struct PtjSweep {
+  const uint8_t *code; size_t len; int valid;
+  uint32_t *slot; size_t scap;          // per byte offset: 0 = none, else index + 1
+  ZydisDecodedInstruction *ins; ZydisDecoderContext *ctx; uint32_t n, cap;
+};
+static PtjSweep g_ptjsweep;
+static int ptj_sweep_begin(PtjSweep *s, const uint8_t *code, size_t len) {
+  s->valid = 0; s->n = 0;
+  if (len + 1 > s->scap) {
+    void *a = realloc(s->slot, (len + 1) * 2 * 4); if (!a) return 0;
+    s->slot = (uint32_t *)a; s->scap = (len + 1) * 2;
+  }
+  memset(s->slot, 0, (len + 1) * 4);
+  s->code = code; s->len = len; s->valid = 1;
+  return 1;
+}
+// Decode (no operands) at `o' with `lim' bytes available, through the sweep: reuse a stored
+// decode when its instruction ends within `lim' (a decode never reads past its own end, so
+// the stored result is the one a `lim'-byte buffer gives), otherwise decode and store.
+static inline const ZydisDecodedInstruction *ptj_sweep_at(PtjSweep *s, ZydisDecoder *dec,
+                                                          const uint8_t *code, size_t o, size_t lim) {
+  uint32_t k = s->slot[o];
+  if (k && o + s->ins[k - 1].length <= lim) return &s->ins[k - 1];
+  if (s->n == s->cap) {
+    uint32_t c = s->cap ? s->cap * 2 : 4096;
+    void *a = realloc(s->ins, (size_t)c * sizeof(ZydisDecodedInstruction)); if (!a) return nullptr;
+    s->ins = (ZydisDecodedInstruction *)a;
+    a = realloc(s->ctx, (size_t)c * sizeof(ZydisDecoderContext)); if (!a) return nullptr;
+    s->ctx = (ZydisDecoderContext *)a; s->cap = c;
+  }
+  if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(dec, &s->ctx[s->n], code + o, lim - o, &s->ins[s->n])))
+    return nullptr;
+  if (!k) s->slot[o] = s->n + 1;         // keep the full-length decode if one exists
+  return &s->ins[s->n++];
+}
+// The key's two linear sweeps fused into one, no operands: returns ptj_scan_data_from()
+// and, when `mask' != NULL, zeroes every >= 32-bit imm/disp in `mask' exactly as
+// masked_hash() does (masked_hash stops at its first undecodable byte, the scan resyncs one
+// byte on; both trajectories are followed).  Stores every decode in `sw' when non-NULL.
+static uint32_t ptj_scan_fused(ZydisDecoder *dec, const uint8_t *code, size_t len, uint8_t *mask,
+                               PtjSweep *sw) {
+  PtjDfScan df; ptj_df_init(&df, len);
+  int hashing = mask != nullptr;
+  for (size_t o = 0;;) {
+    int scan_on = o + 1 < len, hash_on = hashing && o < len;
+    if (!scan_on && !hash_on) break;
+    ZydisDecodedInstruction lin; const ZydisDecodedInstruction *pi = &lin;
+    int ok;
+    if (sw) ok = (pi = ptj_sweep_at(sw, dec, code, o, len)) != nullptr;
+    else ok = ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(dec, nullptr, code + o, len - o, &lin));
+    if (!ok) { hashing = 0; if (!scan_on) break; ptj_df_flush(&df); o++; continue; }
+    if (hash_on) {
+      for (int k = 0; k < 2; k++)
+        if (pi->raw.imm[k].size >= 32) memset(mask + o + pi->raw.imm[k].offset, 0, pi->raw.imm[k].size / 8);
+      if (pi->raw.disp.size >= 32) memset(mask + o + pi->raw.disp.offset, 0, pi->raw.disp.size / 8);
+    }
+    if (scan_on) {
+      int64_t lt = 0;
+      if (pi->mnemonic == ZYDIS_MNEMONIC_LEA && pi->raw.modrm.mod == 0 && pi->raw.modrm.rm == 5 &&
+          pi->raw.disp.size == 32) {
+        int64_t t = (int64_t)o + pi->length + (int64_t)pi->raw.disp.value;
+        if (t > (int64_t)o && t < (int64_t)len) lt = t;
+      }
+      ptj_df_insn(&df, o, pi->length, pi->mnemonic, lt);
+    }
+    o += pi->length;
+  }
+  ptj_df_flush(&df);
+  uint32_t data_from = df.data_from;
   return data_from;
 }
+// PTJIT_DECCHECK=1 -- every fast decode is re-done with full decodes and compared.
+static int g_ptj_deccheck = 0;
+static uint64_t g_ptj_deccheck_objs = 0, g_ptj_deccheck_bad = 0;
 
 // A **recursive-descent** sweep, not a linear one.  V8 code objects embed data in the
 // instruction stream -- irregexp emits an inline jump table right after
@@ -931,21 +1314,36 @@ static uint32_t ptj_scan_data_from(ZydisDecoder *dec, const uint8_t *code, size_
 // on `acorn`).  Only offsets reachable by falling through, by a direct branch or past a
 // call are treated as instruction boundaries; everything else is data as far as we care.
 //
-// D-J6: an OPTIMISED code object is entered in the middle (OSR at a loop header, a deopt
+// An OPTIMISED code object is entered in the middle (OSR at a loop header, a deopt
 // or exception entry), so a descent from offset 0 can cover 2 % of it.  The analyzer's
 // v2.21 restart fill finds those entries and returns them as `restart_roots`; the front
 // end puts them into `cx->roots`, so BOTH sides decode the same instruction boundaries and
 // a site at an analyzer-only boundary is no longer dropped as `no_insn_boundary`.
-static int ptj_decode_object(PtjPatchCtx *cx, const uint8_t *code, size_t len) {
-  PtjDec *d = &g_ptjdec;
+static int ptj_decode_object_d(PtjPatchCtx *cx, const uint8_t *code, size_t len, PtjDec *d, int fast) {
   if (!ptj_dec_reserve(d, (uint32_t)len + 8)) return 0;
   d->n = 0; d->ntgt = 0;
   memset(d->vis, 0, len);
   memset(d->fbd, 0, len);
   for (uint32_t r = 0; r < cx->nforbid; r++) if (cx->forbid[r] < len) d->fbd[cx->forbid[r]] = 1;
   for (uint32_t r = 0; r < cx->nroots;  r++) if (cx->roots[r]  < len) d->fbd[cx->roots[r]]  = 1;
+  if (cx->pcsoft && cx->nsoft) {           // plain PcDescs -> 2 (allowed inside a window)
+    for (uint32_t r = 0; r < cx->nsoft && r < cx->nforbid; r++) if (cx->forbid[r] < len) d->fbd[cx->forbid[r]] = 2;
+    for (uint32_t r = cx->nsoft; r < cx->nforbid; r++) if (cx->forbid[r] < len) d->fbd[cx->forbid[r]] = 1;
+    for (uint32_t r = 0; r < cx->nrr; r++) if (cx->rr[r] < len) d->fbd[cx->rr[r]] = 1;
+  }
   uint64_t lo = (uint64_t)(uintptr_t)code, hi = lo + len;
-  d->data_from = ptj_scan_data_from(cx->dec, code, len);   // pass 0: inline data
+  PtjSweep *sw = nullptr;                  // decode once, reuse (see PtjSweep)
+  if (fast) {
+    sw = &g_ptjsweep;
+    if (!(sw->valid && sw->code == code && sw->len == len) && !ptj_sweep_begin(sw, code, len)) { sw = nullptr; fast = 0; }
+  }
+  d->dec = cx->dec;
+  // lazy operands: not for HotSpot (its extra passes are written against eager tables) nor for
+  // the ground-truth mode (every instruction's operands are read there anyway)
+  int lazy = fast && cx->fastdec >= 2 && !g_ptj_hs_callstub && !cx->gt;
+  if (fast && cx->data_from_hint) d->data_from = cx->data_from_hint;  // computed on these bytes for the key
+  else if (fast) d->data_from = ptj_scan_fused(cx->dec, code, len, nullptr, sw);
+  else d->data_from = ptj_scan_data_from(cx->dec, code, len);   // pass 0: inline data
   len = d->data_from;
   hi = lo + len;
   d->nstk = 0;
@@ -959,12 +1357,21 @@ static int ptj_decode_object(PtjPatchCtx *cx, const uint8_t *code, size_t len) {
     while (off < len && !d->vis[off]) {
       ZydisDecodedInstruction ins;
       ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-      if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(cx->dec, code + off, len - off, &ins, ops,
-                                               ZYDIS_MAX_OPERAND_COUNT, 0))) break;
+      ZydisInstructionCategory c; int direct; uint64_t t; uint8_t ilen;
+      if (fast) {                                   // raw fields only, from the sweep
+        const ZydisDecodedInstruction *pi = ptj_sweep_at(sw, cx->dec, code, off, len);
+        if (!pi) break;
+        c = pi->meta.category; ilen = pi->length;
+        direct = pi->raw.imm[0].size && pi->raw.imm[0].is_relative;
+        t = lo + off + ilen + (uint64_t)pi->raw.imm[0].value.s;
+      } else {
+        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(cx->dec, code + off, len - off, &ins, ops,
+                                                 ZYDIS_MAX_OPERAND_COUNT, 0))) break;
+        c = ins.meta.category; ilen = ins.length;
+        direct = (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].imm.is_relative);
+        t = lo + off + ins.length + (uint64_t)ops[0].imm.value.s;
+      }
       d->vis[off] = 1;
-      ZydisInstructionCategory c = ins.meta.category;
-      int direct = (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].imm.is_relative);
-      uint64_t t = lo + off + ins.length + (uint64_t)ops[0].imm.value.s;
       if (c == ZYDIS_CATEGORY_UNCOND_BR) {
         if (direct && t >= lo && t < hi && d->nstk < d->cap) d->stk[d->nstk++] = (uint32_t)(t - lo);
         break;                                    // no fall-through
@@ -974,19 +1381,65 @@ static int ptj_decode_object(PtjPatchCtx *cx, const uint8_t *code, size_t len) {
         d->stk[d->nstk++] = (uint32_t)(t - lo);
       if (c == ZYDIS_CATEGORY_CALL && direct && t >= lo && t < hi && d->nstk < d->cap)
         d->stk[d->nstk++] = (uint32_t)(t - lo);
-      off += ins.length;
+      off += ilen;
     }
+  }
+  // Bytes HotSpot rewrites itself (C1 patch sites + their stub copies)
+  uint8_t *vmp = nullptr;
+  if (g_ptj_hs_callstub) {
+    ptj_hs_c1_patchsites(code, len, [&](uint32_t site, uint32_t n, uint32_t c0, uint32_t c1) {
+      if (!vmp) vmp = (uint8_t *)calloc(len, 1);
+      if (!vmp) return;
+      memset(vmp + site, 1, n); memset(vmp + c0, 1, c1 - c0);
+    });
   }
   // second pass, in address order: build the instruction table and the branch-target set
   for (uint32_t off = 0; off < len; off++) {
     if (!d->vis[off]) continue;
     ZydisDecodedInstruction *ins = &d->ins[d->n];
     ZydisDecodedOperand *ops = d->ops[d->n];
-    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(cx->dec, code + off, len - off, ins, ops,
+    if (fast) {                                     // instruction from the sweep
+      const ZydisDecodedInstruction *pi = ptj_sweep_at(sw, cx->dec, code, off, len);
+      if (!pi) continue;
+      *ins = *pi;
+      d->ctxk[d->n] = (uint32_t)(pi - sw->ins);
+      if (lazy) d->opsok[d->n] = 0;                 // operands decoded on first use (ptj_ops)
+      else if (!ZYAN_SUCCESS(ZydisDecoderDecodeOperands(cx->dec, &sw->ctx[pi - sw->ins], ins, ops,
+                                                        ZYDIS_MAX_OPERAND_COUNT))) continue;
+      else d->opsok[d->n] = 1;
+    } else if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(cx->dec, code + off, len - off, ins, ops,
                                              ZYDIS_MAX_OPERAND_COUNT, 0))) continue;
+    else d->opsok[d->n] = 1;
     d->off[d->n] = off;
     d->len[d->n] = ins->length;
-    d->bad[d->n] = (uint8_t)ptj_insn_unsafe(ins, ops, lo, hi, lo + off);
+    d->bad[d->n] = (uint8_t)(lazy ? ptj_insn_unsafe_raw(ins, lo, hi, lo + off)
+                                  : ptj_insn_unsafe(ins, ops, lo, hi, lo + off));
+    // A HotSpot safepoint poll `test [reg], eax' (85 /r, memory form, reg
+    // field = eax) faults when a safepoint is armed; SharedRuntime's polling-page handler blob
+    // resumes at poll pc + the poll's length, read from the ORIGINAL code.  If the poll was
+    // displaced together with the next instruction, that resume pc lies inside our detour.
+    // So the byte after a poll is a forbidden window interior, like a PcDesc.
+    if (g_ptj_hs_callstub && ins->opcode == 0x85 && ins->opcode_map == ZYDIS_OPCODE_MAP_DEFAULT && ins->raw.modrm.mod != 3 &&
+        ins->raw.modrm.reg == 0 && !(ins->raw.rex.R) && off + ins->length < len && d->fbd) {
+      d->fbd[off + ins->length] = 1;
+      // The poll's OWN pc must stay a hard interior
+      // too.  JDK 17's polling-page handler blob computes the resume pc from the byte AT the poll
+      // pc (0x41 REX.B -> +3, else +2); inside a window that byte is part of our `jmp rel32', so a
+      // poll displaced as the LAST instruction of a window resumes one byte short.  The poll's pc is a PcDesc,
+      // which `pcsoft' would otherwise relax.
+      d->fbd[off] = 1;
+    }
+    if (vmp && !d->bad[d->n]) {
+      for (uint32_t q = off; q < off + ins->length && q < len; q++)
+        if (vmp[q]) { d->bad[d->n] = PTJ_DROP_CALL; break; }
+    }
+    if (g_ptj_hs_callstub && !d->bad[d->n] && code[off] == 0xe9 && ins->length == 5) {
+      int32_t rel; memcpy(&rel, code + off + 1, 4);
+      if (rel == -5 || (off >= 10 && code[off - 10] == 0x48 && code[off - 9] == 0xbb)) {
+        d->bad[d->n] = PTJ_DROP_CALL;
+        __atomic_fetch_add(&g_ptj_callstub_refused, 1, __ATOMIC_RELAXED);
+      }
+    }
     if (d->n == 0 && off == 0 && cx->sparkplug && len >= 20 && code[0] == 0xbb &&
         code[5] == 0x49 && code[6] == 0xbc && code[15] == 0xe8) {
       uint32_t imm; memcpy(&imm, code + 1, 4);
@@ -994,13 +1447,54 @@ static int ptj_decode_object(PtjPatchCtx *cx, const uint8_t *code, size_t len) {
     }
     ZydisInstructionCategory c = ins->meta.category;
     if ((c == ZYDIS_CATEGORY_COND_BR || c == ZYDIS_CATEGORY_UNCOND_BR || c == ZYDIS_CATEGORY_CALL) &&
-        ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].imm.is_relative) {
-      uint64_t t = lo + off + ins->length + (uint64_t)ops[0].imm.value.s;
+        (lazy ? (ins->raw.imm[0].size && ins->raw.imm[0].is_relative)
+              : (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[0].imm.is_relative))) {
+      uint64_t t = lo + off + ins->length + (uint64_t)(lazy ? ins->raw.imm[0].value.s : ops[0].imm.value.s);
       if (t >= lo && t < hi && d->ntgt < d->tcap) d->tgt[d->ntgt++] = (uint32_t)(t - lo);
     }
     d->n++;
   }
+  free(vmp);
   return 1;
+}
+
+// The entry point.  `cx->fastdec' selects the decode-once path; PTJIT_DECCHECK=1 re-runs
+// the full-decode path into a second table and counts every object whose tables differ.
+// Instruction i's operands, decoded on first use.  NULL if Zydis cannot decode them
+// (the callers then refuse the window / stop the shift).
+static inline const ZydisDecodedOperand *ptj_ops(PtjDec *d, uint32_t i) {
+  if (d->opsok[i] == 0) {
+    d->opsok[i] = ZYAN_SUCCESS(ZydisDecoderDecodeOperands(d->dec, &g_ptjsweep.ctx[d->ctxk[i]], &d->ins[i],
+                                                          d->ops[i], ZYDIS_MAX_OPERAND_COUNT)) ? 1 : 2;
+  }
+  return d->opsok[i] == 1 ? d->ops[i] : nullptr;
+}
+static PtjDec g_ptjdec_chk;
+static int ptj_dec_same(PtjDec *a, PtjDec *b, size_t len) {
+  for (uint32_t i = 0; i < a->n; i++) if (!ptj_ops(a, i)) return 0;
+  if (a->data_from != b->data_from || a->n != b->n || a->ntgt != b->ntgt) return 0;
+  if (memcmp(a->vis, b->vis, len) || memcmp(a->fbd, b->fbd, len)) return 0;
+  if (memcmp(a->off, b->off, 4 * a->n) || memcmp(a->len, b->len, 2 * a->n) || memcmp(a->bad, b->bad, a->n)) return 0;
+  if (memcmp(a->tgt, b->tgt, 4 * a->ntgt)) return 0;
+  for (uint32_t i = 0; i < a->n; i++) {
+    if (memcmp(&a->ins[i], &b->ins[i], sizeof(ZydisDecodedInstruction))) return 0;
+    if (memcmp(a->ops[i], b->ops[i], sizeof(ZydisDecodedOperand) * a->ins[i].operand_count)) return 0;
+  }
+  return 1;
+}
+static int ptj_decode_object(PtjPatchCtx *cx, const uint8_t *code, size_t len) {
+  int r = ptj_decode_object_d(cx, code, len, &g_ptjdec, cx->fastdec);
+  if (cx->fastdec && g_ptj_deccheck) {
+    int r2 = ptj_decode_object_d(cx, code, len, &g_ptjdec_chk, 0);
+    g_ptj_deccheck_objs++;
+    if (r != r2 || (r && !ptj_dec_same(&g_ptjdec, &g_ptjdec_chk, len))) {
+      g_ptj_deccheck_bad++;
+      fprintf(stderr, "PTJIT DECCHECK decode MISMATCH addr=%p len=%zu hint=%u df=%u/%u n=%u/%u\n", (void *)code, len,
+              cx->data_from_hint, g_ptjdec.data_from, g_ptjdec_chk.data_from, g_ptjdec.n, g_ptjdec_chk.n);
+    }
+  }
+  cx->data_from_hint = 0; g_ptjsweep.valid = 0;
+  return r;
 }
 
 static int ptj_is_target(PtjDec *d, uint32_t o) {
@@ -1011,7 +1505,32 @@ static int ptj_is_target(PtjDec *d, uint32_t o) {
 // entry).  Treated exactly like a direct branch target: no window may contain it strictly
 // inside, or a thread entering there would land in the middle of our `jmp rel32`.
 // `d->fbd` is filled from cx->forbid and cx->roots once per object.
-static inline int ptj_is_forbidden(PtjDec *d, uint32_t o) { return d->fbd && d->fbd[o]; }
+static inline int ptj_is_forbidden(PtjDec *d, uint32_t o) { return d->fbd && d->fbd[o] == 1; }
+// shift: does `ins' write (any part of) one of the site's registers, or transfer control?
+static int ptj_blocks_shift(const ZydisDecodedInstruction *ins, const ZydisDecodedOperand *ops,
+                            const PtjSite *s) {
+  switch (ins->meta.category) {
+    case ZYDIS_CATEGORY_COND_BR: case ZYDIS_CATEGORY_UNCOND_BR: case ZYDIS_CATEGORY_CALL:
+    case ZYDIS_CATEGORY_RET: case ZYDIS_CATEGORY_INTERRUPT: case ZYDIS_CATEGORY_SYSCALL:
+    case ZYDIS_CATEGORY_SYSTEM: return 1;
+    default: break;
+  }
+  if (ins->mnemonic == ZYDIS_MNEMONIC_UD2 || ins->mnemonic == ZYDIS_MNEMONIC_HLT ||
+      ins->mnemonic == ZYDIS_MNEMONIC_INT3) return 1;
+  for (int q = 0; q < ins->operand_count; q++) {
+    if (ops[q].type != ZYDIS_OPERAND_TYPE_REGISTER) continue;
+    if (!(ops[q].actions & (ZYDIS_OPERAND_ACTION_WRITE | ZYDIS_OPERAND_ACTION_CONDWRITE))) continue;
+    ZydisRegister big = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[q].reg.value);
+    for (int r = 0; r < s->nregs; r++) {
+      int x = s->regs[r];
+      ZydisRegister sr = x < 16 ? (ZydisRegister)(ZYDIS_REGISTER_RAX + x)
+                       : x < 32 ? (ZydisRegister)(ZYDIS_REGISTER_XMM0 + (x - 16)) : ZYDIS_REGISTER_NONE;
+      if (sr == ZYDIS_REGISTER_NONE) return 1;
+      if (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, sr) == big) return 1;
+    }
+  }
+  return 0;
+}
 static int ptj_find_insn(PtjDec *d, uint32_t o) {
   int lo = 0, hi = (int)d->n - 1;
   while (lo <= hi) { int m = (lo + hi) / 2;
@@ -1057,10 +1576,17 @@ static int ptj_emit_site(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
   uint8_t *kf_branch = nullptr, *kf_hole = nullptr;
   uint64_t *kf_ctr = nullptr;
   uint32_t kf_first = cx->nentries;
+  int kf_save = 0;
   if (st->kf) {
-    if (!st->flags_dead && !cx->kf_flags_live) { cx->drops[PTJ_DROP_KF_FLAGS]++; return 1; }
+    if (!st->flags_dead && cx->kf_flags_save) kf_save = 1;
+    else if (!st->flags_dead && !cx->kf_flags_live) { cx->drops[PTJ_DROP_KF_FLAGS]++; return 1; }
     kf_ctr = ptj_kf_alloc(cx);
-    if (!kf_ctr || !ptj_kf_open(e, kf_ctr, st->kf, &kf_branch, &kf_hole)) {
+    uint8_t *kf_p0 = e->p;
+    if (kf_ctr && kf_save) {        // lea -0x80(%rsp),%rsp ; pushfq   (step over any red zone)
+      *e->p++ = 0x48; *e->p++ = 0x8d; *e->p++ = 0x64; *e->p++ = 0x24; *e->p++ = 0x80; *e->p++ = 0x9c;
+    }
+    if (!kf_ctr || !ptj_kf_open(e, kf_ctr, st->kf, &kf_branch, &kf_hole, cx->kf_gs_n != 0)) {
+      e->p = kf_p0;
       cx->drops[PTJ_DROP_KF_NOCTR]++; return 1;   // no guard -> no site (never log unguarded:
     }                                             // a loop header would log every iteration)
     cx->kf_sites++;
@@ -1068,11 +1594,18 @@ static int ptj_emit_site(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
   int ok = ptj_emit_site_values(cx, e, st, ins, raw, orig_addr);
   if (kf_ctr && ok) {
     ptj_kf_close(e, kf_hole);
+    uint8_t *join = e->p;           // the guard's branch target = what Stage 3 compares against
+    if (kf_save) {                  // popfq ; lea 0x80(%rsp),%rsp  (both paths pass through here)
+      *e->p++ = 0x9d;
+      *e->p++ = 0x48; *e->p++ = 0x8d; *e->p++ = 0xa4; *e->p++ = 0x24;
+      *e->p++ = 0x80; *e->p++ = 0x00; *e->p++ = 0x00; *e->p++ = 0x00;
+      cx->kf_flags_saved++;
+    }
     for (uint32_t q = kf_first; q < cx->nentries; q++) {
       cx->entries[q].kf_period = st->kf;
       cx->entries[q].counter   = (uint64_t)(uintptr_t)kf_ctr;
       cx->entries[q].kf_branch = (uint64_t)(uintptr_t)kf_branch;
-      cx->entries[q].kf_join   = (uint64_t)(uintptr_t)e->p;
+      cx->entries[q].kf_join   = (uint64_t)(uintptr_t)join;
       cx->entries[q].resync    = st->resync ? 1 : 0;
       cx->kf_values++;
     }
@@ -1090,8 +1623,10 @@ static int ptj_emit_site_values(PtjPatchCtx *cx, PtjEmit *e, const PtjSite *st,
   if (st->kind == PTJ_KIND_MEMOP) {
     int pb = 64; uint8_t *at = nullptr;
     int scr = 0;                                   // %rax
-    if (!ptj_ptw_mem(e, ins, raw, orig_addr, st->size ? st->size : 8, scr, &pb, &at)) return 0;
+    if (!ptj_ptw_mem(e, ins, raw, orig_addr, ptj_memop_log_size(st), scr, &pb, &at)) return 0;
+    uint32_t first = cx->nentries;
     ptj_add_entry(cx, at, orig_addr, st, 255, 0, pb);
+    if (cx->nentries == first + 1u) ptj_memop_fix_entry(cx, st, first);
     return 1;
   }
   for (int i = 0; i < st->nregs; i++) {
@@ -1120,7 +1655,7 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
   ost->requested = (uint32_t)nsites;
   if (!ptj_decode_object(cx, code, len)) { cx->drops[PTJ_DROP_DECODE] += nsites; return 0; }
   ptj_sort_sites(sites, nsites);
-  // SAME-RUN GROUND TRUTH (defect D-J2).  `--gt-all' for a JIT: every memory-accessing
+  // SAME-RUN GROUND TRUTH.  `--gt-all' for a JIT: every memory-accessing
   // instruction of the object becomes a window-forcing PSEUDO-SITE, so the patcher displaces
   // it and the trampoline can record its effective address.  Without this the oracle would
   // only ever cover the handful of instructions that happen to sit inside a critical-value
@@ -1155,50 +1690,89 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
   uint32_t limit = cx->hi ? cx->hi : (uint32_t)len;
   while (i < nsites) {
     PtjSite *s0 = &sites[i];
-    if (s0->off < guard_off) { cx->drops[PTJ_DROP_BRANCH_TARGET]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
+    if (s0->off < guard_off) { ptj_drop_s(cx, PTJ_DROP_BRANCH_TARGET, &sites[i], lo); i++; continue; }
     // A keyframe guard is `dec CNT(%rip)', which writes EFLAGS.  Where the analyzer could not
-    // prove them dead the site is dropped (the ELF default, keyframe_impl.md section 1.4):
+    // prove them dead the site is dropped (the ELF default):
     // logging a loop header unconditionally would cost one PTWRITE per iteration of the
     // hottest loop in the program, and a keyframe is an accuracy bonus, not a correctness
     // requirement.  Done here as well as in ptj_emit_site so it does not consume a window.
-    if (s0->kf && !s0->flags_dead && !cx->kf_flags_live) {
-      cx->drops[PTJ_DROP_KF_FLAGS]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
+    if (s0->kf && !s0->flags_dead && !cx->kf_flags_live && !cx->kf_flags_save) {
+      ptj_drop_s(cx, PTJ_DROP_KF_FLAGS, &sites[i], lo); i++; continue; }
     int k = ptj_find_insn(d, s0->off);
     if (k < 0) {
-      cx->drops[s0->off >= d->data_from ? PTJ_DROP_DATA_REGION : PTJ_DROP_NO_BOUNDARY]++;
-      ptj_note_unpatched_s(cx, &sites[i]); i++; continue;
+      ptj_drop_s(cx, s0->off >= d->data_from ? PTJ_DROP_DATA_REGION : PTJ_DROP_NO_BOUNDARY, &sites[i], lo);
+      i++; continue;
     }
     // unsupported registers -> drop the site, keep going
     int unsup = 0;
     for (int r = 0; r < s0->nregs; r++) if (sites[i].regs[r] >= 32) unsup = 1;
-    if (unsup) { cx->drops[PTJ_DROP_UNSUP_REG]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
-    if (d->bad[k]) { cx->drops[d->bad[k]]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
-    // grow the window to >= 5 bytes
-    int j = k; uint32_t end = d->off[k]; int bad = 0;
-    while (end - d->off[k] < 5) {
-      if (j >= (int)d->n) { bad = PTJ_DROP_WINDOW_TRUNCATED; break; }
-      if (d->bad[j]) { bad = (int)d->bad[j] + (PTJ_DROP_WINDOW_IMM32 - PTJ_DROP_IMM32); break; }
-      if (j > k && d->off[j] != end) { bad = PTJ_DROP_WINDOW_TRUNCATED; break; }  // a gap = data
-      end = d->off[j] + d->len[j]; j++;
-    }
-    if (bad) { cx->drops[bad]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
-    if (cx->single && j > k + 1) { cx->drops[PTJ_DROP_WINDOW_MULTI]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
-    if (end > limit) { cx->drops[PTJ_DROP_WINDOW_TRUNCATED]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
+    if (unsup) { ptj_drop_s(cx, PTJ_DROP_UNSUP_REG, &sites[i], lo); i++; continue; }
+    if (d->bad[k] && !(cx->shift && d->bad[k] == PTJ_DROP_IMM32)) {
+      ptj_drop_s(cx, d->bad[k], &sites[i], lo); i++; continue; }
+    // The window [a, j): starts at instruction a <= k, contains k, >= 5 bytes.  The checks and
+    // their order are exactly the forward-only ones when a == k.
     // No interior instruction boundary may be the target of a direct branch, nor an offset
     // the VM told us can be entered indirectly (HotSpot: a PcDesc / a dispatch-table entry).
-    int clash = 0;
-    for (int q = k + 1; q < j; q++)
-      if (ptj_is_target(d, d->off[q]) || ptj_is_forbidden(d, d->off[q])) { clash = 1; break; }
-    if (clash) { cx->drops[PTJ_DROP_BRANCH_TARGET]++; ptj_note_unpatched_s(cx, &sites[i]); i++; continue; }
+    auto try_window = [&](int kk, int a, int *j_out, uint32_t *end_out) -> int {
+      int j = a; uint32_t e = d->off[a];
+      while (e - d->off[a] < 5 || j <= kk) {
+        if (j >= (int)d->n) return PTJ_DROP_WINDOW_TRUNCATED;
+        if (d->bad[j]) return (int)d->bad[j] + (PTJ_DROP_WINDOW_IMM32 - PTJ_DROP_IMM32);
+        if (j > a && d->off[j] != e) return PTJ_DROP_WINDOW_TRUNCATED;   // a gap = data
+        e = d->off[j] + d->len[j]; j++;
+      }
+      if (cx->single && j > a + 1) return PTJ_DROP_WINDOW_MULTI;
+      if (e > limit) return PTJ_DROP_WINDOW_TRUNCATED;
+      if (cx->hole_hi > cx->hole_lo && d->off[a] < cx->hole_hi && e > cx->hole_lo) return PTJ_DROP_VE_HOLE;
+      for (int q = a + 1; q < j; q++)
+        if (ptj_is_target(d, d->off[q]) || ptj_is_forbidden(d, d->off[q])) return PTJ_DROP_BRANCH_TARGET;
+      *j_out = j; *end_out = e; return 0;
+    };
+    // sliding: start up to 4 instructions earlier; never over another site (all earlier sites
+    // are either inside an earlier window, i.e. before guard_off, or dropped for good)
+    auto try_slide = [&](int kk, int *a_out, int *j_out, uint32_t *end_out) -> int {
+      for (int a = kk - 1; a >= 0 && a >= kk - 4; a--) {
+        if (d->off[a] + d->len[a] != d->off[a + 1]) return 1;
+        if (d->off[a] < guard_off || d->bad[a]) return 1;
+        if (i > 0 && sites[i - 1].off >= d->off[a]) return 1;
+        if (!try_window(kk, a, j_out, end_out)) { *a_out = a; return 0; }
+      }
+      return 1;
+    };
+    int ws = k, j = k; uint32_t end = 0;
+    int bad = d->bad[k] ? (int)d->bad[k] : try_window(k, k, &j, &end);
+    if (bad && !d->bad[k] && cx->slide && bad != PTJ_DROP_WINDOW_MULTI && !try_slide(k, &ws, &j, &end)) {
+      bad = 0; cx->slid++;
+    }
+    if (bad && cx->shift && s0->kind == PTJ_KIND_REG && s0->when == PTJ_WHEN_BEFORE && !s0->kf) {
+      int q = k;
+      for (int step = 0; step < 8; step++) {
+        if (q + 1 >= (int)d->n || d->off[q] + d->len[q] != d->off[q + 1]) break;
+        const ZydisDecodedOperand *oq = ptj_ops(d, (uint32_t)q);
+        if (!oq || ptj_blocks_shift(&d->ins[q], oq, s0)) break;
+        q++;
+        if (i + 1 < nsites && sites[i + 1].off < d->off[q]) break;     // never pass another site
+        if (d->bad[q] || d->off[q] < guard_off) continue;
+        int a2 = q, j2; uint32_t e2;
+        int b2 = try_window(q, q, &j2, &e2);
+        if (b2 && cx->slide && b2 != PTJ_DROP_WINDOW_MULTI && !try_slide(q, &a2, &j2, &e2)) b2 = 0;
+        if (!b2) {
+          s0->off = d->off[q]; s0->flags_dead = 0;       // liveness belongs to the old point
+          k = q; ws = a2; j = j2; end = e2; bad = 0; cx->shifted++;
+          break;
+        }
+      }
+    }
+    if (bad) { ptj_drop_s(cx, bad, &sites[i], lo); i++; continue; }
     // absorb every site that falls inside the window
     int m = i;
     while (m < nsites && sites[m].off < end) m++;
     // emit
-    if (*cx->slab_used + 1024 + (end - d->off[k]) * 4 > cx->slab_cap) {
+    if (*cx->slab_used + 1024 + (end - d->off[ws]) * 4 > cx->slab_cap) {
       cx->drops[PTJ_DROP_SLAB_FULL] += (m - i); for (int x = i; x < m; x++) ptj_note_unpatched_s(cx, &sites[x]); i = m; continue;
     }
     uint8_t *t = cx->slab + *cx->slab_used;
-    int64_t reach = (int64_t)((uint64_t)(uintptr_t)t - (lo + d->off[k]));
+    int64_t reach = (int64_t)((uint64_t)(uintptr_t)t - (lo + d->off[ws]));
     if (!ptj_fits32(reach)) { cx->drops[PTJ_DROP_OUT_OF_RANGE] += (m - i); for (int x = i; x < m; x++) ptj_note_unpatched_s(cx, &sites[x]); i = m; continue; }
     uint32_t saved_entries = cx->nentries, saved_relocs = cx->nrelocs, saved_gtents = cx->ngtents;
     uint64_t saved_values = cx->n_values;
@@ -1206,12 +1780,14 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
     int fail = 0, npatched = 0;
     if (cx->ctr && cx->ntramps < cx->ctr_max && cx->ntramps < cx->maxtramps)
       ptj_emit_counter(&e, &cx->ctr[cx->ntramps]);
-    for (int q = k; q < j && !fail; q++) {
+    for (int q = ws; q < j && !fail; q++) {
       uint64_t ia = lo + d->off[q];
       const uint8_t *raw = code + d->off[q];
+      const ZydisDecodedOperand *oq = ptj_ops(d, (uint32_t)q);   // lazy operands
+      if (!oq) { fail = 1; break; }
       for (int x = i; x < m; x++) {
         if (sites[x].off != d->off[q] || sites[x].when != PTJ_WHEN_BEFORE) continue;
-        if (!ptj_emit_site(cx, &e, &sites[x], &d->ins[q], d->ops[q], raw, ia)) { fail = 1; break; }
+        if (!ptj_emit_site(cx, &e, &sites[x], &d->ins[q], oq, raw, ia)) { fail = 1; break; }
       }
       if (fail) break;
       uint8_t *gkey = nullptr; PtjGtEnt *gent = nullptr;
@@ -1233,8 +1809,8 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
         }
       }
       uint8_t *rstart = e.p;
-      if (!ptj_reloc_insn(&e, &d->ins[q], d->ops[q], raw, ia)) { fail = 1; break; }
-      // D-J9: the ground-truth record's lockstep key is the address of the relocated copy
+      if (!ptj_reloc_insn(&e, &d->ins[q], oq, raw, ia)) { fail = 1; break; }
+      // The ground-truth record's lockstep key is the address of the relocated copy
       // just emitted -- what `ptrecon' has in hand (relocated[].tramp_addr) when it produces
       // the reconstructed record for this access.
       if (gkey) { uint64_t kv = (uint64_t)(uintptr_t)rstart; memcpy(gkey, &kv, 8);
@@ -1243,10 +1819,15 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
         PtjReloc *rr = &cx->relocs[cx->nrelocs++];
         rr->tramp_addr = (uint64_t)(uintptr_t)rstart; rr->orig_addr = ia;
         rr->obj = cx->obj; rr->len = d->len[q]; rr->tramp_len = (uint16_t)(e.p - rstart);
+      } else if (cx->relocs) {
+        // Fail closed.  An unrecorded relocation is invisible to the reconstructor
+        // AND to the HotSpot front end's fault translation (an implicit null check in it
+        // would kill the VM), so the window is dropped instead of installed.
+        fail = 1; break;
       }
       for (int x = i; x < m && !fail; x++) {
         if (sites[x].off != d->off[q] || sites[x].when != PTJ_WHEN_AFTER) continue;
-        if (!ptj_emit_site(cx, &e, &sites[x], &d->ins[q], d->ops[q], raw, ia)) fail = 1;
+        if (!ptj_emit_site(cx, &e, &sites[x], &d->ins[q], oq, raw, ia)) fail = 1;
       }
     }
     if (!fail) {
@@ -1262,23 +1843,23 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
     *cx->slab_used = (*cx->slab_used + tlen + 15) & ~(size_t)15;
     // diagnostics: remember the window's original bytes before we overwrite them
     {
-      uint32_t wl = end - d->off[k];
+      uint32_t wl = end - d->off[ws];
       cx->last_orig_len = wl > 32 ? 32 : wl;
-      memcpy(cx->last_orig, code + d->off[k], cx->last_orig_len);
-      cx->last_obj_addr = lo; cx->last_obj_len = (uint32_t)len; cx->last_off = d->off[k];
+      memcpy(cx->last_orig, code + d->off[ws], cx->last_orig_len);
+      cx->last_obj_addr = lo; cx->last_obj_len = (uint32_t)len; cx->last_off = d->off[ws];
     }
     // install the detour.  The finished window is built first, then written either with a
     // plain store (V8: the code object cannot be executing yet) or through cx->install,
     // which the HotSpot front end supplies as the int3-then-jmp cross-modifying protocol.
-    uint32_t wlen = end - d->off[k];
+    uint32_t wlen = end - d->off[ws];
     uint8_t wbuf[32];
     if (wlen > sizeof(wbuf)) { cx->drops[PTJ_DROP_ENCODE] += (m - i); for (int x = i; x < m; x++) ptj_note_unpatched_s(cx, &sites[x]); i = m; continue; }
-    int ok = ptj_enc_jmp32(wbuf, code + d->off[k], t);
+    int ok = ptj_enc_jmp32(wbuf, code + d->off[ws], t);
     for (uint32_t z = 5; z < wlen; z++) wbuf[z] = 0x90;
     if (wr_open) wr_open();
     if (ok) {
-      if (cx->install) ok = cx->install(code + d->off[k], wbuf, wlen, (uint64_t)(uintptr_t)t);
-      else memcpy(code + d->off[k], wbuf, wlen);
+      if (cx->install) ok = cx->install(code + d->off[ws], wbuf, wlen, (uint64_t)(uintptr_t)t);
+      else memcpy(code + d->off[ws], wbuf, wlen);
     }
     if (wr_close) wr_close();
     if (!ok) {
@@ -1288,13 +1869,13 @@ static int ptj_patch_object(PtjPatchCtx *cx, uint8_t *code, size_t len,
     }
     if (cx->ntramps < cx->maxtramps) {
       if (cx->ctr_orig && cx->ntramps < cx->ctr_max)
-        cx->ctr_orig[cx->ntramps] = lo + d->off[k];
+        cx->ctr_orig[cx->ntramps] = lo + d->off[ws];
       cx->tramps[cx->ntramps++] = (uint64_t)(uintptr_t)t;
     }
     npatched = m - i;
     ost->patched += (uint32_t)npatched;
     ost->windows++;
-    if (note_tramp) note_tramp(cx, code + d->off[k], end - d->off[k], t, tlen);
+    if (note_tramp) note_tramp(cx, code + d->off[ws], end - d->off[ws], t, tlen);
     guard_off = end;
     i = m;
     // continue scanning from the first instruction after the window

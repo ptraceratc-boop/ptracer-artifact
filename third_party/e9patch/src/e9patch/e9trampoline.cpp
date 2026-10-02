@@ -21,6 +21,9 @@
 #include <cstring>
 
 #include <map>
+#include <vector>
+#include <cstdio>
+#include <cstdlib>
 
 #include <sys/mman.h>
 
@@ -152,12 +155,48 @@ static void saveJump(const Binary *B, intptr_t addr, uint8_t *bytes,
 /*
  * Relocate an instruction to the given address.
  */
+/*
+ * PTracer (private): E9PATCH_RELOCMAP=FILE writes one line per copy of an
+ * ORIGINAL instruction that lands in the final trampoline bytes:
+ *     <orig addr> <trampoline addr> <trampoline length> <context>
+ * context: B = T0 batch member, I = a patch's own "$instr", E = $BREAK
+ * epilogue copy, P = -Opeephole prologue copy, R = raw "$instr" bytes.
+ * Records are logged only in the byte-emission pass (a real buffer) and are
+ * rolled back together with the buffer when an optimisation is undone, so the
+ * file describes exactly the bytes E9Patch wrote.  Unset = no effect.
+ */
+struct E9RelocRec { intptr_t orig, tramp; int len; char ctx; };
+static std::vector<E9RelocRec> e9_reloc_log;
+static const char *e9_reloc_path = getenv("E9PATCH_RELOCMAP");
+static char e9_reloc_ctx = 'I';
+static void e9_reloc_note(const Instr *I, intptr_t addr, int len, char ctx)
+{
+    if (e9_reloc_path != nullptr && *e9_reloc_path != '\0' && len >= 0)
+        e9_reloc_log.push_back({I->addr, addr, len, ctx});
+}
+void e9_reloc_flush(void)
+{
+    if (e9_reloc_path == nullptr || *e9_reloc_path == '\0')
+        return;
+    FILE *f = fopen(e9_reloc_path, "w");
+    if (f == nullptr)
+        error("failed to open \"%s\" for writing", e9_reloc_path);
+    fprintf(f, "# E9PATCH_RELOCMAP v1: orig tramp tramp_len ctx\n");
+    for (const auto &r: e9_reloc_log)
+        fprintf(f, "%lx %lx %d %c\n", (long)r.orig, (long)r.tramp, r.len,
+            r.ctx);
+    fclose(f);
+}
+
 static int relocateInstr(const Instr *I, intptr_t addr, Buffer *buf = nullptr)
 {
     bool relax   = (addr == INTPTR_MIN);
     off_t offset = (relax? 0: addr - I->addr);
-    return relocateInstr(I->addr, offset, I->ORIG, I->size, I->pic, buf,
+    int r = relocateInstr(I->addr, offset, I->ORIG, I->size, I->pic, buf,
         relax);
+    if (buf != nullptr && buf->buf != nullptr && !relax)
+        e9_reloc_note(I, addr, r, e9_reloc_ctx);
+    return r;
 }
 
 /*
@@ -248,6 +287,8 @@ static int buildBreak(const Binary *B, const Instr *I, intptr_t addr,
     // Build the epilogue:
     J = I->next();
     unsigned start = (mode == BUILD_BYTES? buf->size(): 0);
+    size_t log_start = e9_reloc_log.size();
+    char saved_ctx = e9_reloc_ctx; e9_reloc_ctx = 'E';
     bool ok = true;
     for (unsigned j = 0; ok && j < i; j++, J = J->next())
     {
@@ -276,9 +317,11 @@ static int buildBreak(const Binary *B, const Instr *I, intptr_t addr,
         addr += (unsigned)len;
     }
 
+    e9_reloc_ctx = saved_ctx;
     if (!ok)
     {
         // Failed to apply optimization --> jump to next instruction.
+        e9_reloc_log.resize(log_start);
         if (buf != nullptr)
             buf->reset(start);
         return buildBreak(B, I, addr_0, mode, breaks, buf);
@@ -304,6 +347,7 @@ static int buildPrologue(const Binary *B, const Instr *I,
 
     int r = 0;
     unsigned start = (mode == BUILD_BYTES? buf->size(): 0);
+    size_t log_start = e9_reloc_log.size();
     std::vector<std::pair<const Instr *, intptr_t>> entries;
     for (; J != I; J = J->next())
     {
@@ -317,9 +361,12 @@ static int buildPrologue(const Binary *B, const Instr *I,
             {
                 uint8_t *bytes = buf->bytes();
                 intptr_t entry = addr;
+                char saved_ctx = e9_reloc_ctx; e9_reloc_ctx = 'P';
                 len = relocateInstr(J, addr, buf);
+                e9_reloc_ctx = saved_ctx;
                 if (len < 0)
                 {
+                    e9_reloc_log.resize(log_start);
                     buf->reset(start);
                     break;
                 }
@@ -842,10 +889,16 @@ static void buildBytes(const Binary *B, const Trampoline *T, const Instr *I,
             }
 
             case ENTRY_INSTR:
+            {
+                char saved_ctx = e9_reloc_ctx; e9_reloc_ctx = 'I';
                 relocateInstr(I, addr + buf.size(), &buf);
+                e9_reloc_ctx = saved_ctx;
                 continue;
+            }
 
             case ENTRY_INSTR_BYTES:
+                if (buf.buf != nullptr)
+                    e9_reloc_note(I, addr + buf.size(), I->size, 'R');
                 buf.push(I->ORIG, I->size);
                 break;
         
@@ -887,7 +940,9 @@ static void buildBytes(const Binary *B, const Trampoline *T, const Instr *I,
                             buf);
                     else
                     {
+                        char saved_ctx = e9_reloc_ctx; e9_reloc_ctx = 'B';
                         int r = relocateInstr(I, addr + buf.size(), &buf);
+                        e9_reloc_ctx = saved_ctx;
                         if (r < 0)
                             error("failed to relocate instruction at "
                                 "address 0x%lx", I->addr);
@@ -974,6 +1029,7 @@ void flattenAllTrampolines(Binary *B)
             entry32, A->T, I);
         A->bytes = bytes;
     }
+    e9_reloc_flush();
 }
 
 /*

@@ -1,0 +1,27 @@
+# <benchmark> <iterations per process> <warm-up drop>: the Renaissance cells of the JIT Fast sweep (25 = the paper's 31
+# minus the 6 dummies).  Steady state = median of the iterations after the drop; the boundary drain runs before op <drop>.
+akka-uct 10 7
+als 30 20
+chi-square 30 20
+db-shootout 16 11
+dec-tree 30 20
+dotty 30 20
+finagle-chirper 30 20
+finagle-http 12 8
+fj-kmeans 29 19
+future-genetic 30 20
+gauss-mix 30 20
+log-regression 20 13
+mnemonics 16 11
+movie-lens 13 9
+naive-bayes 30 20
+neo4j-analytics 20 13
+page-rank 20 13
+par-mnemonics 16 11
+philosophers 30 20
+reactors 10 7
+rx-scrabble 30 20
+scala-doku 20 13
+scala-kmeans 30 20
+scala-stm-bench7 30 20
+scrabble 30 20

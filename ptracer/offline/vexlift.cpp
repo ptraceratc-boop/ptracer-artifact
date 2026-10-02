@@ -73,6 +73,8 @@ std::unique_ptr<IRBlockC> VexLifter::lift_one(uint64_t addr, const uint8_t* byte
     IRSB* sb = r->irsb;
     b->len = r->size;
     b->tmpty.assign(sb->tyenv->types, sb->tyenv->types + sb->tyenv->types_used);
+    b->tmpsz.resize(b->tmpty.size());
+    for (size_t i = 0; i < b->tmpty.size(); i++) b->tmpsz[i] = (uint8_t)(b->tmpty[i] == Ity_I1 ? 1 : sizeofIRType(b->tmpty[i]));
     for (int i = 0; i < sb->stmts_used; i++) {
         const IRStmt* s = sb->stmts[i];
         IRStmtC c;
@@ -106,6 +108,11 @@ std::unique_ptr<IRBlockC> VexLifter::lift_one(uint64_t addr, const uint8_t* byte
     }
     b->jk = sb->jumpkind;
     b->next = compile_expr(*b, sb->next);
+    for (auto& n : b->nodes) if (n.k == IRNodeC::CCALL) {
+        n.ccid = n.ccname == "amd64g_calculate_condition" ? 1 : n.ccname == "amd64g_calculate_rflags_c" ? 2 : n.ccname == "amd64g_calculate_rflags_all" ? 3 : 0;
+        n.cargs_atomic = true;
+        for (int a : n.cargs) { auto k = b->nodes[a].k; if (k != IRNodeC::CONST && k != IRNodeC::GET && k != IRNodeC::RDTMP) n.cargs_atomic = false; }
+    }
     b->ok = true;
     return b;
 }

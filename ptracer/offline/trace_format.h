@@ -1,4 +1,4 @@
-// PTracer memory trace format (SPEC_FORMAT section 5).  Single source of truth.
+// PTracer memory trace format. Single source of truth.
 #pragma once
 #include <stdint.h>
 #define MTRACE_MAGIC 0x544D5450u /* "PTMT" little-endian */

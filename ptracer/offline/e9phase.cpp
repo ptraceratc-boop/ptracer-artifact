@@ -92,6 +92,7 @@ void E9Phases::build(const std::vector<MapEnt>& maps) {
         if (im.patched.empty()) continue;   // rewritten, but nothing was remapped: nothing to do
         imgs_.push_back(std::move(im));
     }
+    for (auto& im : imgs_) for (auto& r : im.loader) { if (r.lo < ld_lo_) ld_lo_ = r.lo; if (r.hi > ld_hi_) ld_hi_ = r.hi; }
 }
 
 int E9Phases::patched_overlay_image(const MapEnt& m) const {
@@ -100,6 +101,7 @@ int E9Phases::patched_overlay_image(const MapEnt& m) const {
 }
 
 int E9Phases::loader_image(uint64_t ip) const {
+    if (ip < ld_lo_ || ip >= ld_hi_) return -1;      // called per decoded instruction while any image is pre-init
     for (size_t i = 0; i < imgs_.size(); i++)
         for (auto& r : imgs_[i].loader)
             if (ip >= r.lo && ip < r.hi) return (int)i;

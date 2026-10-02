@@ -46,3 +46,15 @@ d72adbfef39e1bf9f2a4fe4bc3541bb27d9c9d3da305a4fbe592c5ccd7bc49c2  suite45/lib.n/
 Every `lib-dynload/*.so` is in `../MANIFEST.sha256`.  The install prefix recorded in the
 trees' `sysconfig` data is a placeholder (`/opt/cpython-cg`); the interpreter derives its real
 prefix from its own location.
+
+## Whole-process pyperformance (Figure 5: 94 benchmarks)
+
+| path | content |
+|---|---|
+| `pyperf/run_one_full.py`, `pyperf/fakepyperf_full.py` | the full harness: any pyperformance 1.14.0 MANIFEST name (incl. `<local:X>` variants with their extra_opts) in-process; `PPF_LOOPS`/`PPF_WARM` as before |
+| `pyperf/bench94.lst` | the 94 benchmarks of the overhead figure (bench97.lst without the three `bench_command` benchmarks python_startup, python_startup_no_site, 2to3, which time interpreter start-up rather than execution) |
+| `pyperf/bench97.lst` | all 97 MANIFEST benchmarks (`PYPERF_LIST=` selects it) |
+| `pyperf/loops.tsv` | per-benchmark loop counts, calibrated on vanilla (>= 0.1 s timed), identical for every configuration |
+| `wp/site.tar.xz`, `wp/requirements.txt` | the installed third-party packages (their `pip freeze`), shipped as built bytes because several pinned versions have no Python 3.12 wheel; `wp/setup_site.sh` unpacks them into `wp/site` |
+| `wp/extmods/` | `_bz2 _lzma _sqlite3 _uuid` built against the cpython-cg configuration (`wp/extmods_build.sh`, gcc 13.3.0), since cpython-cg was configured without those libraries' headers |
+| `wp/images.tsv` | the 82 ELF images a pyperformance process maps (minus ld.so/vdso), with the sha256 prefix every Fast image and the HiFi plan is keyed to; `setup_site.sh` checks them |

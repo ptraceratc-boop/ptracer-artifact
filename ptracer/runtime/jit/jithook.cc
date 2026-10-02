@@ -11,6 +11,7 @@
 #include <v8.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -74,7 +75,7 @@ struct Counters {
   uint64_t patched, patch_skipped_decode, patch_skipped_small,
       patch_skipped_ro, patch_skipped_type, patch_skipped_cap,
       patch_skipped_range;
-  // --- the V8 half of D-J13 the design notes -----------------------------
+  // --- implicit exceptions, V8 half -----------------------------
   // `patch_skipped_bytecode'/`patch_skipped_wasm' split the old `patch_skipped_type' bucket,
   // so the WASM_CODE gate is visible in every run's stats; `patch_skipped_wasm_range' is the
   // second, forward-proof gate (a code object V8 registered with its wasm trap handler, no
@@ -87,8 +88,19 @@ struct Counters {
   // every WASM_CODE range V8 ever reported, and the peak size of the live table.
   uint64_t wasm_ranges, wasmprot_overlap_reported, wasmprot_live_max, wasmprot_insns_max;
   uint64_t dump_bytes, dump_truncated;
+  // Data-gate audit (the Node analogue of the Java agent's data gate): JIT_CODE objects whose linear decode
+  // from their FIRST byte hits an undecodable byte before any jmp/ret/ud2/hlt, i.e. objects that
+  // may be data reported as code.  `obj_data_gate_checked' = objects examined.
+  uint64_t obj_data_skips, obj_data_gate_checked;
 };
 static Counters g_c;
+// PTJIT_DATA_GATE: 0 = off (no scan, zero cost), 1 = COUNT ONLY (default; no behaviour change),
+// 2 = count and do NOT patch such objects.
+static int g_data_gate = -1;
+static int data_gate_mode() {
+  if (g_data_gate < 0) { const char *v = getenv("PTJIT_DATA_GATE"); g_data_gate = v ? atoi(v) : 1; }
+  return g_data_gate;
+}
 static pid_t g_install_tid;
 static int g_diag = 0;
 static int g_diag_every = 200;
@@ -105,11 +117,11 @@ static inline uint64_t now_ns() {
 
 // ============================================================================
 //  V8's wasm trap handler: the one pc-keyed fault-recovery table V8 has
-//  (D-J13 for the V8 front end -- the design notes
+//  (implicit exceptions, V8 front end)
 //
 //  HotSpot turns a fault in compiled code into a Java exception by looking the FAULTING PC
 //  up in the nmethod's implicit-exception table, so displacing such an instruction into our
-//  slab is fatal (D-J13, the design notes.  V8 has exactly one table of that
+//  slab is fatal.  V8 has exactly one table of that
 //  shape and it belongs to WebAssembly.  `v8::internal::trap_handler` keeps
 //
 //      size_t gNumCodeObjects;                        // _ZN2v88internal12trap_handler15gNumCodeObjectsE
@@ -121,7 +133,7 @@ static inline uint64_t now_ns() {
 //  `pc - base` to appear EXACTLY in `off[]` before it rewrites RIP to `gLandingPad`.  The
 //  layout above is read off node 22.23 (V8 12.4) with objdump; the live table is the evidence.
 //  A relocated copy of a protected instruction satisfies neither test, so displacing one
-//  would turn a wasm OOB trap into a fatal SIGSEGV -- exactly D-J13.
+//  would turn a wasm OOB trap into a fatal SIGSEGV.
 //
 //  Only `wasm::WasmCode::RegisterTrapHandlerData()` (called from
 //  `NativeModule::PublishCode[Locked]`) ever fills that table: no JS/TurboFan path does.  And
@@ -235,7 +247,7 @@ static uint32_t v8_snapshot_ranges(uint64_t *lo, uint64_t *hi, uint32_t max,
 
 // ---------------------------------------------------------- code dumping ----
 // The jitdump (`JTR1` records) and the site map are `jitdump.h`, shared with the HotSpot
-// front end (`java/jvmtiagent.cc`); the formats are the design notes sections 4-5.
+// front end (`java/jvmtiagent.cc`).
 static PtjArena g_dump;
 static inline uint64_t rdtscp_now() { return ptj_rdtscp(); }
 static inline void arena_init(size_t cap) { ptj_arena_init(&g_dump, cap); }
@@ -263,13 +275,13 @@ static size_t g_tslab_want = 0;
 // every code object it serves.  Allocate it lazily, hinted just below the first
 // JIT code address we see (V8's code space is one reserved 128MB-ish cage).
 static size_t g_tslab_live = 0;            // bytes of the slab that are RWX
-// Keyframes (defect D-J1) and the same-run ground truth (D-J2): the design notes
+// Keyframes and the same-run ground truth.
 static uint32_t g_keyframe = 1024;         // PTJIT_KEYFRAME: analyzer `"keyframe": K'
-// PTJIT_NOROOTS=1 -- A/B control for the D-J6 patcher fix: ask the analyzer exactly as usual
+// PTJIT_NOROOTS=1 -- ablation of the restart-roots seeding: ask the analyzer exactly as usual
 // but do NOT seed the patcher's own recursive descent with the reply's `restart_roots`.  Every
 // site beyond the first restart then lands on an offset this sweep never decoded and is
-// dropped as `no_insn_boundary', which is precisely the pre-fix behaviour.
-static int g_noroots = 0;   // default ON again since analyzer v2.24 (jit_accuracy.md 9: 80/80 Node runs clean)
+// dropped as `no_insn_boundary'.
+static int g_noroots = 0;   // roots seeded by default
 static uint32_t g_kfctr_max = 16384;       // PTJIT_KFCTR: countdown cells (1 MiB of slab)
 static PtjGtRing g_gt;                     // PTJIT_GT=1: the process's own address log
 static const size_t TSLAB_CHUNK = 1u << 20;
@@ -392,7 +404,7 @@ struct PatchRec {
   uint16_t dlen;
   uint16_t name_len;
   char name[96];
-  // --- diagnostics (jit_runtime.md 6b) ---
+  // --- diagnostics ---
   uint64_t obj_addr;        // the code object this window belongs to
   uint32_t obj_len;
   uint32_t obj_idx;
@@ -456,13 +468,13 @@ static ObjRec *g_objs = nullptr;
 // V8's mark-compact GC *evacuates* InstructionStream objects: the code bytes are
 // memcpy'd to a new page and our position-dependent `jmp rel32` travels with the
 // copy, where it now points `delta` bytes past the trampoline it was written for.
-// That is the SIGSEGV of the design notesb.  V8 does report the move
+// Executing it would fault.  V8 does report the move
 // (JitCodeEvent::CODE_MOVED), so we un-patch the moved copy and re-install the
 // trampolines against the new base.
 struct LiveObj {
   uint64_t addr; uint32_t len;
   PtjSite *sites; int nsites;      // the resolved site list (owned)
-  uint32_t *rroots; int nrroots;   // D-J6: the analyzer's restart roots (owned) -- the
+  uint32_t *rroots; int nrroots;   // The analyzer's restart roots (owned) -- the
                                    // re-install after a move must decode the same boundaries
   uint64_t first_prec; uint32_t n_prec;
   uint8_t dead;
@@ -484,12 +496,12 @@ static void obj_note(uint64_t a, uint32_t l, uint64_t tsc, uint32_t ns, uint32_t
 #define PTJ_MAXSITES 4096
 #define PTJ_MAXROOTS 1024
 static PtjSite g_sitebuf[PTJ_MAXSITES + 1]; // one optional post-cache stack-anchor site
-// D-J6: the analyzer's `restart_roots' for the object being patched.
+// The analyzer's `restart_roots' for the object being patched.
 static uint32_t g_rrootbuf[PTJ_MAXROOTS];
 static uint64_t g_restart_roots = 0, g_restart_objs = 0;
 
 // ---- in-memory cache: masked content hash -> site list ----
-// D-J6: the reply's `restart_roots' are part of the answer -- without them the patcher's own
+// The reply's `restart_roots' are part of the answer -- without them the patcher's own
 // sweep does not reach the boundaries the sites sit on -- so they are cached with the sites.
 struct CacheEnt { char key[65]; PtjSite *sites; int n; uint32_t *rroots; int nrroots; };
 static CacheEnt *g_mem = nullptr;
@@ -511,7 +523,7 @@ static CacheEnt *mem_find(const char *k, int insert) {
   return nullptr;
 }
 
-// ---- cache key: the code bytes with every relocatable field masked (the decisions log D7) ----
+// ---- cache key: the code bytes with every relocatable field masked ----
 static uint8_t *g_maskbuf = nullptr; static size_t g_maskcap = 0;
 static void masked_hash(const uint8_t *code, size_t len, char out[65], uint32_t data_from) {
   if (len > g_maskcap) { g_maskbuf = (uint8_t *)realloc(g_maskbuf, len * 2); g_maskcap = len * 2; }
@@ -539,6 +551,33 @@ static void masked_hash(const uint8_t *code, size_t len, char out[65], uint32_t 
   ptj_sha_update(&sh, &data_from, 4);
   ptj_sha_hex(&sh, out);
 }
+// The same key and the same data_from from ONE linear sweep without operand decoding
+// (the masked fields are raw.imm/raw.disp, which ZydisDecoderDecodeInstruction fills);
+// every decode is kept in `sw' (when non-NULL) for the patcher.  Returns data_from.
+static uint64_t g_keychk_objs = 0, g_keychk_bad = 0;
+static uint32_t masked_hash_fast(const uint8_t *code, size_t len, char out[65], PtjSweep *sw) {
+  if (len > g_maskcap) { g_maskbuf = (uint8_t *)realloc(g_maskbuf, len * 2); g_maskcap = len * 2; }
+  if (sw && !ptj_sweep_begin(sw, code, len)) sw = nullptr;
+  if (!g_maskbuf) { out[0] = 0; return ptj_scan_fused(&g_dec, code, len, nullptr, sw); }
+  memcpy(g_maskbuf, code, len);
+  uint32_t data_from = ptj_scan_fused(&g_dec, code, len, g_maskbuf, sw);
+  PtjSha sh; ptj_sha_init(&sh);
+  uint64_t l = len; ptj_sha_update(&sh, &l, 8);
+  ptj_sha_update(&sh, g_maskbuf, len);
+  ptj_sha_update(&sh, &data_from, 4);
+  ptj_sha_hex(&sh, out);
+  if (g_ptj_deccheck) {                   // PTJIT_DECCHECK=1: the full-decode key, compared
+    uint32_t df2 = ptj_scan_data_from(&g_dec, code, len);
+    char k2[65]; masked_hash(code, len, k2, df2);
+    g_keychk_objs++;
+    if (df2 != data_from || strcmp(k2, out)) {
+      g_keychk_bad++;
+      fprintf(stderr, "PTJIT DECCHECK key MISMATCH addr=%p len=%zu df=%u/%u\n", (void *)code, len, data_from, df2);
+    }
+  }
+  return data_from;
+}
+static int g_fastdec = 2;                 // PTJIT_FASTDEC; 0 = five full decodes
 
 // ---- the PKRU window used while writing to V8's code space ----
 static void wr_open(void) {
@@ -661,8 +700,21 @@ static void on_moved(uint8_t *from, uint8_t *to, size_t len) {
                       (unsigned long long)(uintptr_t)from, (unsigned long long)(uintptr_t)to, len);
 }
 
+static void plan_install(uint8_t *code, size_t len, const char *name, size_t name_len,
+                         PtjSite *sites, int n, uint32_t *rroots, int nrr);
+static int async_enqueue(uint8_t *code, size_t len, const char *key, uint32_t data_from,
+                         const char *name, size_t name_len);
+static int g_async = 0;                    // PTJIT_ASYNC: analyse cache misses off the JS thread
+static pthread_mutex_t g_memlock = PTHREAD_MUTEX_INITIALIZER;   // g_mem: JS thread + analysis worker
+static uint64_t g_js_analysis_ns = 0, g_js_analysis_calls = 0;  // analyzer time ON the JS thread
+
 // Analyze (or recall) one code object and patch every site it yields.
+static void full_patch_body(uint8_t *code, size_t len, const char *name, size_t name_len);
 static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_len) {
+  full_patch_body(code, len, name, name_len);
+  g_cx.data_from_hint = 0; g_ptjsweep.valid = 0;   // the sweep/hint never outlive this object
+}
+static void full_patch_body(uint8_t *code, size_t len, const char *name, size_t name_len) {
   if (!len || (!g_pinbridge && len < 5)) { g_cx.drops[PTJ_DROP_WINDOW_TRUNCATED]++; return; }
   // Pin does not need a five-byte detour or writable application text. Include
   // V8's file-backed builtins as well as dynamically generated code in this mode.
@@ -673,7 +725,7 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
     if (!g_tslab) tslab_init_near((uint64_t)code, g_tslab_want);
     if (!g_tslab) { g_c.patch_skipped_cap++; return; }
     // The keyframe counters and the ground-truth cursor are carved out of the FRONT of the
-    // slab, so `dec CNT(%rip)' and `lock xadd %rcx,CUR(%rip)' reach them with a rel32 (D-J1/D-J2).
+    // slab, so `dec CNT(%rip)' and `lock xadd %rcx,CUR(%rip)' reach them with a rel32.
     if (!g_cx.gt_cur) {
       uint32_t nctr = g_keyframe ? g_kfctr_max : 0;
       size_t db = ptj_slab_data_bytes(nctr);
@@ -690,10 +742,16 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
 
   char key[65];
   uint64_t h0 = ptj_ns();
-  // D-J6: the analyzer needs the same inline-data boundary the patcher uses, and it is part
+  // The analyzer needs the same inline-data boundary the patcher uses, and it is part
   // of the cache key (see masked_hash).
-  uint32_t data_from = ptj_scan_data_from(&g_dec, code, len);
-  masked_hash(code, len, key, data_from);
+  uint32_t data_from;
+  if (g_fastdec) {                        // one no-operand sweep, kept for the patcher
+    data_from = masked_hash_fast(code, len, key, g_pinbridge ? nullptr : &g_ptjsweep);
+    g_cx.data_from_hint = data_from;
+  } else {
+    data_from = ptj_scan_data_from(&g_dec, code, len);
+    masked_hash(code, len, key, data_from);
+  }
   g_hash_ns += ptj_ns() - h0;
 
   if (g_hashdump && key[0])
@@ -701,18 +759,30 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
             (int)(name_len > 90 ? 90 : name_len), name ? name : "");
   PtjSite *sites = g_sitebuf; int n = -1;
   uint32_t *rroots = g_rrootbuf; int nrr = 0;
+  pthread_mutex_lock(&g_memlock);
   CacheEnt *ce = key[0] ? mem_find(key, 0) : nullptr;
+  if (ce && !ce->sites) ce = nullptr;          // slot reserved, never filled
   if (ce) { sites = ce->sites; n = ce->n; rroots = ce->rroots; nrr = ce->nrroots; g_cli.mem_hits++; }
-  else {
+  pthread_mutex_unlock(&g_memlock);
+  if (!ce) {
     if (key[0]) n = ptj_cache_load(&g_cli, key, g_sitebuf, PTJ_MAXSITES, g_rrootbuf, PTJ_MAXROOTS, &nrr);
+    // A miss is analysed on the worker; the object runs unpatched until its plan lands
+    // (installed on this thread from a V8 interrupt, after a staleness check).
+    if (n < 0 && g_have_cli && g_async && key[0]) {   // also under the Pin bridge (PTJIT_PIN_ASYNC=1)
+      async_enqueue(code, len, key, data_from, name, name_len);
+      return;
+    }
     if (n < 0 && g_have_cli) {
       char nm[128]; size_t nl = name_len > 120 ? 120 : name_len;
       if (name && nl) memcpy(nm, name, nl); nl = name ? nl : 0; nm[nl] = 0;
+      uint64_t a0 = ptj_ns();
       n = ptj_analyze(&g_cli, code, len, (uint64_t)code, nm, g_sitebuf, PTJ_MAXSITES,
                       nullptr, 0, nullptr, 0, data_from, g_rrootbuf, PTJ_MAXROOTS, &nrr);
+      g_js_analysis_ns += ptj_ns() - a0; g_js_analysis_calls++;
       if (n >= 0 && key[0]) ptj_cache_store(&g_cli, key, g_sitebuf, n, g_rrootbuf, nrr);
     }
     if (n >= 0 && key[0]) {
+      pthread_mutex_lock(&g_memlock);
       CacheEnt *c2 = mem_find(key, 1);
       if (c2 && !c2->sites) {
         c2->sites = (PtjSite *)malloc(sizeof(PtjSite) * (n ? n : 1));
@@ -720,12 +790,20 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
         c2->rroots = (uint32_t *)malloc(sizeof(uint32_t) * (nrr ? nrr : 1));
         if (c2->rroots) { memcpy(c2->rroots, g_rrootbuf, sizeof(uint32_t) * nrr); c2->nrroots = nrr; }
       }
+      pthread_mutex_unlock(&g_memlock);
     }
   }
   if (n < 0) {
     if (g_pinbridge) { fprintf(stderr, "PTJIT: Pin plan analysis failed\n"); _exit(71); }
     return;
   }
+  plan_install(code, len, name, name_len, sites, n, rroots, nrr);
+}
+
+// The install half of full_patch: a site list (from the cache, a synchronous analysis or an
+// asynchronous job) is placed on the live object.  JS thread only.
+static void plan_install(uint8_t *code, size_t len, const char *name, size_t name_len,
+                         PtjSite *sites, int n, uint32_t *rroots, int nrr) {
   g_restart_roots += (uint64_t)nrr;
   if (nrr) g_restart_objs++;
   g_objs_analyzed++;
@@ -742,7 +820,7 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
     g_pin_objects++; g_pin_sites += (uint64_t)n;
     return; // Pin inserts the logging code; no application bytes are rewritten.
   }
-  // D-J6: seed the patcher's recursive descent with the analyzer's restart roots, so both
+  // Seed the patcher's recursive descent with the analyzer's restart roots, so both
   // sides decode the same instruction boundaries.  They are also treated as forbidden window
   // interiors (`fbd'): a restart root is a place the descent could NOT reach, i.e. a plausible
   // indirect entry (OSR / deopt / exception handler), and a window straddling one would put a
@@ -756,7 +834,7 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
             g_cx.obj, (void *)code, len, n, (int)(name_len > 60 ? 60 : name_len), name ? name : "");
     hexdump(stderr, code, len);
     fprintf(stderr, "\n");
-    // D-J11 diagnosis: the restart roots this object was patched with, as OFFSETS, so a
+    // Diagnosis: the restart roots this object was patched with, as OFFSETS, so a
     // crash dump can be replayed against `static/cfgrec.py' without guessing the base.
     fprintf(stderr, "PTJITROOTS %u addr=%p len=%zu noroots=%d nrr=%d", g_cx.obj,
             (void *)code, len, g_noroots, g_noroots ? 0 : nrr);
@@ -773,6 +851,288 @@ static void full_patch(uint8_t *code, size_t len, const char *name, size_t name_
   obj_note((uint64_t)code, (uint32_t)len, g_cx.tsc, (uint32_t)n, ost.patched);
   live_note((uint64_t)code, (uint32_t)len, g_sitebuf, n, first, g_rrootbuf, nrr);
   g_cx.obj++;
+}
+
+// ======================================================================
+//  Asynchronous analysis (PTJIT_ASYNC=1)
+//  The Node counterpart of the Java agent's queue.  A code object whose masked hash is in
+//  neither cache is SNAPSHOTTED in the JitCodeEvent handler and queued; one worker thread (the
+//  only user of the analyzer socket) analyses it and stores the plan in both caches, then asks
+//  V8 for an interrupt.  The plan is installed on the JS thread from that interrupt callback
+//  (or from drain()): the JS thread is then inside a stack-check call, so every JIT frame on
+//  its stack is stopped at a call's return address, and no window ever contains a call, so no
+//  thread is inside a window being written (V8 runs JS code on this one thread only;
+//  `off_thread' == 0).  The object runs unpatched until then -- exactly the Java behaviour.
+//  Staleness: V8 never reports CODE_REMOVED and reuses addresses, so a job is dropped when a
+//  later CODE_ADDED overlaps it, follows a CODE_MOVED, and before install the LIVE bytes must be
+//  mapped and hash (masked, = Java's stalemask) to the job's key; otherwise it is dropped.
+// ======================================================================
+static int safe_read(const void *src, void *dst, size_t n);
+struct AJob {
+  uint64_t addr; uint32_t len; uint32_t data_from;
+  char key[65]; char name[128];
+  uint8_t *snap;
+  int state;                 // 0 queued, 1 analysing, 2 ready, 3 failed/skipped
+  int stale;                 // 1 overlap, 2 partial move (JS thread sets, under g_qlock)
+  int n, nrr; PtjSite *sites; uint32_t *rroots;
+  uint64_t t_enq, t_ready;
+  AJob *qnext;
+};
+static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_qcv = PTHREAD_COND_INITIALIZER, g_qdone = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_irqlock = PTHREAD_MUTEX_INITIALIZER;  // g_qstop + RequestInterrupt
+static AJob *g_qhead = nullptr, *g_qtail = nullptr;
+static AJob **g_pend = nullptr; static uint32_t g_npend = 0, g_pendcap = 0;   // every job not yet retired
+static int g_qstop = 0, g_worker_up = 0, g_irq_req = 0, g_qbusy = 0;
+static v8::Isolate *g_iso = nullptr;
+// PTJIT_WORKERS=N (default 4; 1 if the socket is not `...sock.0'; fewer if a service is missing): N analysis workers, worker i talking to its own analyzer service
+// (PTJIT_SOCK's trailing `.0' replaced by `.i', the socket naming of jitwp.py/repslice.py).
+// Worker 0 uses g_cli itself so the existing analysis_* counters keep their meaning.
+static const int AJ_MAXW = 8;
+static int g_nworkers = 1;
+static PtjClient *g_wcli[AJ_MAXW];
+static pthread_t g_worker[AJ_MAXW];
+static struct {
+  uint64_t queued, installed, install_same, stale_overlap, stale_moved, stale_hash, stale_unmapped, failed,
+           moved, worker_cache_hits, irq_calls, drain_calls, install_ns, irq_ns,
+           lat_sum_ns, lat_max_ns, pend_max, worker_analysis_ns, worker_calls;
+} g_aj;
+
+static void irq_cb(v8::Isolate *, void *);
+static void *aworker(void *arg) {
+  PtjClient *cli = g_wcli[(intptr_t)arg];
+  PtjSite *sb = (PtjSite *)malloc(sizeof(PtjSite) * (PTJ_MAXSITES + 1));
+  uint32_t *rb = (uint32_t *)malloc(sizeof(uint32_t) * PTJ_MAXROOTS);
+  pthread_mutex_lock(&g_qlock);
+  for (;;) {
+    while (!g_qhead && !g_qstop) pthread_cond_wait(&g_qcv, &g_qlock);
+    if (g_qstop) break;
+    AJob *j = g_qhead; g_qhead = j->qnext; if (!g_qhead) g_qtail = nullptr;
+    j->state = 1; g_qbusy++;
+    int stale = j->stale;
+    pthread_mutex_unlock(&g_qlock);
+    int n = -1, nrr = 0;
+    if (!stale && sb && rb) {
+      pthread_mutex_lock(&g_memlock);                  // an earlier job with the same bytes
+      CacheEnt *ce = mem_find(j->key, 0);
+      if (ce && ce->sites) {
+        n = ce->n; memcpy(sb, ce->sites, sizeof(PtjSite) * n);
+        nrr = ce->nrroots; if (nrr) memcpy(rb, ce->rroots, sizeof(uint32_t) * nrr);
+      }
+      pthread_mutex_unlock(&g_memlock);
+      if (n >= 0) __atomic_fetch_add(&g_aj.worker_cache_hits, 1, __ATOMIC_RELAXED);
+      else {
+        uint64_t a0 = ptj_ns();
+        n = ptj_analyze(cli, j->snap, j->len, j->addr, j->name, sb, PTJ_MAXSITES,
+                        nullptr, 0, nullptr, 0, j->data_from, rb, PTJ_MAXROOTS, &nrr);
+        __atomic_fetch_add(&g_aj.worker_analysis_ns, ptj_ns() - a0, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_aj.worker_calls, 1, __ATOMIC_RELAXED);
+        if (n >= 0) {
+          ptj_cache_store(cli, j->key, sb, n, rb, nrr);
+          pthread_mutex_lock(&g_memlock);
+          CacheEnt *c2 = mem_find(j->key, 1);
+          if (c2 && !c2->sites) {
+            PtjSite *cs = (PtjSite *)malloc(sizeof(PtjSite) * (n ? n : 1));
+            uint32_t *cr = (uint32_t *)malloc(sizeof(uint32_t) * (nrr ? nrr : 1));
+            if (cs && cr) {
+              memcpy(cs, sb, sizeof(PtjSite) * n); if (nrr) memcpy(cr, rb, sizeof(uint32_t) * nrr);
+              c2->n = n; c2->rroots = cr; c2->nrroots = nrr; c2->sites = cs;
+            } else { free(cs); free(cr); }
+          }
+          pthread_mutex_unlock(&g_memlock);
+        }
+      }
+    }
+    PtjSite *js = nullptr; uint32_t *jr = nullptr;
+    if (n >= 0) {
+      js = (PtjSite *)malloc(sizeof(PtjSite) * (n + 1));
+      jr = (uint32_t *)malloc(sizeof(uint32_t) * (nrr ? nrr : 1));
+      if (js && jr) { memcpy(js, sb, sizeof(PtjSite) * n); if (nrr) memcpy(jr, rb, sizeof(uint32_t) * nrr); }
+      else { free(js); free(jr); js = nullptr; jr = nullptr; n = -1; }
+    }
+    pthread_mutex_lock(&g_qlock);
+    j->sites = js; j->rroots = jr; j->n = n; j->nrr = nrr;
+    // The snapshot is kept until retirement: install_job compares the live bytes with it
+    j->state = n >= 0 ? 2 : 3; j->t_ready = ptj_ns(); g_qbusy--;
+    pthread_cond_broadcast(&g_qdone);
+    int want_irq = !g_irq_req; g_irq_req = 1;
+    pthread_mutex_unlock(&g_qlock);
+    if (want_irq) {
+      pthread_mutex_lock(&g_irqlock);        // not while holding g_qlock (V8 takes its own lock)
+      if (!g_qstop && g_iso) g_iso->RequestInterrupt(irq_cb, nullptr);
+      pthread_mutex_unlock(&g_irqlock);
+    }
+    pthread_mutex_lock(&g_qlock);
+  }
+  pthread_mutex_unlock(&g_qlock);
+  return nullptr;
+}
+
+static int async_enqueue(uint8_t *code, size_t len, const char *key, uint32_t data_from,
+                         const char *name, size_t name_len) {
+  AJob *j = (AJob *)calloc(1, sizeof(AJob));
+  if (!j) return -1;
+  j->snap = (uint8_t *)malloc(len);
+  if (!j->snap) { free(j); return -1; }
+  memcpy(j->snap, code, len);
+  j->addr = (uint64_t)code; j->len = (uint32_t)len; j->data_from = data_from;
+  memcpy(j->key, key, 65);
+  size_t nl = name_len > 120 ? 120 : name_len; if (name && nl) memcpy(j->name, name, nl);
+  j->name[name ? nl : 0] = 0;
+  j->t_enq = ptj_ns();
+  pthread_mutex_lock(&g_qlock);
+  if (g_npend == g_pendcap) {
+    uint32_t nc = g_pendcap ? g_pendcap * 2 : 1024;
+    AJob **np = (AJob **)realloc(g_pend, sizeof(AJob *) * nc);
+    if (!np) { pthread_mutex_unlock(&g_qlock); free(j->snap); free(j); return -1; }
+    g_pend = np; g_pendcap = nc;
+  }
+  g_pend[g_npend++] = j;
+  if (g_npend > g_aj.pend_max) g_aj.pend_max = g_npend;
+  if (g_qtail) g_qtail->qnext = j; else g_qhead = j;
+  g_qtail = j;
+  g_aj.queued++;
+  pthread_cond_signal(&g_qcv);
+  pthread_mutex_unlock(&g_qlock);
+  return 0;
+}
+
+// JS thread, from the JitCodeEvent handler: a new object at [lo,hi) retires every pending job
+// it overlaps (V8 reused the address of a dead object).
+static void async_note_added(uint64_t lo, uint64_t hi) {
+  if (!g_npend) return;
+  pthread_mutex_lock(&g_qlock);
+  for (uint32_t i = 0; i < g_npend; i++) {
+    AJob *j = g_pend[i];
+    if (!j->stale && lo < j->addr + j->len && hi > j->addr) j->stale = 1;
+  }
+  pthread_mutex_unlock(&g_qlock);
+}
+// JS thread, CODE_MOVED (inside the GC pause): follow the object.
+static void async_note_moved(uint64_t from, uint64_t to, uint64_t len) {
+  if (!g_npend || from == to) return;
+  pthread_mutex_lock(&g_qlock);
+  for (uint32_t i = 0; i < g_npend; i++) {
+    AJob *j = g_pend[i];
+    if (j->stale || !(from < j->addr + j->len && from + len > j->addr)) continue;
+    if (j->addr == from && j->len == len) { j->addr = to; g_aj.moved++; }
+    else j->stale = 2;
+  }
+  pthread_mutex_unlock(&g_qlock);
+}
+
+static void install_job(AJob *j) {
+  uint8_t *live = (uint8_t *)malloc(j->len);
+  if (!live) { g_aj.failed++; return; }
+  if (!safe_read((const void *)j->addr, live, j->len)) { g_aj.stale_unmapped++; free(live); return; }
+  uint32_t df;
+  if (g_fastdec && j->snap && !memcmp(live, j->snap, j->len) && !g_ptj_deccheck) {
+    df = j->data_from;                    // byte-identical to the hashed snapshot -> same key
+    g_aj.install_same++;
+  } else {
+    char k[65];
+    if (g_fastdec) df = masked_hash_fast(live, j->len, k, nullptr);
+    else { df = ptj_scan_data_from(&g_dec, live, j->len); masked_hash(live, j->len, k, df); }
+    if (!k[0] || strcmp(k, j->key)) { free(live); g_aj.stale_hash++; return; }
+  }
+  free(live);
+  if (!g_pinbridge) {                    // Pin needs no slab; plan_install publishes to Pin
+    if (!g_tslab) return;
+    live_supersede(j->addr, j->addr + j->len);
+  }
+  uint64_t lat = ptj_ns() - j->t_enq;
+  g_aj.lat_sum_ns += lat; if (lat > g_aj.lat_max_ns) g_aj.lat_max_ns = lat;
+  memcpy(g_sitebuf, j->sites, sizeof(PtjSite) * j->n);
+  if (j->nrr) memcpy(g_rrootbuf, j->rroots, sizeof(uint32_t) * j->nrr);
+  if (g_fastdec) g_cx.data_from_hint = df;   // computed on these bytes
+  plan_install((uint8_t *)j->addr, j->len, j->name, strlen(j->name), g_sitebuf, j->n,
+               g_rrootbuf, j->nrr);
+  g_cx.data_from_hint = 0; g_ptjsweep.valid = 0;
+  g_aj.installed++;
+}
+
+// JS thread only: retire every job that is no longer queued or being analysed.
+static void install_ready(void) {
+  if (!g_npend) return;
+  uint64_t t0 = ptj_ns();
+  AJob *batch[256]; uint32_t nb;
+  do {
+    nb = 0;
+    pthread_mutex_lock(&g_qlock);
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < g_npend; i++) {
+      AJob *j = g_pend[i];
+      if (j->state >= 2 && nb < 256) batch[nb++] = j; else g_pend[w++] = j;
+    }
+    g_npend = w;
+    pthread_mutex_unlock(&g_qlock);
+    for (uint32_t i = 0; i < nb; i++) {
+      AJob *j = batch[i];
+      if (j->stale == 1) g_aj.stale_overlap++;
+      else if (j->stale == 2) g_aj.stale_moved++;
+      else if (j->state == 3) g_aj.failed++;
+      else install_job(j);
+      free(j->sites); free(j->rroots); free(j->snap); free(j);
+    }
+  } while (nb == 256);
+  g_aj.install_ns += ptj_ns() - t0;
+}
+
+static void irq_cb(v8::Isolate *, void *) {
+  uint64_t t0 = ptj_ns();
+  pthread_mutex_lock(&g_qlock); g_irq_req = 0; pthread_mutex_unlock(&g_qlock);
+  g_aj.irq_calls++;
+  install_ready();
+  g_aj.irq_ns += ptj_ns() - t0;
+}
+
+static void async_start(void) {
+  if (g_worker_up) return;
+  g_iso = v8::Isolate::GetCurrent();
+  const char *nw = getenv("PTJIT_WORKERS");
+  g_nworkers = nw ? atoi(nw) : 4;         // needs services ...sock.0..3 (jitwp/repslice start them)
+  if (g_nworkers < 1) g_nworkers = 1;
+  if (g_nworkers > AJ_MAXW) g_nworkers = AJ_MAXW;
+  g_wcli[0] = &g_cli;
+  size_t sl = strlen(g_cli.sock);
+  int numbered = sl > 2 && !strcmp(g_cli.sock + sl - 2, ".0");
+  // A self-spawned or un-numbered service is ONE `analyze.py --serve', which serves one client at a
+  // time: a second connection would wait forever behind the first, so use one worker.
+  if (!numbered) g_nworkers = 1;
+  for (int i = 1; i < g_nworkers; i++) {
+    PtjClient *c = (PtjClient *)calloc(1, sizeof(PtjClient));
+    if (!c) { g_nworkers = i; break; }
+    memcpy(c->sock, g_cli.sock, sizeof c->sock); memcpy(c->cache, g_cli.cache, sizeof c->cache);
+    memcpy(c->py, g_cli.py, sizeof c->py); memcpy(c->script, g_cli.script, sizeof c->script);
+    memcpy(c->ver, g_cli.ver, sizeof c->ver); c->fast = g_cli.fast; c->kf = g_cli.kf;
+    if (numbered) snprintf(c->sock + sl - 1, sizeof(c->sock) - (sl - 1), "%d", i);
+    c->fd = ptj_connect(c);
+    if (c->fd < 0) {
+      fprintf(stderr, "PTJIT async: worker %d cannot reach %s -- %d worker(s)\n", i, c->sock, i);
+      free(c); g_nworkers = i; break;
+    }
+    g_wcli[i] = c;
+  }
+  int up = 0;
+  for (int i = 0; i < g_nworkers; i++)
+    if (pthread_create(&g_worker[i], nullptr, aworker, (void *)(intptr_t)i) == 0) up++;
+  if (up) { g_worker_up = up; g_nworkers = up; }
+  else { fprintf(stderr, "PTJIT async: cannot start the analysis worker -- synchronous\n"); g_async = 0; }
+}
+static void async_stop(void) {
+  pthread_mutex_lock(&g_irqlock);
+  pthread_mutex_lock(&g_qlock); g_qstop = 1; pthread_cond_broadcast(&g_qcv); pthread_mutex_unlock(&g_qlock);
+  pthread_mutex_unlock(&g_irqlock);
+}
+static void async_counts(uint64_t *queued, uint64_t *busy, uint64_t *ready) {
+  uint64_t q = 0, b = 0, r = 0;
+  pthread_mutex_lock(&g_qlock);
+  for (uint32_t i = 0; i < g_npend; i++) {
+    int s = g_pend[i]->state;
+    if (s == 0) q++; else if (s == 1) b++; else r++;
+  }
+  pthread_mutex_unlock(&g_qlock);
+  *queued = q; *busy = b; *ready = r;
 }
 
 // Entry-only instrumentation through the same emitter (mode 3): one synthetic
@@ -806,7 +1166,7 @@ static void entry_patch(uint8_t *code, size_t len, const char *name, size_t name
   g_cx.obj++;
 }
 
-// PTJIT_WASM_PROBE=1 -- the NEGATIVE CONTROL for the design notes
+// PTJIT_WASM_PROBE=1 -- a negative control for the wasm trap-table checks.
 // Deliberately displace an instruction V8 registered with its wasm trap handler: one
 // synthetic `reg' site at the object's FIRST protected-instruction offset, so the window
 // relocates exactly that instruction into the slab.  The next time it faults by design (a
@@ -834,8 +1194,8 @@ static void wasm_probe_patch(uint8_t *code, size_t len) {
   }
   if (off + 5 > len) return;
   // wasm code lives in its own code space, far from V8's JS code range, so the run's
-  // trampoline slab is not within the +-2 GB a `jmp rel32' reaches (the probe's first
-  // finding: `out_of_range').  Give the probe its own slab next to the wasm code.
+  // trampoline slab is not within the +-2 GB a `jmp rel32' reaches (it would
+  // report `out_of_range').  Give the probe its own slab next to the wasm code.
   static uint8_t *pslab = nullptr; static size_t pslab_cap = 0, pslab_used = 0;
   if (!pslab) {
     for (int64_t o = 1 << 20; o < (int64_t)1 << 31 && !pslab; o <<= 1) {
@@ -879,7 +1239,7 @@ static void wasm_probe_patch(uint8_t *code, size_t len) {
 }
 
 // ======================================================================
-//  Crash diagnostics the design notesb)
+//  Crash diagnostics
 //  A SIGSEGV/SIGBUS/SIGILL handler that classifies the faulting IP against the
 //  slab, the trampolines and the patched code objects, plus a patch verifier
 //  that says *what* overwrote a patch (V8 restored the original bytes / wrote
@@ -1031,7 +1391,7 @@ static void install_at(uint8_t *code, size_t len, PtjSite *sites, int n,
                        const uint32_t *rroots, int nrr) {
   if (!g_tslab) return;
   g_cx.slab = g_tslab; g_cx.slab_cap = g_tslab_cap; g_cx.slab_used = &g_tslab_used;
-  // D-J6: the moved copy must be swept with the same restart roots, or the sites beyond the
+  // The moved copy must be swept with the same restart roots, or the sites beyond the
   // first restart land on offsets this sweep never decoded and are dropped.
   g_cx.roots = (!g_noroots && rroots && nrr > 0) ? rroots : nullptr;
   g_cx.nroots = (uint32_t)(!g_noroots && nrr > 0 ? nrr : 0);
@@ -1050,6 +1410,25 @@ static void install_at(uint8_t *code, size_t len, PtjSite *sites, int n,
 }
 
 // ------------------------------------------------------------- handler ------
+// 1 if a linear decode from the object's first byte reaches an undecodable byte before any
+// unconditional control transfer that ends straight-line code (jmp/ret/ud2/hlt); 0 otherwise
+// (a terminator first, or the whole object decodes).  Mirrors the Java agent's stub rule.
+static int obj_looks_like_data(const uint8_t *code, size_t len) {
+  for (size_t o = 0; o < len; ) {
+    ZydisDecodedInstruction pi;
+    ZydisDecodedOperand po[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&g_dec, code + o, len - o, &pi, po,
+                                             ZYDIS_MAX_OPERAND_COUNT, 0))) return 1;
+    switch (pi.mnemonic) {
+      case ZYDIS_MNEMONIC_JMP: case ZYDIS_MNEMONIC_RET: case ZYDIS_MNEMONIC_UD2:
+      case ZYDIS_MNEMONIC_HLT: return 0;
+      default: break;
+    }
+    o += pi.length;
+  }
+  return 0;
+}
+
 static void handler(const v8::JitCodeEvent *e) {
   uint64_t t0 = 0;
   if (g_mode >= MODE_PATCH) t0 = ptj_ns();
@@ -1070,7 +1449,7 @@ static void handler(const v8::JitCodeEvent *e) {
         arena_record(0, (uint8_t)e->code_type, e->code_start, nullptr,
                      e->code_len, e->name.str, e->name.len, 1);
       if (g_mode >= MODE_PATCH) {
-        // ---- the two pc-identity gates the design notes ----------------
+        // ---- the two pc-identity gates ----------------
         // (1) code_type: V8 reports wasm as WASM_CODE and only wasm code contains
         //     instructions that fault BY DESIGN (trap_handler protected loads/stores and
         //     WasmGC null checks).  Never patch it.  (2) belt and braces, and forward proof
@@ -1078,6 +1457,7 @@ static void handler(const v8::JitCodeEvent *e) {
         //     that is registered in `trap_handler::gCodeObjects`.
         int is_jit = (e->code_type == v8::JitCodeEvent::JIT_CODE);
         int is_wasm = (e->code_type == v8::JitCodeEvent::WASM_CODE);
+        if (g_async) async_note_added((uint64_t)e->code_start, (uint64_t)e->code_start + e->code_len);
         if (is_wasm) {
           wasm_range_note((uint64_t)e->code_start, (uint64_t)e->code_start + e->code_len);
           uint64_t live = 0, ins = 0; uint64_t rl[1], rh[1];
@@ -1094,6 +1474,13 @@ static void handler(const v8::JitCodeEvent *e) {
                    v8_in_wasm_code((uint64_t)e->code_start)) {
           gated = 1;
           g_c.patch_skipped_wasm_range++;
+        }
+        if (!gated && is_jit && data_gate_mode() > 0) {
+          g_c.obj_data_gate_checked++;
+          if (obj_looks_like_data((const uint8_t *)e->code_start, e->code_len)) {
+            g_c.obj_data_skips++;
+            if (data_gate_mode() >= 2) gated = 1;
+          }
         }
         if (!gated) {
           note_range((uint64_t)e->code_start,
@@ -1117,10 +1504,14 @@ static void handler(const v8::JitCodeEvent *e) {
       // V8 evacuated the code object: our position-dependent detour travelled with
       // the copy.  Repair it before anything can execute the new address.
       if (g_mode >= MODE_PATCH && e->code_type == v8::JitCodeEvent::JIT_CODE) {
-        if (g_pinbridge)
+        if (g_pinbridge) {
+          if (g_async) async_note_moved((uint64_t)e->code_start, (uint64_t)e->new_code_start, e->code_len);
           pin_publish(PT_PIN_MOVE, (uint8_t *)e->code_start, e->code_len,
                       nullptr, 0, (uint8_t *)e->new_code_start);
-        else on_moved((uint8_t *)e->code_start, (uint8_t *)e->new_code_start, e->code_len);
+        } else {
+          if (g_async) async_note_moved((uint64_t)e->code_start, (uint64_t)e->new_code_start, e->code_len);
+          on_moved((uint8_t *)e->code_start, (uint8_t *)e->new_code_start, e->code_len);
+        }
       }
       break;
     case v8::JitCodeEvent::CODE_REMOVED:
@@ -1156,7 +1547,7 @@ static void handler(const v8::JitCodeEvent *e) {
 #define NAPI_CALL(env, call) do { if ((call) != napi_ok) return nullptr; } while (0)
 
 static napi_value Enable(napi_env env, napi_callback_info info) {
-  v8_trap_syms();                 // the design notes: V8's wasm protected-insn table
+  v8_trap_syms();                 // V8's wasm protected-insn table
   size_t argc = 9;
   napi_value argv[9];
   napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
@@ -1228,6 +1619,9 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
     // --- analyzer service, cache and patch context (modes 3 and 4) ---
     memset(&g_cx, 0, sizeof(g_cx));
     g_cx.dec = &g_dec;
+    g_fastdec = getenv("PTJIT_FASTDEC") ? atoi(getenv("PTJIT_FASTDEC")) : 2;   // 1 = decode once, 2 = + lazy operands
+    g_cx.fastdec = g_fastdec;
+    g_ptj_deccheck = getenv("PTJIT_DECCHECK") ? atoi(getenv("PTJIT_DECCHECK")) : 0;
     g_cx.use_ptwrite = g_use_ptwrite;
     const char *sp = getenv("PTJIT_SPACE");
     g_space = sp ? (uint32_t)atoi(sp) : 3;
@@ -1235,7 +1629,7 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
     const char *spk = getenv("PTJIT_SPARKPLUG");
     g_cx.sparkplug = spk ? atoi(spk) : 1;
     g_cx.single = getenv("PTJIT_SINGLE") ? atoi(getenv("PTJIT_SINGLE")) : 0;
-    // ---- BUFFER SINK the design notes ---------------------------------
+    // ---- BUFFER SINK ---------------------------------
     // `PTJIT_SINK=buffer': a logged value is STORED into this thread's %gs ring instead of
     // being PTWRITEd.  The ring, its guard-page fault handler, the cv files and the sync
     // markers are `runtime/rt/ptlogrt.c' -- the same runtime the E9Patch buffer sink uses --
@@ -1255,6 +1649,14 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
         g_cx.sink_buffer = 1;
         const char *sy = getenv("PTLOG_SYNC");   // MUST equal the runtime's own period
         g_cx.sync = sy ? (uint32_t)strtoul(sy, nullptr, 0) : 4096u;
+        const char *sc = getenv("PTLOG_SYNC_CARRIER");   // `tnt': no PTWRITE (rewrite.py --sync-carrier)
+        g_cx.sync_tnt = (sc && !strcmp(sc, "tnt")) ? 1 : 0;
+        if (g_cx.sync_tnt) {
+          g_cx.maxtnts = 3u << 21;
+          g_cx.tnts = (PtjTntMark *)mmap(nullptr, (size_t)g_cx.maxtnts * sizeof(PtjTntMark),
+              PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+          if (g_cx.tnts == MAP_FAILED) { g_cx.tnts = nullptr; g_cx.maxtnts = 0; }
+        }
         g_cx.maxsyncs = 1u << 21;
         g_cx.syncs = (PtjSyncMark *)mmap(nullptr, (size_t)g_cx.maxsyncs * sizeof(PtjSyncMark),
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -1263,19 +1665,16 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
         fprintf(stderr, "PTJIT: unknown PTJIT_SINK=%s (want `ptwrite' or `buffer')\n", sk);
         _exit(71);
       } }
-    // ---- keyframes (defect D-J1, the design notes -------------------------
+    // ---- keyframes -------------------------
     // V8 tiers a function up WHILE it is running and enters the new code object by OSR at a
     // loop header, so the object's one frame anchor (a `reg' site at its first byte) never
     // executes and 79-91 % of its records had an unknown address.  `PTJIT_KEYFRAME=K' asks
     // the analyzer for `resync' sites at the outermost loop back-edge headers, logged every
-    // K-th execution.  0 turns them off (the A/B control).
-    // Roots were temporarily disabled for v2.23's out-of-phase restart defect.
-    // Since v2.24, phase-anchored restart recovery is validated and the default
-    // is restored to NOROOTS=0 (jit_accuracy.md section 9). NOROOTS=1 remains
-    // an explicit ablation, not an assertion of greater correctness.
+    // K-th execution.  0 turns them off.
+    // NOROOTS=0 (default) seeds the restart roots; NOROOTS=1 is an explicit ablation.
     { const char *nr = getenv("PTJIT_NOROOTS"); g_noroots = nr ? atoi(nr) : 0; }
-    // ---- pc identity the design notes ---------------------------------
-    // The A/B knobs for the V8 half of D-J13.  Both default OFF: a measurement run never
+    // ---- pc identity ---------------------------------
+    // The knobs for implicit-exception translation.  Both default OFF: a measurement run never
     // patches wasm code, and the audit below proves it did not.
     g_patch_wasm = getenv("PTJIT_PATCH_WASM") ? atoi(getenv("PTJIT_PATCH_WASM")) : 0;
     g_wasm_probe = getenv("PTJIT_WASM_PROBE") ? atoi(getenv("PTJIT_WASM_PROBE")) : 0;
@@ -1283,8 +1682,17 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
       g_keyframe = kf ? (uint32_t)strtoul(kf, nullptr, 0) : 1024;
       const char *kc = getenv("PTJIT_KFCTR");
       if (kc) g_kfctr_max = (uint32_t)strtoul(kc, nullptr, 0);
-      g_cx.kf_flags_live = getenv("PTJIT_KF_FLAGS_LIVE") ? atoi(getenv("PTJIT_KF_FLAGS_LIVE")) : 0; }
-    // ---- same-run ground truth (defect D-J2) -----------------------------------------
+      g_cx.kf_flags_live = getenv("PTJIT_KF_FLAGS_LIVE") ? atoi(getenv("PTJIT_KF_FLAGS_LIVE")) : 0;
+      // The engine-neutral placement rules shared with the Java front end.
+      // `slide' starts a failed window up to 4 instructions earlier, `shift' moves a reg/before
+      // site forward past instructions that write none of its registers, `kfflagsave' wraps a
+      // live-EFLAGS keyframe guard in pushfq/popfq.  None displaces an instruction the V8 rules
+      // refuse (imm32 = V8 RelocInfo, calls, CODE_TARGET branches); pcsoft/uep/immrule/vmentries
+      // are HotSpot-specific and have no V8 counterpart.  Default on; =0 disables.
+      g_cx.slide = getenv("PTJIT_SLIDE") ? atoi(getenv("PTJIT_SLIDE")) : 1;
+      g_cx.shift = getenv("PTJIT_SHIFT") ? atoi(getenv("PTJIT_SHIFT")) : 1;
+      g_cx.kf_flags_save = getenv("PTJIT_KF_FLAGS_SAVE") ? atoi(getenv("PTJIT_KF_FLAGS_SAVE")) : 1; }
+    // ---- same-run ground truth -----------------------------------------
     if (getenv("PTJIT_GT") && atoi(getenv("PTJIT_GT"))) {
       size_t mb = getenv("PTJIT_GT_MB") ? (size_t)strtoul(getenv("PTJIT_GT_MB"), nullptr, 0) : 4096;
       const char *dir = getenv("PTJIT_GT_DIR");
@@ -1349,6 +1757,12 @@ static napi_value Enable(napi_env env, napi_callback_info info) {
       g_cli.fd = ptj_connect(&g_cli);
     }
     g_have_cli = (g_cli.fd >= 0);
+    // Asynchronous analysis (the Java queue design, one worker = the only socket user).
+    // Default on; PTJIT_ASYNC=0 analyses inside the JIT event.
+    { const char *as = getenv("PTJIT_ASYNC"); g_async = as ? atoi(as) : 1; }
+    { const char *pa = getenv("PTJIT_PIN_ASYNC");     // async analysis under the Pin bridge (Node HiFi)
+      if (g_async && ((g_pinbridge && !(pa && !strcmp(pa, "1"))) || !g_have_cli)) g_async = 0; }
+    if (g_async) async_start();
     g_mem = (CacheEnt *)mmap(nullptr, (size_t)MEMCAP * sizeof(CacheEnt),
         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (g_mem == MAP_FAILED) g_mem = nullptr;
@@ -1392,10 +1806,10 @@ static napi_value Flush(napi_env env, napi_callback_info info) {
   napi_value v; napi_create_double(env, (double)(val), &v); \
   napi_set_named_property(env, obj, name, v); } while (0)
 
-// The standing audit the design notes: NOTHING we displaced may be inside a
+// The standing audit: NOTHING we displaced may be inside a
 // code object V8 registered with its wasm trap handler, and nothing may be ON one of its
 // protected instructions.  `relocs[].orig_addr` is every instruction we moved out of guest
-// code, so this is the exact question D-J13 asks, asked of the live V8 table.
+// code, so this is the exact question implicit-exception translation asks, asked of the live V8 table.
 static void wasm_prot_audit(void) {
   if (!g_v8_syms) return;
   static uint64_t lo[PTJ_WASMRNG_MAX], hi[PTJ_WASMRNG_MAX];
@@ -1435,6 +1849,9 @@ static napi_value Stats(napi_env env, napi_callback_info info) {
   SETNUM("handler_ns", g_c.handler_ns);
   SETNUM("off_thread", g_c.off_thread);
   SETNUM("patched", g_c.patched);
+  SETNUM("obj_data_skips", g_c.obj_data_skips);
+  SETNUM("obj_data_gate_checked", g_c.obj_data_gate_checked);
+  SETNUM("data_gate_mode", data_gate_mode());
   SETNUM("nprec", g_nprec);
   SETNUM("readd", g_readd);
   SETNUM("nseen", g_nseen);
@@ -1443,7 +1860,7 @@ static napi_value Stats(napi_env env, napi_callback_info info) {
   SETNUM("patch_skipped_ro", g_c.patch_skipped_ro);
   SETNUM("patch_skipped_range", g_c.patch_skipped_range);
   SETNUM("patch_skipped_type", g_c.patch_skipped_type);
-  // pc identity the design notes: the two gates and the standing audit.
+  // pc identity: the two gates and the standing audit.
   SETNUM("patch_skipped_bytecode", g_c.patch_skipped_bytecode);
   SETNUM("patch_skipped_wasm", g_c.patch_skipped_wasm);
   SETNUM("patch_skipped_wasm_range", g_c.patch_skipped_wasm_range);
@@ -1469,15 +1886,18 @@ static napi_value Stats(napi_env env, napi_callback_info info) {
   SETNUM("kf_counters", g_cx.kfctr_used);
   SETNUM("kf_dropped_flags_live", g_cx.drops[PTJ_DROP_KF_FLAGS]);
   SETNUM("kf_dropped_no_counter", g_cx.drops[PTJ_DROP_KF_NOCTR]);
+  SETNUM("slide", g_cx.slide); SETNUM("shift", g_cx.shift); SETNUM("kf_flags_save", g_cx.kf_flags_save);
+  SETNUM("slid", g_cx.slid); SETNUM("shifted", g_cx.shifted); SETNUM("kf_flags_saved", g_cx.kf_flags_saved);
   SETNUM("gt_sites", g_cx.ngtents);
-  // BUFFER SINK the design notes
+  // BUFFER SINK
   SETNUM("sink_buffer", (uint64_t)g_cx.sink_buffer);
   SETNUM("buf_sync", g_cx.sync);
   SETNUM("buf_sites", g_cx.buf_sites);
   SETNUM("buf_sites_flags_live", g_cx.buf_sites_flags_live);
   SETNUM("buf_values", g_cx.buf_values);
+  SETNUM("wide_memop_sites", g_cx.wide_memop_sites);   // > 8-byte memop sites (logged as 8 bytes)
   SETNUM("buf_markers", g_cx.nsyncs);
-  SETNUM("restart_roots", g_restart_roots);      // D-J6: analyzer restart roots seeded into the sweep
+  SETNUM("restart_roots", g_restart_roots);      // Analyzer restart roots seeded into the sweep
   SETNUM("restart_objs", g_restart_objs);
   SETNUM("gt_refused", g_cx.gt_refused);
   SETNUM("gt_records", g_gt.base ? (ptj_gt_used(&g_gt) - 32) / 16 : 0);
@@ -1488,10 +1908,18 @@ static napi_value Stats(napi_env env, napi_callback_info info) {
   SETNUM("tslab_used", g_tslab_used);
   SETNUM("tslab_base", (uint64_t)g_tslab);
   SETNUM("pause_ns", g_pause_ns);
-  SETNUM("analysis_ns", g_cli.call_ns);
-  SETNUM("analysis_calls", g_cli.calls);
-  SETNUM("analysis_errors", g_cli.errors);
+  { uint64_t cn = g_cli.call_ns, cc = g_cli.calls, ce = g_cli.errors;   // + workers 1..N-1
+    for (int i = 1; i < g_nworkers && g_worker_up; i++)
+      if (g_wcli[i]) { cn += g_wcli[i]->call_ns; cc += g_wcli[i]->calls; ce += g_wcli[i]->errors; }
+    SETNUM("analysis_ns", cn);
+    SETNUM("analysis_calls", cc);
+    SETNUM("analysis_errors", ce); }
+  SETNUM("aj_workers", g_async ? g_nworkers : 0);
   SETNUM("hash_ns", g_hash_ns);
+  SETNUM("fastdec", g_fastdec);
+  SETNUM("deccheck_key_objs", g_keychk_objs); SETNUM("deccheck_key_bad", g_keychk_bad);
+  SETNUM("deccheck_dec_objs", g_ptj_deccheck_objs); SETNUM("deccheck_dec_bad", g_ptj_deccheck_bad);
+  SETNUM("aj_install_same", g_aj.install_same);
   SETNUM("patch_ns", g_patch_ns);
   SETNUM("cache_mem_hits", g_cli.mem_hits);
   SETNUM("cache_disk_hits", g_cli.disk_hits);
@@ -1535,6 +1963,20 @@ static napi_value Stats(napi_env env, napi_callback_info info) {
     }
     napi_set_named_property(env, obj, "analysis_ms", la);
   }
+  { uint64_t q = 0, b = 0, r = 0; async_counts(&q, &b, &r);
+    SETNUM("async", g_async);
+    SETNUM("aj_pending", q + b + r); SETNUM("aj_queued_now", q); SETNUM("aj_busy_now", b); SETNUM("aj_ready_now", r);
+    SETNUM("aj_queued", g_aj.queued); SETNUM("aj_installed", g_aj.installed);
+    SETNUM("aj_stale_overlap", g_aj.stale_overlap); SETNUM("aj_stale_moved", g_aj.stale_moved);
+    SETNUM("aj_stale_hash", g_aj.stale_hash); SETNUM("aj_stale_unmapped", g_aj.stale_unmapped);
+    SETNUM("aj_failed", g_aj.failed); SETNUM("aj_moved", g_aj.moved);
+    SETNUM("aj_worker_cache_hits", g_aj.worker_cache_hits); SETNUM("aj_worker_calls", g_aj.worker_calls);
+    SETNUM("aj_worker_analysis_ns", g_aj.worker_analysis_ns);
+    SETNUM("aj_irq_calls", g_aj.irq_calls); SETNUM("aj_drain_calls", g_aj.drain_calls);
+    SETNUM("aj_install_ns", g_aj.install_ns); SETNUM("aj_irq_ns", g_aj.irq_ns);
+    SETNUM("aj_lat_mean_ms", g_aj.installed ? (double)g_aj.lat_sum_ns / g_aj.installed / 1e6 : 0);
+    SETNUM("aj_lat_max_ms", (double)g_aj.lat_max_ns / 1e6); SETNUM("aj_pend_max", g_aj.pend_max);
+    SETNUM("js_analysis_ns", g_js_analysis_ns); SETNUM("js_analysis_calls", g_js_analysis_calls); }
   SETNUM("have_pkru", g_have_pkru);
   SETNUM("saved_pkru", g_saved_pkru);
   return obj;
@@ -1631,6 +2073,34 @@ static napi_value Sitemap(napi_env env, napi_callback_info info) {
   napi_value r; napi_create_int64(env, written, &r); return r;
 }
 
+// drain(timeout_ms) -- wait (JS thread) until no job is queued or being analysed, then
+// install every finished plan.  Returns the jobs still pending.  NOT used inside a timed window.
+static napi_value Drain(napi_env env, napi_callback_info info) {
+  size_t argc = 1; napi_value argv[1]; int64_t to = 60000;
+  napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr);
+  if (argc > 0) napi_get_value_int64(env, argv[0], &to);
+  g_aj.drain_calls++;
+  if (g_async) {
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += to / 1000; dl.tv_nsec += (to % 1000) * 1000000;
+    if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    pthread_mutex_lock(&g_qlock);
+    for (;;) {
+      int busy = g_qbusy || g_qhead;
+      if (!busy) break;
+      if (pthread_cond_timedwait(&g_qdone, &g_qlock, &dl)) break;
+    }
+    pthread_mutex_unlock(&g_qlock);
+    install_ready();
+  }
+  uint64_t q = 0, b = 0, r = 0; async_counts(&q, &b, &r);
+  napi_value v; napi_create_double(env, (double)(q + b + r), &v); return v;
+}
+static napi_value Stop(napi_env env, napi_callback_info info) {
+  if (g_worker_up) async_stop();
+  napi_value r; napi_get_undefined(env, &r); return r;
+}
+
 static napi_value Init(napi_env env, napi_value exports) {
   napi_value fn;
   napi_create_function(env, nullptr, 0, Enable, nullptr, &fn);
@@ -1649,6 +2119,10 @@ static napi_value Init(napi_env env, napi_value exports) {
   napi_set_named_property(env, exports, "ptwrite", fn);
   napi_create_function(env, nullptr, 0, Sitemap, nullptr, &fn);
   napi_set_named_property(env, exports, "sitemap", fn);
+  napi_create_function(env, nullptr, 0, Drain, nullptr, &fn);
+  napi_set_named_property(env, exports, "drain", fn);
+  napi_create_function(env, nullptr, 0, Stop, nullptr, &fn);
+  napi_set_named_property(env, exports, "stop", fn);
   return exports;
 }
 

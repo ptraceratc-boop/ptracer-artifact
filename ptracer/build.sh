@@ -25,6 +25,14 @@ export E9PATCH_DIR ZYDIS_DIR JDK_HOME NODE_INCLUDE PYBIN
 say() { printf '\n=== %s ===\n' "$*"; }
 have() { [ -e "$1" ]; }
 
+# e9patch carries local changes (CFR targets + E9PATCH_RELOCMAP, see third_party/e9patch/PATCHES.md): rebuild
+# whenever a source file is newer than the binary, so a stale stock binary is never used.
+e9stale=0
+[ -x "$E9PATCH_DIR/e9patch" ] && [ -n "$(find "$E9PATCH_DIR/src" -newer "$E9PATCH_DIR/e9patch" -name '*.cpp' 2>/dev/null | head -1)" ] && e9stale=1
+if [ $e9stale = 1 ] || [ ! -x "$E9PATCH_DIR/e9tool" ] || [ ! -x "$E9PATCH_DIR/e9patch" ] || [ ! -f "$ZYDIS_DIR/libZydis.a" ]; then
+    say "E9Patch + Zydis (vendored source)"
+    make -C "$E9PATCH_DIR" -j"$(nproc)" release
+fi
 [ -x "$E9PATCH_DIR/e9tool" ] || { echo "FATAL: E9Patch not found at $E9PATCH_DIR (set E9PATCH_DIR)"; exit 2; }
 [ -f "$ZYDIS_DIR/libZydis.a" ] || { echo "FATAL: Zydis static lib not found at $ZYDIS_DIR/libZydis.a"; exit 2; }
 "$PYBIN" -c "import pyvex" 2>/dev/null || { echo "FATAL: $PYBIN cannot import pyvex (activate the venv from README step 2 or set PYBIN=<venv>/bin/python)"; exit 2; }
@@ -34,6 +42,12 @@ make -C "$PT/offline" PY="$PYBIN" ZYDIS="$ZYDIS_DIR"
 
 say "E9Patch plugin + buffer/PTWRITE runtimes"
 make -C "$PT/runtime/e9plugin" E9="$E9PATCH_DIR"
+
+# The JIT suites' whole-program Fast images use their own rewriter + runtime (runtime/jit_toolchain, see SOURCES.md5):
+# per-thread keyframe counters (--kf-gs/--kf-base), --reserve-cursor, PTLOG_KF_N/PTLOG_RECYCLE.  Separate outputs, so
+# the non-JIT Fast toolchain above is unchanged.  Must run after the make above (shared e9compile scratch name).
+say "JIT-suite Fast toolchain (runtime/jit_toolchain)"
+make -C "$PT/runtime/jit_toolchain/e9plugin" E9="$E9PATCH_DIR"
 
 if [ -x "$PIN_ROOT/pin" ]; then
     say "Pin 4.4 HiFi Pintool + no-op floor"

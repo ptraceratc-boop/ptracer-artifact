@@ -8,17 +8,22 @@
 //   PTJIT_SOCK / PTJIT_CACHE / PTJIT_PY / PTJIT_ANALYZE / PTJIT_NOSPAWN / PTJIT_SPACE / PTJIT_SPARKPLUG
 //   PTJIT_KEYFRAME K = resync-keyframe period (default 1024, 0 = off).  A JIT function is
 //                  entered by OSR at a loop header, so without these the object's entry
-//                  anchor never runs (defect D-J1, the design notes
+//                  anchor never runs.
 //   PTJIT_KFCTR    countdown cells to reserve (default 65536)
 //   PTJIT_KF_FLAGS_LIVE  1 = also emit a keyframe where EFLAGS are live (default 0 = drop)
 //   PTJIT_GT       1 = same-run ground truth: every memory access of a patched object also
 //                  logs its effective address to gt.<pid>.<pid>.bin (PTJIT_GT_DIR,
-//                  PTJIT_GT_MB window, default 4096).  A measurement build (defect D-J2).
+//                  PTJIT_GT_MB window, default 4096).  A measurement build.
 //   PTJIT_ADDON    load a different addon build (the pre-fix one, for the reliability table)
 //   PTJIT_FAST     0 (default) conservative value objective; 1 Fast location objective.
 //                  Both use this runtime-assisted substrate, not Pin JIT. Cache keys differ.
 //   PTJIT_STACK_ANCHOR  0 unchanged (default), 1 rsp, 2 rsp+rbp at each object entry.
 //                  Native MODE=4 only; post-cache augmentation, no selected values removed.
+//   PTJIT_ASYNC    1 (default) = analyse plan-cache misses on worker threads, install at a
+//                  V8 interrupt.  0 = synchronous, inside the JIT event.
+//   PTJIT_WORKERS  analysis workers (default 4, one per analyzer socket PTJIT_SOCK=...sock.0..3;
+//                  1 when the socket is not numbered).  hook.drain(ms) / hook.stop() are exported.
+//   PTJIT_SLIDE / PTJIT_SHIFT / PTJIT_KF_FLAGS_SAVE  placement rules, default 1; 0 = off.
 //   PTJIT_PIN      1 = publish analyzed JIT plans to hifitool -jitbridge 1 instead of
 //                  patching application bytes. Requires MODE=4 and KEYFRAME=0.
 //                  Pin performs instrumentation; native images still need ELF PLANs.
@@ -29,6 +34,8 @@ const g = (a, b, d) => (E[a] !== undefined ? E[a] : (E[b] !== undefined ? E[b] :
 const mode = parseInt(g('PTJIT_MODE', 'JITPOC_MODE', '0'), 10);
 if (mode > 0) {
   const hook = require(E.PTJIT_ADDON || (__dirname + '/jithook.node'));
+  // wtb.js reads the hook's counters at the warm-up/timed boundary
+  Object.defineProperty(process, Symbol.for('ptjit.hook'), { value: hook });
   hook.enable(mode,
     parseInt(g('PTJIT_ARENA_MB', 'JITPOC_ARENA_MB', '1024'), 10),
     parseInt(g('PTJIT_VERBOSE', 'JITPOC_VERBOSE', '0'), 10),
@@ -39,6 +46,7 @@ if (mode > 0) {
     parseInt(g('PTJIT_NOIMM64', 'JITPOC_NOIMM64', '0'), 10),
     parseInt(g('PTJIT_MINPATCH', 'JITPOC_MINPATCH', '0'), 10));
   process.on('exit', () => {
+    if (hook.stop) hook.stop();   // no V8 interrupt may be requested after this point
     const st = hook.stats();
     if (mode >= 3) st.verify = hook.verify();
     const cnt = g('PTJIT_COUNTERS', 'JITPOC_COUNTERS', null);

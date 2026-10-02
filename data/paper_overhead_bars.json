@@ -1,5 +1,5 @@
 {
- "source": "the published paper figure (vector PDF): filled-rectangle heights relative to the uninstrumented (1x) bar, read once and cached here; approximate rendered-figure values, not raw measurements",
+ "source": "the published paper figure (vector PDF): bar heights relative to the uninstrumented (1x) bar, read once and cached here (approximate rendered-figure values, not raw measurements); bars above the figure's axis break use the printed labels; \"Err\" = the tracer failed, \"NA\" = not applicable, 200 = capped at 200x",
  "suites": [
   "poly",
   "mc",
@@ -32,6 +32,54 @@
    "rust": 1.0702,
    "node": 5.9204,
    "java": 5.5003
+  },
+  "hifi_ptw": {
+   "poly": 1.29,
+   "mc": 4.36,
+   "pyperf": 5.69,
+   "rust": 1.25,
+   "node": 12.28,
+   "java": 11.1
+  },
+  "fast_ptw": {
+   "poly": 1.08,
+   "mc": 2.78,
+   "pyperf": 2.86,
+   "rust": 1.08,
+   "node": 5.25,
+   "java": 5.04
+  },
+  "memtrace": {
+   "poly": 9.3,
+   "mc": 36,
+   "pyperf": 54,
+   "rust": 3.3,
+   "node": 38,
+   "java": 47
+  },
+  "libdft": {
+   "poly": 73,
+   "mc": 71,
+   "pyperf": 95,
+   "rust": 107,
+   "node": 61,
+   "java": "Err"
+  },
+  "valgrind": {
+   "poly": 85,
+   "mc": "Err",
+   "pyperf": 200,
+   "rust": 31,
+   "node": 200,
+   "java": 200
+  },
+  "spindle": {
+   "poly": 1.97,
+   "mc": "NA",
+   "pyperf": 12.15,
+   "rust": "NA",
+   "node": "NA",
+   "java": "NA"
   }
  }
 }

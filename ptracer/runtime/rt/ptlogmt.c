@@ -100,6 +100,38 @@ static void *ptlogmt_start(void *v)
     return fn(arg);
 }
 
+/* fork WITHOUT exec (multiprocessing Pool workers).  fork(2) copies the calling thread's GS base
+ * into the child, whose TCB copy still carries the PARENT's tid/pid: the child would keep logging into its copy
+ * of the parent's buffer until the runtime's rotate path notices (the INHERITED-%gs warning) and abandons it.
+ * Drop the inherited base in the child right after fork, exactly as ptlogmt_start() does for a new thread, so the
+ * child's next %gs access faults into the runtime's lazy allocator and it gets its own TCB + cv file.
+ * (Values logged by the instrumented libc between the fork syscall and this handler still go to the copy.) */
+#define PTLOGMT_CTL_WRITER_OFF 16   /* struct ptlog_ctl: ntcb, stop, WRITER (layout pinned by ptlog_abi.h) */
+static void ptlogmt_atfork_child(void)
+{
+    unsigned long gs = 0;
+    syscall(SYS_arch_prctl, ARCH_GET_GS, &gs);
+    /* the drain (writer) thread is NOT copied by fork(2), but its `writer = 1' flag is: the child's teardown
+     * would then poll for it 100 000 x 10 us on every exit.  Clear it. */
+    if (ptlogmt_is_tcb(gs))
+    {
+        unsigned long ctl = *(volatile unsigned long *)(gs + PTLOG_TCB_CTL_OFF);
+        if (ctl != 0)
+            *(volatile long *)(ctl + PTLOGMT_CTL_WRITER_OFF) = 0;
+    }
+    if (gs != 0)
+    {
+        long tid = syscall(SYS_gettid);
+        if (!ptlogmt_is_tcb(gs) || *(volatile long *)(gs + PTLOG_TCB_TID_OFF) != tid)
+            syscall(SYS_arch_prctl, ARCH_SET_GS, 0UL);
+    }
+}
+
+__attribute__((constructor)) static void ptlogmt_init(void)
+{
+    pthread_atfork(0, 0, ptlogmt_atfork_child);
+}
+
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     void *(*fn)(void *), void *arg)
 {

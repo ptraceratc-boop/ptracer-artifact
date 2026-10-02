@@ -1,4 +1,4 @@
-// Minimal JSON reader/writer for the PTracer offline tools (spec, site map, sideband, summary).
+// Minimal JSON reader/writer for PTracer v2 offline tools (spec, site map, sideband, summary).
 // Supports objects, arrays, strings, numbers (int64/double), bool, null. No dependencies.
 #pragma once
 #include <cstdint>
@@ -71,8 +71,9 @@ inline Json json_parse(const std::string& s) { JsonParser jp(s); return jp.parse
 inline Json json_load(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb"); if (!f) throw std::runtime_error("cannot open " + path);
     // A SHORT read must never be mistaken for end-of-file: a truncated buffer parses as a
-    // syntax error at an arbitrary offset ("json: :").  Read until feof, and retry an
-    // interrupted read instead of stopping at it.
+    // syntax error at an arbitrary offset ("json: :"), which is what two of 475 `ptrecon
+    // --mt' children reported while five of them read the same 8 MB of specs at once.
+    // Read until feof, and retry an interrupted read instead of stopping at it.
     std::string s; char buf[65536]; size_t n;
     for (;;) {
         n = fread(buf, 1, sizeof buf, f);
@@ -83,8 +84,8 @@ inline Json json_load(const std::string& path) {
         throw std::runtime_error("short read on " + path + ": " + strerror(e));
     }
     fclose(f);
-    // Name the file in the exception: a bare "json: :" says nothing about WHICH of the
-    // JSON inputs failed to parse.
+    // Name the file in the exception: a bare "json: :" from one of 475 `ptrecon --mt'
+    // children says nothing about WHICH of the fifteen JSON inputs failed to parse.
     try { return json_parse(s); }
     catch (const std::exception& e) {
         throw std::runtime_error(std::string(e.what()) + " while parsing " + path +

@@ -25,7 +25,7 @@ cat <<EOF
 Output directory: $RUN_OUT
 Estimated total time: 4-8 compute-h on a quiet machine, ~15 human-min in all.
   E1 runtime overhead (Figure 5)      2-4 compute-h + ~1 compute-h to build the Fast images
-  E2 inaccuracy table (Section 5.6)   1-3 compute-h; tens of GB of temporary trace files
+  E2 inaccuracy table (Section 5.6)   see run/02_accuracy.sh --dry-run
   E3 ablation (Figure 6)              ~30 compute-min
 EOF
 
@@ -56,7 +56,7 @@ stage() {  # <label> <final output> <script>
     bash "$3"
 }
 stage "E1 Figure 5"    six_suite_overhead.png run/01_overhead.sh
-stage "E2 Section 5.6" inaccuracy.md          run/02_accuracy.sh
+stage "E2 Section 5.6" accuracy/inaccuracy.md run/02_accuracy.sh
 stage "E3 Figure 6"    ablation.png           run/03_ablation.sh
 [ "$DRY" = 1 ] && exit 0
 
@@ -65,6 +65,6 @@ cat <<EOF
 == experiments v1 complete ==
   Figure 5 (runtime overhead):                 $RUN_OUT/six_suite_overhead.png
   Figure 6 (ablation of the new techniques):   $RUN_OUT/ablation.png
-  Section 5.6 (inaccuracy table):              $RUN_OUT/inaccuracy.md
+  Section 5.6 (inaccuracy table):              $RUN_OUT/accuracy/inaccuracy.md
 EOF
-cat "$RUN_OUT/inaccuracy.md"
+cat "$RUN_OUT/accuracy/inaccuracy.md"

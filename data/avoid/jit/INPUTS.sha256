@@ -1,0 +1,22 @@
+# Inputs the seed avoid lists were converged on (reference build: the artifact Docker image, analyzer v2.36, --mode fast --keyframe 1024,
+# rewrite --sink buffer --sync 4096 --kf-gs; common: --reserve-cursor; java/node: --reserve-cursor --dead-regs off).
+# run/lib/jitwp/build_stage.sh compares these hashes with its inputs: on a match the seeds converge in 1-2 rounds;
+# otherwise they are only a head start and the build converges on its own (more analysis rounds).
+3a15d66867d83762c7f2f1e37359cb8f6c5743edb369c65285cb0b1c4f7498bf  common/libc.so.6
+fce00b6f25f459cf4ae0b7fae4257909a1a8a86f9149e7c029a5d617baf1ccd0  common/libm.so.6
+1fd75fe70354a416d75aef22bcae68c47bd25d20e2d0568c30b1a9838cf62f11  common/libstdc++.so.6
+d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb  common/libgcc_s.so.1
+fe5b9dd8f3e1b470084f17073dc0a25b28ebc650bc5d3b06b07ab91561bd0803  java/libjvm.so
+b687fae8cd87fa45b43c589bad3a72088246bb2d2b7dddb6f9cdaaa610c7a1ae  java/libjava.so
+79f7398739f96472aa4deb432c5a6ef54dc5001a5b5d4ca24a1e4bed8f5e2cdd  java/libjli.so
+e846d4feae7bbc1453023a31c33c7f092532f15a17fc2f32c057eeea2f01d850  java/libzip.so
+ca3973f643a76178f1d27857b58755e67a4baf8608a5306fd6a54d25d6ca93bb  java/libnio.so
+422dc4462ab8b1423a789e62a3721350bb99e850578ac3ff6628d589115decef  java/libnet.so
+c1e5b1fe649e244e5f45ad4ab379b51fc0d17b2654dd0897fd2fc00266dd8c4c  java/libjimage.so
+12ffee1810c1d19562eb71c5fb15bcf6158e7b465ab887cd5b44f1350e333ce2  java/libverify.so
+d726e6d23331060d20435e24f56d248abc320f62999aa90b4782e90bcba35c32  java/libmanagement.so
+8c754a4b4ffe7f8988a9d4e739d1b8c69d03116973ef3d3b54ed93057194ed50  java/libextnet.so
+6437c4e9c98ceb1f22fd01cce8b2a25b6a1a71e418c61152700716cd0e49e79e  java/libjaas.so
+7b8591a02dd40a1e02cf8903c32bc31cfc022ce3af5bd4e4df56d1cd343ebe69  java/libmanagement_ext.so
+01fee134b17b9fc4a09324abb53a9d79436582fd3669d495126711ddeea1777d  java/libjsvml.so
+3517c2df0b2f8cd7f422b4b8450ef81c6889f08eb03e281d6de9079b15e6a327  node/node

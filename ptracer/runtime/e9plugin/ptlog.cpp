@@ -148,6 +148,10 @@ static std::map<intptr_t, Site>  sites;
 static Sink   opt_sink   = SINK_PTWRITE;
 static int    opt_space  = 3;
 static long   opt_sync   = 4096;
+// `synccarrier tnt': the sync marker carries its count
+// in TNT bits instead of a PTWRITE payload, so a buffer-sink image executes no
+// PTWRITE at all.  Default off = `ptwrite'.
+static bool   opt_sync_tnt = false;
 static int    opt_gsbase = 0;       // %gs slot base
 static FILE  *opt_map    = nullptr;
 static intptr_t opt_slotbase = 0;   // accepted for compatibility (== counterbase)
@@ -286,6 +290,13 @@ static void parseSiteFile(const char *filename)
         if (strncmp(p, "liveness", 8) == 0)
             { opt_liveness = (strtol(p+8, nullptr, 0) != 0); continue; }
         if (strncmp(p, "space", 5) == 0)  { opt_space  = (int)strtol(p+5, nullptr, 0); continue; }
+        if (strncmp(p, "synccarrier", 11) == 0)
+        {
+            if (strstr(p+11, "tnt") != nullptr) opt_sync_tnt = true;
+            else if (strstr(p+11, "ptwrite") != nullptr) opt_sync_tnt = false;
+            else error("%s:%d: bad synccarrier", filename, lineno);
+            continue;
+        }
         if (strncmp(p, "sync", 4) == 0)   { opt_sync   = strtol(p+4, nullptr, 0); continue; }
         if (strncmp(p, "bufoff", 6) == 0) { opt_gsbase = (int)strtol(p+6, nullptr, 0); continue; }
         if (strncmp(p, "delta", 5) == 0)
@@ -454,6 +465,11 @@ struct Emitter
     //              instruction means this execution was NOT a keyframe
     std::vector<long> log_cnt, log_kfper, log_kfbr, log_kfjoin;
     std::vector<long> sync_offs;
+    // `synccarrier tnt' only: the marker's TNT-loop roles (s = start, b = the
+    // bit branch, z = the not-taken path of it); the END of each marker is its
+    // `sync_offs' entry.  Always empty for the PTWRITE carrier.
+    std::vector<long> tnt_offs;
+    std::vector<char> tnt_role;
 
     void pushLog(long off)
     {
@@ -1091,6 +1107,7 @@ static intptr_t newCounter()
 }
 
 static void emitPushfq(Emitter &e)         { e.raw({0x9c}); e.tick(); }
+static void emitPopfq(Emitter &e)          { e.raw({0x9d}); e.tick(); }
 
 /* --- keyframe primitives ------------------------------------------------ */
 
@@ -1159,6 +1176,11 @@ static void appendEmitter(Emitter &e, const Emitter &t)
     }
     for (long o: t.sync_offs)
         e.sync_offs.push_back(base + o);
+    for (size_t i = 0; i < t.tnt_offs.size(); i++)
+    {
+        e.tnt_offs.push_back(base + t.tnt_offs[i]);
+        e.tnt_role.push_back(t.tnt_role[i]);
+    }
     e.since_ptwrite = t.since_ptwrite;
 }
 
@@ -1647,6 +1669,52 @@ static void sSyncRegs(Scratch &S, int spare = -1)
  * times, and nothing at all when `ahead' is 0.  `%gs:TOTAL' itself keeps
  * counting countdowns, so the next marker is unaffected.
  */
+/*
+ * `synccarrier tnt': the marker's count travels in
+ * TNT bits instead of a PTWRITE payload, for PT-capable CPUs without PTWRITE.
+ * `%r' holds the payload the PTWRITE carrier would have written; the loop
+ * destroys it (every caller's `%r' is dead after its marker) and clobbers
+ * EFLAGS (every caller has them dead or saved here):
+ *
+ *   top: shr  $1,%r        # CF = the next bit (LSB first), ZF = no bits left
+ *        jc   1f           # TNT: the bit                    ('b' in the map)
+ *        nop               # runs iff the bit is 0           ('z')
+ *     1: jnz  top          # TNT: more bits
+ *
+ * 8 bytes, 2 TNT bits per payload bit, bitlength(payload) iterations (at least
+ * one), once per `sync' values.  The reconstructor collects the bits between
+ * the marker's first instruction ('s' = offset 0 of the marker body) and its
+ * END -- the instruction right after the loop, which the map lists as the
+ * marker itself (`sync_offs') -- and realigns exactly as with a PTW payload.
+ */
+static void emitTntCount(Emitter &mark, int r)
+{
+    mark.tnt_offs.push_back(0); mark.tnt_role.push_back('s');
+    const long top = mark.body_len;
+    mark.raw({0x48 | (r >> 3), 0xd1, 0xe8 | (r & 7)});     // shr $1,%r
+    mark.tnt_offs.push_back(mark.body_len); mark.tnt_role.push_back('b');
+    mark.raw({0x72, 0x01});                                 // jc 1f
+    mark.tnt_offs.push_back(mark.body_len); mark.tnt_role.push_back('z');
+    mark.raw({0x90});                                       // nop
+    mark.raw({0x75, (int)(uint8_t)(int8_t)(top - (mark.body_len + 2))});  // jnz top
+    mark.tick(4);
+    mark.sync_offs.push_back(mark.body_len);                // END: the caller's next instruction
+}
+
+// A marker body's sync/TNT offsets, rebased into the site body.
+static void adoptMarker(Emitter &e, const Emitter &mark, long markbase)
+{
+    for (long o: mark.log_offs)
+        e.sync_offs.push_back(markbase + o);    // the PTWRITE carrier's `ptwrite'
+    for (long o: mark.sync_offs)
+        e.sync_offs.push_back(markbase + o);    // the TNT carrier's END
+    for (size_t i = 0; i < mark.tnt_offs.size(); i++)
+    {
+        e.tnt_offs.push_back(markbase + mark.tnt_offs[i]);
+        e.tnt_role.push_back(mark.tnt_role[i]);
+    }
+}
+
 static void emitSyncSlow(Emitter &e, Scratch &S, int spare = -1, long ahead = 0)
 {
     sSyncRegs(S, spare);
@@ -1661,14 +1729,23 @@ static void emitSyncSlow(Emitter &e, Scratch &S, int spare = -1, long ahead = 0)
     emitMovToGs(mark, scr, GS_TOTAL);
     if (ahead != 0)
         emitLeaReg32(mark, scr, (int32_t)ahead);
-    emitPtwriteReg(mark, scr, 0);
+    if (opt_sync_tnt)
+    {
+        // EFLAGS are live here: save them below the red zone, 1-in-`sync'.
+        emitLeaRsp(mark, -RED_ZONE);
+        emitPushfq(mark);
+        emitTntCount(mark, scr);
+        emitPopfq(mark);                // END
+        emitLeaRsp(mark, RED_ZONE);
+    }
+    else
+        emitPtwriteReg(mark, scr, 0);
     emitMovEcxImm(mark, (int32_t)opt_sync);
     long marklen = mark.body_len;
     emitJrcxz8(e, 2);                   // skip the `jmp' below
     emitJmp8(e, (int8_t)marklen);
     long markbase = e.body_len;
-    for (long o: mark.log_offs)
-        e.sync_offs.push_back(markbase + o);    // the marker's `ptwrite'
+    adoptMarker(e, mark, markbase);     // the marker's `ptwrite' (or TNT loop)
     for (const Chunk &c: mark.chunks)
         e.raw(c.bytes);                 // marker code is pure bytes
     emitMovToGs(e, cnt, GS_COUNT);
@@ -1746,10 +1823,19 @@ static void emitSyncFast(Emitter &e, Scratch &S, long nval, int spare = -1)
     emitAddImmReg(mark, /*sub=*/true, (int32_t)opt_sync, r);
     emitAddRegToGs(mark, /*sub=*/true, r, GS_TOTAL);
     // ABSOLUTE re-arm (see above).
+    if (opt_sync_tnt)
+    {
+        emitMovFromGs(mark, r, GS_TOTAL);
+        emitTntCount(mark, r);
+        emitMovImmToGs(mark, (int32_t)opt_sync, GS_COUNT);     // END
+    }
+    else
+    {
     emitMovImmToGs(mark, (int32_t)opt_sync, GS_COUNT);
     Mem tot;
     tot.seg = 0x65; tot.base = -1; tot.index = -1; tot.disp = GS_TOTAL;
     emitPtwriteMem(mark, tot, 8, 0, 0);
+    }
     if (local_save)
     {
         emitPop(mark, r);
@@ -1758,8 +1844,7 @@ static void emitSyncFast(Emitter &e, Scratch &S, long nval, int spare = -1)
     long marklen = mark.body_len;
     emitJccFwd(e, 0xf, marklen);        // jg .Lcont   (cc 0xf = jnle)
     long markbase = e.body_len;
-    for (long o: mark.log_offs)
-        e.sync_offs.push_back(markbase + o);
+    adoptMarker(e, mark, markbase);
     for (const Chunk &c: mark.chunks)
         e.raw(c.bytes);
     e.since_ptwrite = 1000;
@@ -2037,6 +2122,8 @@ extern "C" void *e9_plugin_init(const Context *cxt)
             warning("ptlog: sink=buffer/gt without `--rt=FILE'; the rewritten "
                 "binary will need LD_PRELOAD=ptlogrt.so");
     }
+    if (opt_sync_tnt && (opt_sink != SINK_BUFFER || opt_sync <= 0))
+        error("ptlog: synccarrier tnt requires the buffer sink and sync > 0");
     fprintf(stderr, "ptlog: %zu instrumented instructions, sink=%s, space=%d, "
         "sync=%ld\n", sites.size(),
         (opt_sink == SINK_BUFFER? "buffer": "ptwrite"), opt_space, opt_sync);
@@ -2105,7 +2192,7 @@ extern "C" void e9_plugin_patch(const Context *cxt)
             site_avoid |= 1u << op.reg;
     if (have_mem && !mem.rip)
     {
-        // The base/index of the memory operand are HARD (D-M4-8): the trampoline
+        // The base/index of the memory operand are HARD: the trampoline
         // dereferences them, so no stack copy can stand in for them.  The
         // registers the site LOGS are soft -- see `Scratch'.
         if (mem.base  >= 0) { site_avoid |= 1u << mem.base;  site_hard |= 1u << mem.base;  }
@@ -2329,6 +2416,9 @@ extern "C" void e9_plugin_patch(const Context *cxt)
             post.empty()? "-": post.c_str(), e.body_len - before_len);
         for (long o: e.sync_offs)
             fprintf(opt_map, "0x%" PRIxPTR ",-3,S,s,%ld,%ld\n", I->address, o, o);
+        for (size_t i = 0; i < e.tnt_offs.size(); i++)      // `synccarrier tnt' only
+            fprintf(opt_map, "0x%" PRIxPTR ",-6,T,t,%c,%ld\n", I->address,
+                e.tnt_role[i], e.tnt_offs[i]);
         // A keyframe-guarded value carries a KEYED extra column after the six
         // fixed ones; a consumer that only knows the six-column form ignores
         // it:  k=<counter>:<K>:<jnz>:<join>

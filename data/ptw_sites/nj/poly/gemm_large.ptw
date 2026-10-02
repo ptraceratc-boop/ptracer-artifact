@@ -1,0 +1,9 @@
+# Fast-PTWRITE sites of gemm_large: every site but the keyframe sites: <address> <when> <spec-entry hash>
+0x138c before 61ff46205ead
+0x14a1 before 2917f6581288
+0x1549 after 35823eb81eca
+0x15b0 after d7af4400ae6c
+0x1616 before f0e6ac5a2b83
+0x16fd before aec1466b2402
+0x1859 before 95a1d53e050a
+0x192d before db60d83bf368

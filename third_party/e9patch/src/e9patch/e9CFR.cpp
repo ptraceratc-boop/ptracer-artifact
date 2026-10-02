@@ -252,7 +252,7 @@ void targetAnalysis(Binary *B)
                     break;
                 }
                 case 0xF3:                  // endbr64
-                    if (j+4 > end || !cet)
+                    if (j+4 > end)  /* PTracer: every endbr64 is a target */
                         continue;
                     if (data[j+1] != 0x0F || data[j+2] != 0x1E ||
                             data[j+3] != 0xFA)
@@ -290,6 +290,8 @@ void targetAnalysis(Binary *B)
         size_t init_size = 0, fini_size = 0;
         const Elf64_Rela *rela = nullptr;
         size_t rela_size = 0;
+        const Elf64_Rela *jmprel = nullptr;     /* PTracer: .rela.plt */
+        size_t jmprel_size = 0;
         const struct hshtab_s *hshtab = nullptr;
         const Elf64_Sym *symtab = nullptr;
         for (size_t i = 0; dynamic[i].d_tag != DT_NULL; i++)
@@ -334,6 +336,17 @@ void targetAnalysis(Binary *B)
                 case DT_RELASZ:
                     rela_size = dynamic[i].d_un.d_val / sizeof(Elf64_Rela);
                     break;
+                case DT_JMPREL:
+                {
+                    intptr_t offset = addrToOffset(phdrs, phnum,
+                        dynamic[i].d_un.d_ptr, /*x=*/false);
+                    if (offset >= 0)
+                        jmprel = (const Elf64_Rela *)(data + offset);
+                    break;
+                }
+                case DT_PLTRELSZ:
+                    jmprel_size = dynamic[i].d_un.d_val / sizeof(Elf64_Rela);
+                    break;
                 case DT_SYMTAB:
                 {
                     intptr_t offset = addrToOffset(phdrs, phnum,
@@ -371,7 +384,8 @@ void targetAnalysis(Binary *B)
         for (size_t i = 0; pic && rela != nullptr && i < rela_size; i++)
         {
             // Rela section
-            if (ELF64_R_TYPE(rela[i].r_info) != R_X86_64_RELATIVE)
+            if (ELF64_R_TYPE(rela[i].r_info) != R_X86_64_RELATIVE &&
+                    ELF64_R_TYPE(rela[i].r_info) != R_X86_64_IRELATIVE)
                 continue;
             intptr_t addr = rela[i].r_offset;
             intptr_t offset = addrToOffset(phdrs, phnum, addr, /*x=*/false);
@@ -379,6 +393,14 @@ void targetAnalysis(Binary *B)
                 continue;
             addr = rela[i].r_addend;
             intptr_t target = addrToOffset(phdrs, phnum, addr);
+            setTarget(targets, B->size, target);
+        }
+        for (size_t i = 0; jmprel != nullptr && i < jmprel_size; i++)
+        {
+            // PTracer: IRELATIVE resolvers in .rela.plt
+            if (ELF64_R_TYPE(jmprel[i].r_info) != R_X86_64_IRELATIVE)
+                continue;
+            intptr_t target = addrToOffset(phdrs, phnum, jmprel[i].r_addend);
             setTarget(targets, B->size, target);
         }
         if (hshtab != nullptr && symtab != nullptr)
@@ -397,11 +419,42 @@ void targetAnalysis(Binary *B)
             for (uint32_t i = 0; i < nsyms; i++)
             {
                 if (symtab[i].st_shndx == SHN_UNDEF ||
-                        ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC)
+                        (ELF64_ST_TYPE(symtab[i].st_info) != STT_FUNC &&
+                         ELF64_ST_TYPE(symtab[i].st_info) != STT_GNU_IFUNC))
                     continue;
                 intptr_t addr = symtab[i].st_value;
                 intptr_t target = addrToOffset(phdrs, phnum, addr);
                 setTarget(targets, B->size, target);
+            }
+        }
+    }
+    {
+        // PTracer: every defined FUNC/IFUNC symbol of .dynsym AND .symtab (via the
+        // section headers) is a possible indirect target.  The GNU-hash walk above
+        // can miss exported functions called through the PLT.
+        const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
+        if (eh->e_shoff != 0 && eh->e_shentsize == sizeof(Elf64_Shdr) &&
+                eh->e_shoff + (size_t)eh->e_shnum * sizeof(Elf64_Shdr) <= B->size)
+        {
+            const Elf64_Shdr *sh = (const Elf64_Shdr *)(data + eh->e_shoff);
+            for (unsigned k = 0; k < eh->e_shnum; k++)
+            {
+                if (sh[k].sh_type != SHT_DYNSYM && sh[k].sh_type != SHT_SYMTAB)
+                    continue;
+                if (sh[k].sh_offset + sh[k].sh_size > B->size)
+                    continue;
+                const Elf64_Sym *st = (const Elf64_Sym *)(data + sh[k].sh_offset);
+                size_t n = sh[k].sh_size / sizeof(Elf64_Sym);
+                for (size_t i = 0; i < n; i++)
+                {
+                    unsigned t = ELF64_ST_TYPE(st[i].st_info);
+                    if (st[i].st_shndx == SHN_UNDEF || st[i].st_value == 0 ||
+                            (t != STT_FUNC && t != STT_GNU_IFUNC))
+                        continue;
+                    intptr_t target = addrToOffset(phdrs, phnum,
+                        (intptr_t)st[i].st_value);
+                    setTarget(targets, B->size, target);
+                }
             }
         }
     }

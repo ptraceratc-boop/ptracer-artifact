@@ -10,7 +10,7 @@ static int fails = 0;
 int main() {
     VexLifter L; VexInterp I;
     std::vector<MemAccess> acc; auto emit = [&](const MemAccess& m) { acc.push_back(m); };
-    auto run = [&](uint64_t ip, std::vector<uint8_t> b) { auto blk = L.lift_one(ip, b.data(), b.size()); if (!blk->ok) { printf("lift fail @%lx: %s\n", (unsigned long)ip, blk->err.c_str()); fails++; return; } I.exec(*blk, emit); };
+    auto run = [&](uint64_t ip, std::vector<uint8_t> b) { auto blk = L.lift_one(ip, b.data(), b.size()); if (!blk->ok) { printf("lift fail @%lx: %s\n", (unsigned long)ip, blk->err.c_str()); fails++; return; } std::vector<MemAccess> acc; I.exec(*blk, &acc); for (auto& m : acc) emit(m); };   // compiled skeleton (PTRECON_INTERP=tree: tree walker)
     // 1. mov (%rdi),%rdi with rdi known -> load at rdi, rdi becomes unknown (value not logged)
     I.set_reg(OFFSET_amd64_RDI, 8, 0x1000);
     run(0x400000, {0x48, 0x8b, 0x3f});
@@ -60,7 +60,7 @@ int main() {
     I.set_reg(OFFSET_amd64_RDI, 8, 0x5000); acc.clear(); run(0x400080, {0xf0, 0x48, 0x0f, 0xb1, 0x1f});
     CHECK(acc.size() == 1 && acc[0].op == 2 && acc[0].addr == 0x5000, "lock cmpxchg emits rmw at rdi");
     // 13. `rep stosq' expanded one iteration at a time: the store address must ADVANCE, which it
-    //     only does if guest_DFLAG is known (defect D-U10).  With DFLAG unknown the first
+    //     only does if guest_DFLAG is known.  With DFLAG unknown the first
     //     iteration is right and every later one is an unknown address.
     I.set_reg(OFFSET_amd64_RDI, 8, 0x6000); I.set_reg(OFFSET_amd64_RCX, 8, 4); I.set_reg(OFFSET_amd64_RAX, 8, 0);
     acc.clear();

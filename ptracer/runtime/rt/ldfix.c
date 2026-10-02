@@ -38,6 +38,7 @@
 
 #define AT_NULL     0
 #define AT_ENTRY    9
+#define AT_BASE     7
 
 /* The prefix of E9Patch's `struct e9_config_s' (src/e9patch/e9loader.h) that
  * this shim needs.  `base' is the loader's link-time address, so the image's
@@ -76,6 +77,15 @@ void init(int argc, char **argv, char **envp, const void *dynamic,
     while (*p != 0)
         p++;
     unsigned long *av = (unsigned long *)(p + 1);
+    /* A rewritten ld.so may also be the PROGRAM INTERPRETER (the program's
+     * PT_INTERP names it).  Then the kernel's AT_ENTRY
+     * is the program's entry and AT_BASE is this image's own load base, and
+     * AT_ENTRY must stay untouched, or ld.so would take itself for the
+     * program.  Explicitly invoked, ld.so has no interpreter and AT_BASE = 0. */
+    unsigned long self = (unsigned long)((const char *)cfg - c->base);
+    for (unsigned long *q = av; q[0] != AT_NULL; q += 2)
+        if (q[0] == AT_BASE && q[1] == self)
+            return;
     for (; av[0] != AT_NULL; av += 2)
         if (av[0] == AT_ENTRY)
             av[1] = entry;

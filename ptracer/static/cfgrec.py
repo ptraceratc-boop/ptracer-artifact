@@ -476,6 +476,28 @@ def _is_padding(proj, addr, irsb):
 
 
 # ----------------------------------------------------------------------------- jump tables
+def _phi_single_const(df, phi, f, limit=4096):
+    """The one constant a phi web can carry if its only other leaves are BlockIn values of orphan
+    blocks (code reached through still-unresolved indirect jumps); else None."""
+    seen, stack, const = set(), [phi], None
+    while stack:
+        x = df.resolve(stack.pop())
+        if x.id in seen:
+            continue
+        seen.add(x.id)
+        if len(seen) > limit:
+            return None
+        if x.kind == 'phi':
+            stack.extend(x.args)
+        elif x.kind == 'const':
+            if const is not None and const.key != x.key:
+                return None
+            const = x
+        elif not (x.kind == 'blockin' and x.key[0] in f.orphans):
+            return None
+    return const
+
+
 def resolve_jump_tables(proj, f, df, max_entries=4096):
     """Resolve indirect jumps angr could not (e.g. CPython's computed-goto dispatch
     `jmp *opcode_targets[op]`) using the dataflow's symbolic target expression:
@@ -498,6 +520,14 @@ def resolve_jump_tables(proj, f, df, max_entries=4096):
             a0, a1 = df.resolve(n.args[0]), df.resolve(n.args[1])
             if a0.kind == 'const':
                 a0, a1 = a1, a0
+            if a1.kind == 'phi' and a0.kind != 'phi':
+                # relative table whose base register (`lea table(%rip)' before a loop) is a loop phi
+                # whose other operands are BlockIn values of orphan blocks (the table's own unresolved
+                # targets): one constant + only orphan BlockIns = that constant (optimistic fixpoint;
+                # the targets read with it are still bounds- and boundary-checked below).
+                c = _phi_single_const(df, a1, f)
+                if c is not None:
+                    a1 = c
             if a1.kind == 'const':
                 base = a1.key
                 x = a0

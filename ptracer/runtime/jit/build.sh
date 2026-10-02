@@ -11,7 +11,8 @@ ROOT=$(realpath -m "$(pwd)/../../..")
 ZY=${ZYDIS_DIR:-$ROOT/third_party/e9patch/contrib/zydis}
 NI=${NODE_INCLUDE:-}
 if [ -z "$NI" ]; then
-  if [ -f "$ROOT/suites/node/include/node_api.h" ]; then NI=$ROOT/suites/node/include
+  if [ -f "$ROOT/suites/node/include/node/node_api.h" ]; then NI=$ROOT/suites/node/include/node
+  elif [ -f "$ROOT/suites/node/include/node_api.h" ]; then NI=$ROOT/suites/node/include
   else NI=/usr/include/node; fi
 fi
 [ -f "$ZY/libZydis.a" ] || { echo "no libZydis.a under $ZY (set ZYDIS_DIR)" >&2; exit 2; }
@@ -19,5 +20,5 @@ fi
 g++ -O2 -std=c++17 -fPIC -shared -fno-exceptions -fno-rtti \
   -I"$NI" -I"$ZY/include" -I"$ZY/dependencies/zycore/include" -DZYAN_NO_LIBC=0 \
   -o jithook.node jithook.cc "$ZY/libZydis.a" \
-  -Wl,--unresolved-symbols=ignore-all
+  -Wl,--unresolved-symbols=ignore-all -pthread
 echo "built $(pwd)/jithook.node"

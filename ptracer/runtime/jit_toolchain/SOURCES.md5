@@ -1,0 +1,19 @@
+# runtime/jit_toolchain: the rewriter, E9Tool plugin and runtime that build the whole-program Fast images of the JIT
+# suites (Java/Renaissance, Node).
+# They add, over runtime/rewrite.py + runtime/rt + runtime/e9plugin (which build the non-JIT Fast images): per-thread
+# keyframe counters in the %gs block (rewrite.py --kf-gs/--kf-base; runtime PTLOG_KF_N), --reserve-cursor, buffer
+# recycling (PTLOG_RECYCLE), thread-exit headroom (ptlogmt.c -> ptlogrt.c), and the JIT arm entry point the V8 hook /
+# JVMTI agent resolve (ptlog_jit_arm).
+# Used by run/lib/jitwp/build_images.sh (rewrite.py) and run/lib/repslice.py e9fast (LD_PRELOAD rt/ptlogmt.so:rt/ptlogrt.so).
+# Built by ptracer/build.sh (make -C runtime/jit_toolchain/e9plugin) with the artifact's E9Patch; rewrite.py does not
+# use E9Patch's CFR/relocation-map options, so they are inactive for these images.
+# rewrite.py and e9plugin/ptlog.cpp also support `--sync-carrier tnt' (sync markers in TNT bits, no PTWRITE; default off).
+eac7da3d0408f56de1b179cf0b82ac02  rewrite.py
+760077ba99c8dee8cd3a4ea0488dedc0  e9plugin/ptlog.cpp
+1890136a047c90556fad1e025b322a30  rt/ptlogrt.c
+78697e57a5ca6b4812ebb38a98e8f809  rt/ptlogmt.c
+d00d2f88670c95be750a585be40e261f  rt/ptlog_abi.h
+fded8c25f63b093d0d78092741571220  rt/ptgt_format.h
+# rewrite_cfr.py: the same rewriter with --cfr (E9Patch CFR + relocation map), used by run/lib/build_ptw.sh for the
+# Fast-PTWRITE (--sink mixed) images of the non-JIT suites.
+eea05ddf70379c06549b0d75db39f971  rewrite_cfr.py

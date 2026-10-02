@@ -7,8 +7,7 @@
 //   2. the **site map** -- docs/SPEC_FORMAT.md section 2 with the JIT profile: absolute
 //      addresses (`pie: false`), plus `obj`/`tsc` on every record.
 //
-// Both formats are specified in the design notes sections 4 and 5; `check_sitemap.py`
-// is the executable check that a run's two files agree.
+// `check_sitemap.py` is the executable check that a run's two files agree.
 #ifndef PTJIT_DUMP_H
 #define PTJIT_DUMP_H
 #include <stdint.h>
@@ -114,7 +113,7 @@ static int64_t ptj_arena_flush(PtjArena *a, const char *path) {
 // One ring per PROCESS, bumped with `lock xadd', so records from several threads interleave
 // but never overwrite each other.  Stage 3 walks the reconstruction of ONE thread against
 // this stream in lockstep, so the comparison is only sound when the JIT code of the run is
-// executed by one thread (m4.md section 9: multi-thread reconstruction does not exist yet).
+// executed by one thread (multi-thread reconstruction is not supported).
 // `cur' is a POINTER to the cursor cell, not the cell: the trampolines reach it with a
 // rel32, so it has to live next to the trampoline slab (ptj_slab_data_init below), not in
 // the front end's own data segment -- which on a first attempt was >2GB away and made every
@@ -217,7 +216,7 @@ static int64_t ptj_write_sitemap(const char *path, const char *vm, int pid, PtjP
   if (!f) return 0;
   fprintf(f, "{\"version\": 2, \"jit\": true, \"vm\": \"%s\", \"pid\": %d,\n", vm, pid);
   fprintf(f, " \"image\": \"jit:%d\", \"orig_image\": \"jit:%d\",\n", pid, pid);
-  // BUFFER SINK the design notes: the map-level `sink' and `sync' are exactly
+  // BUFFER SINK: the map-level `sink' and `sync' are exactly
   // the fields `runtime/rewrite.py' writes for an E9Patch buffer build, so `ptrecon' takes the
   // positional cv path and the sync-marker realignment with no JIT-specific code at all.
   fprintf(f, " \"sink\": \"%s\", \"pie\": false, \"sync\": %u, \"space\": %u,\n",
@@ -259,9 +258,10 @@ static int64_t ptj_write_sitemap(const char *path, const char *vm, int pid, PtjP
               m->kf_period, m->resync ? "true" : "false",
               (unsigned long long)m->counter, (unsigned long long)m->kf_branch,
               (unsigned long long)m->kf_join);
+    if (m->kf_period && cx->kf_gs_n) fprintf(f, ", \"counter_gs\": 1");   // %gs offset, per thread
     fprintf(f, "}%s\n", (i + 1 < cx->nentries || cx->ngtents) ? "," : "");
   }
-  // SAME-RUN GROUND TRUTH the design notes section 4): `role: "gt"' rows are
+  // SAME-RUN GROUND TRUTH: `role: "gt"' rows are
   // NOT critical values.  `offline/recon.cpp' drops them at load time, so the store is
   // ordinary instrumentation to the reconstruction -- no record, no state change, no payload
   // consumed -- and only the gt comparison reads the stream they write.
@@ -284,17 +284,24 @@ static int64_t ptj_write_sitemap(const char *path, const char *vm, int pid, PtjP
     fprintf(f, "%s{\"tramp_addr\": %llu, \"orig_addr\": %llu}",
             i ? ", " : "", (unsigned long long)cx->syncs[i].tramp_addr,
             (unsigned long long)cx->syncs[i].orig_addr);
+  if (cx->sync_tnt) {   // PTLOG_SYNC_CARRIER=tnt: the markers' TNT-loop roles (runtime/rewrite.py format)
+    fprintf(f, "],\n \"sync_carrier\": \"tnt\",\n \"sync_tnt\": [");
+    for (uint32_t i = 0; i < cx->ntnts; i++)
+      fprintf(f, "%s{\"role\": \"%c\", \"tramp_addr\": %llu, \"orig_addr\": %llu}",
+              i ? ", " : "", cx->tnts[i].role, (unsigned long long)cx->tnts[i].tramp_addr,
+              (unsigned long long)cx->tnts[i].orig_addr);
+  }
   fprintf(f, "],\n \"gt_site_addrs\": [");
   for (uint32_t i = 0; i < cx->ngtents; i++)
     fprintf(f, "%s%llu", i ? ", " : "", (unsigned long long)cx->gtents[i].orig_addr);
   // ... and WHEN each became one.  A JIT code object is executed before it is patched (V8
   // enumerates code that is already running; HotSpot patches an nmethod seconds after
   // CODE_ADDED), so an address is a gt site only from this rdtscp on -- without it the
-  // reconstruction's pre-patch records desynchronise the lockstep walk (jit_accuracy.md).
+  // reconstruction's pre-patch records desynchronise the lockstep walk.
   fprintf(f, "],\n \"gt_site_tsc\": [");
   for (uint32_t i = 0; i < cx->ngtents; i++)
     fprintf(f, "%s%llu", i ? ", " : "", (unsigned long long)cx->gtents[i].tsc);
-  // ... and the LOCKSTEP KEY each gt record is written with (defect D-J9): the address of
+  // ... and the LOCKSTEP KEY each gt record is written with: the address of
   // the relocated copy of the instruction inside this trampoline.  An ip is not a dynamic
   // instance for JIT code (addresses are reused across code-object versions, and inside a
   // loop the next record with the same ip is another iteration); a trampoline address is

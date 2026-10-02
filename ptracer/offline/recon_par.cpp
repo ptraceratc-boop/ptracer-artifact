@@ -7,13 +7,13 @@
 //      its registers every K-th execution) has to re-define the registers;
 //   3. with the buffer sink the value stream is POSITIONAL, so a SYNC MARKER (`ptwrite <running
 //      count>') has to re-align the cursor.
-// A capture with neither 2 nor 3 must not be split at all (its chunks would reconstruct an
-// all-unknown machine).  A probe per boundary finds the first point at or after each ideal split
-// where 2 and 3 have both happened with no state loss after them (Recon::run_anchor_scan), the
-// chunk decodes from the PSB before that point, and a capture that cannot supply such points is
-// reconstructed SERIALLY with the reason printed (Recon::can_split).  Chunk 0 starts at byte 0,
-// not at the first PSB: `skip_bytes != 0' turns off the pre-init image view (e9phase.h), which
-// the loader window of every rewritten image needs.
+// Checking only 1 is not enough: a capture with neither 2 nor 3 split anyway (gemm MEDIUM, one
+// sync marker, no keyframes) comes out 84 % unknown at 20 jobs.  So a probe per boundary
+// finds the first point at or after each ideal split where 2 and 3 have both happened with no
+// state loss after them (Recon::run_anchor_scan), the chunk decodes from the PSB before that
+// point, and a capture that cannot supply such points is reconstructed SERIALLY with the reason
+// printed (Recon::can_split).  Chunk 0 starts at byte 0, not at the first PSB: `skip_bytes != 0'
+// turns off the pre-init image view, which would cost 99 338 records on whole-program CPython.
 //
 // Each chunk is reconstructed by a forked child with its own PtDecoder and its own VexInterp,
 // which decodes [warm, bound[k+1]) but emits only from bound[k]: the warm-up prefix rebuilds the
@@ -27,6 +27,7 @@
 #include "recon.h"
 #include <map>
 #include <memory>
+#include <array>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -35,6 +36,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <functional>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -44,32 +46,77 @@ static std::string chunk_path(const std::string& base, int i, const char* suffix
 }
 
 int Recon::run_parallel(const ReconOptions& o) {
-    const uint64_t total = PtDecoder::aux_size(o.aux);
-    std::vector<uint64_t> psb = PtDecoder::psb_offsets(o.aux);
-    int jobs = o.jobs; if (jobs > (int)psb.size()) jobs = (int)psb.size();
+    // A thread plan (--mt-split) is split in its VIRTUAL stream (ThreadPlan::vbase); every
+    // segment start and every PSB inside a segment is an entry point there.
+    const uint64_t total = o.plan ? plan_total(*o.plan) : PtDecoder::aux_size(o.aux);
+    std::vector<uint64_t> psb;
+    if (!o.plan) psb = PtDecoder::psb_offsets(o.aux);
+    else { ThreadPlan ip = *o.plan; ip.index(); std::map<int, std::vector<uint64_t>> fp;
+        for (size_t i = 0; i < ip.segs.size(); i++) {
+            const AuxSeg& sg = ip.segs[i]; if (sg.end <= sg.begin) continue;
+            psb.push_back(ip.vbase[i]);
+            auto it = fp.find(sg.file); if (it == fp.end()) it = fp.emplace(sg.file, PtDecoder::psb_offsets(ip.files[(size_t)sg.file])).first;
+            for (uint64_t p : it->second) if (p > sg.begin && p < sg.end) psb.push_back(ip.vbase[i] + (p - sg.begin));
+        }
+        std::sort(psb.begin(), psb.end()); psb.erase(std::unique(psb.begin(), psb.end()), psb.end()); }
+    // `par' is how many children run at once; `jobs' below is the number of CHUNKS.  Over-
+    // decomposition (chunks_per_job > 1) lets a pool of `par' workers absorb chunks of unequal
+    // cost; it is cheap now that a chunk's warm-up is one anchor window, not a whole chunk.
+    int par = o.jobs < 1 ? 1 : o.jobs;
+    // auto = over-decompose up to 4 chunks per worker while a chunk keeps >= 8 MB of AUX
+    // (measured, whole-program CPython nbody at 8 workers: 1 -> 71.4 s, 4 -> 62.6 s, 16 -> 65.1 s;
+    // the start-up half of the trace replays ~2x slower per instruction, so equal byte ranges
+    // are unequal work, and a chunk costs ~0.2-0.3 s of fixed setup + warm-up).
+    int cpj = o.chunks_per_job > 0 ? o.chunks_per_job
+            : (int)std::max<uint64_t>(1, std::min<uint64_t>(4, total / ((uint64_t)par * (8ull << 20))));
+    int jobs = par * cpj; if (jobs > (int)psb.size()) jobs = (int)psb.size();
     if (jobs < 1) jobs = 1;
+    if (par > jobs) par = jobs;
+    // A fork pool: at most `par' children at once; `child(k)' runs in the child and returns its
+    // exit code, `done(k, ok)' runs in the parent in COMPLETION order.  Returns the failure count.
+    auto pool = [&](int n, const std::function<int(int)>& child, const std::function<void(int, bool)>& done) -> int {
+        int next = 0, running = 0, bad = 0; std::map<pid_t, int> who;
+        while (next < n || running) {
+            while (next < n && running < par) {
+                pid_t p = fork();
+                if (p < 0) { perror("fork"); _exit(2); }
+                if (p == 0) { int rc = 1; try { rc = child(next); } catch (std::exception& e) { fprintf(stderr, "ptrecon child %d: %s\n", next, e.what()); rc = 1; } _exit(rc); }
+                who[p] = next++; running++;
+            }
+            int st = 0; pid_t p = waitpid(-1, &st, 0);
+            if (p < 0) { perror("waitpid"); break; }
+            auto it = who.find(p); if (it == who.end()) continue;
+            int k = it->second; who.erase(it); running--;
+            bool ok = WIFEXITED(st) && WEXITSTATUS(st) == 0; if (!ok) bad++;
+            if (done) done(k, ok);
+        }
+        return bad;
+    };
     const std::string base = o.out.empty() ? (o.summary.empty() ? std::string("ptrecon.par") : o.summary) : o.out;
 
     // ---- ONE setup for all the workers ---------------------------------------------------
-    // Parsing the site-map JSONs, sorting the interval map over every executable mapping and
-    // reading the cv value stream describe the PROCESS, not the chunk, so all of it is built once
-    // here and inherited through fork(), physically shared copy-on-write.  The parent never runs
-    // it, so each child forks from a pristine Recon and only has to say which chunk it is
-    // (retarget()) -- and the boundary probes below use the same object.
+    // A Recon per chunk child would re-parse both site-map JSONs, re-sort the interval map over
+    // every executable mapping and re-read the cv value stream -- per worker, and then hold them
+    // in per-worker memory.  All of that describes the PROCESS, not the chunk, so it is
+    // built once here and inherited through fork(), physically shared copy-on-write.  The parent
+    // never runs it, so each child forks from a pristine Recon and only has to say which chunk it
+    // is (retarget()) -- and the boundary probes below use the same object.
     std::unique_ptr<Recon> shared;
     if (o.gt_in.empty()) {
         ReconOptions so = o;
         so.jobs = 1; so.out.clear(); so.summary.clear(); so.text = false;
         so.skip_bytes = 0; so.end_bytes = 0; so.emit_from = 0; so.delta_seed_in.clear();
-        try { shared.reset(new Recon(so)); shared->preload_values(); }
+        try { shared.reset(new Recon(so)); shared->preload_values(); shared->prebuild_decoder(); }
         catch (std::exception& e) { fprintf(stderr, "ptrecon: shared setup failed (%s)\n", e.what()); shared.reset(); }
     }
 
-    // ---- refusing, loudly, instead of producing garbage ----------------------------------
-    // On a build with no keyframes and no sync markers there is NOTHING at a mid-trace PSB to
-    // re-anchor a chunk on, and the chunks would reconstruct an all-unknown machine.  A capture
-    // that cannot be split is reconstructed serially, with the reason on stderr, which is the
-    // answer the caller actually wanted.
+    // ---- refusing, loudly, instead of producing garbage --------------------------------
+    // Splitting at the PSB nearest each even division of the file, whatever the capture
+    // contains, does not work.  On a build with no keyframes and no sync markers there is NOTHING at a
+    // mid-trace PSB to re-anchor a chunk on, and the chunks reconstruct an all-unknown machine:
+    // 84 % of gemm MEDIUM comes out with unknown addresses at 20 jobs.  A capture that cannot be
+    // split is therefore reconstructed serially, with the reason
+    // on stderr, which is the answer the caller actually wanted.
     auto run_serial = [&](const std::string& why) -> int {
         fprintf(stderr, "ptrecon --jobs %d: NOT splitting this capture -- %s.\n"
                         "ptrecon: falling back to SERIAL reconstruction (the output is the serial output).\n",
@@ -91,7 +138,7 @@ int Recon::run_parallel(const ReconOptions& o) {
     const bool need_anchor = !o.decode_only;
     if (need_anchor) { std::string why; if (!shared->can_split(why)) return run_serial(why); }
 
-    // ---- round 0: SOUND chunk boundaries -------------------------------------------------
+    // ---- round 0: SOUND chunk boundaries ----------------------------------------------------
     // A chunk can only be replayed independently if, where it starts emitting, the decoder has
     // synchronised (a PSB), the registers have been re-defined (a KEYFRAME fired and its site
     // logged) and -- with the buffer sink -- the positional value cursor has been re-aligned (a
@@ -116,31 +163,23 @@ int Recon::run_parallel(const ReconOptions& o) {
     std::vector<uint64_t> tgt;
     for (int k = 1; k < jobs; k++) tgt.push_back(total * (uint64_t)k / (uint64_t)jobs);
     if (need_anchor) {
-        std::vector<pid_t> probes;
-        for (size_t k = 0; k < tgt.size(); k++) {
-            pid_t p = fork();
-            if (p < 0) { perror("fork"); return 2; }
-            if (p == 0) {
-                ReconOptions co = o; co.jobs = 1; co.out.clear(); co.summary.clear();
+        int pbad = pool((int)tgt.size(), [&](int k) -> int {
+                ReconOptions co = o; co.jobs = 1; co.out.clear(); co.summary.clear(); co.site_stats.clear();
                 co.skip_bytes = psb_le(tgt[k]); co.emit_from = 0; co.delta_seed_in.clear();
                 co.end_bytes = tgt[k] + search < total ? tgt[k] + search : total;
-                co.anchor_scan_out = chunk_path(base, (int)k, ".anchor");
-                int rc = 1;
-                try { shared->retarget(co); rc = shared->run_anchor_scan(); }
-                catch (std::exception& e) { fprintf(stderr, "ptrecon anchor probe %zu: %s\n", k, e.what()); rc = 1; }
-                _exit(rc);
-            }
-            probes.push_back(p);
-        }
-        int pbad = 0;
-        for (size_t k = 0; k < probes.size(); k++) { int st = 0; waitpid(probes[k], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) pbad++; }
-        if (pbad) fprintf(stderr, "ptrecon: %d of %zu boundary probes failed\n", pbad, probes.size());
+                co.anchor_scan_out = chunk_path(base, k, ".anchor");
+                shared->retarget(co); return shared->run_anchor_scan();
+            }, nullptr);
+        if (pbad) fprintf(stderr, "ptrecon: %d of %zu boundary probes failed\n", pbad, tgt.size());
     }
     // Chunk 0 starts at byte 0, NOT at the first PSB: `skip_bytes != 0' turns off the pre-init
-    // view of the E9Patch images (e9phase.h) and empties the log-on-change table, so a chunk 0
-    // that began at the first PSB would reconstruct the loader window against the PATCHED bytes.
-    // libipt synchronises forward to that PSB by itself.
+    // view of the E9Patch images and empties the log-on-change table, so a chunk 0 that
+    // began at the first PSB would reconstruct the loader window against the PATCHED bytes and lose
+    // 99 338 records of whole-program CPython -- at every job count, because chunk 0 is the same
+    // chunk every time.  libipt synchronises forward to
+    // that PSB by itself.
     std::vector<uint64_t> bound; bound.push_back(0);
+    std::vector<uint64_t> bfrom; bfrom.push_back(0);   // the PSB each boundary's probe started at
     long long lag_sum = 0; int lag_n = 0, missed = 0, too_close = 0;
     for (size_t k = 0; k < tgt.size(); k++) {
         int ok = 0; unsigned long anchor = 0, from = 0, kfo = 0, syo = 0, nkf = 0, nin = 0;
@@ -156,7 +195,7 @@ int Recon::run_parallel(const ReconOptions& o) {
         // Two boundaries closer than a quarter of an ideal chunk are one boundary: keep the first.
         if ((uint64_t)anchor <= bound.back() + ideal / 4) { too_close++; continue; }
         lag_sum += (long long)anchor - (long long)tgt[k]; lag_n++;
-        bound.push_back((uint64_t)anchor);
+        bound.push_back((uint64_t)anchor); bfrom.push_back(need_anchor ? (uint64_t)from : (uint64_t)anchor);
     }
     bound.push_back(total);
     jobs = (int)bound.size() - 1;
@@ -181,6 +220,23 @@ int Recon::run_parallel(const ReconOptions& o) {
     auto warm_start = [&](int k) -> uint64_t {
         if (k <= 0) return 0;
         if (o.exact_warm) return 0;       // --exact-warm: replay the whole prefix
+        // --decode-only: nothing is interpreted, so there is no state to warm -- decoding the
+        // previous chunk's tail again was pure duplicated work.  One PSB period is still decoded
+        // first: libipt reports the instructions of the packet that ENDS at the boundary PSB with
+        // offset() == bound[k], which the predecessor drops and only a decoder that was
+        // already running before the PSB hands out.
+        if (!need_anchor) { uint64_t w = psb_le(bound[k] - 1); return w <= psb.front() ? 0 : w; }
+        if (!o.warm_legacy) {
+            // The ANCHOR window: the probe for this boundary started decoding at
+            // the PSB `bfrom[k]' and found the keyframe and the sync marker AFTER it, so warming
+            // from there re-establishes exactly what the boundary was placed for.  `--warm-kb'
+            // adds margin (never past the previous chunk's start).
+            uint64_t want = bfrom[k];
+            if (o.warm_min) { uint64_t w2 = want > o.warm_min ? want - o.warm_min : 0;
+                              if (w2 < bound[k - 1]) w2 = std::min(bound[k - 1], want); want = w2; }
+            if (want <= psb.front()) return 0;
+            return psb_le(want);
+        }
         uint64_t want = bound[k] > o.warm_bytes ? bound[k] - o.warm_bytes : 0;
         if (want < bound[k - 1]) want = bound[k - 1];
         if (want <= psb.front()) return 0;
@@ -190,12 +246,13 @@ int Recon::run_parallel(const ReconOptions& o) {
         return psb_le(bound[k] - 1);
     };
 
-    // ---- round 1: the log-on-change scan -------------------------------------------------
+    // ---- round 1: the log-on-change scan --------------------------------------------------
     // Only for a build that actually has log-on-change values, and only when asked: it costs one
     // extra PT decode of the file (spread over the same N processes).  Chunk k scans its OWN range
     // and reports the last value logged at every site, plus a snapshot at chunk k+1's warm start,
     // which is the point chunk k+1 has to start its table from.
     bool scan = o.delta_scan && shared->has_delta();
+    if (scan && o.plan) return run_serial("a thread plan with log-on-change values cannot be delta-scanned (not implemented)");
     if (o.delta_scan && !scan)
         fprintf(stderr, "ptrecon --delta-scan: no log-on-change values in these site maps -- skipped\n");
     if (scan) {
@@ -204,7 +261,7 @@ int Recon::run_parallel(const ReconOptions& o) {
             pid_t p = fork();
             if (p < 0) { perror("fork"); return 2; }
             if (p == 0) {
-                ReconOptions co = o; co.jobs = 1; co.out.clear(); co.summary.clear();
+                ReconOptions co = o; co.jobs = 1; co.out.clear(); co.summary.clear(); co.site_stats.clear();
                 co.skip_bytes = bound[k]; co.end_bytes = bound[k + 1]; co.emit_from = 0;
                 co.scan_snap_at = (k + 1 < jobs) ? warm_start(k + 1) : 0;
                 co.delta_scan_out = chunk_path(base, k, ".dscan");
@@ -259,14 +316,34 @@ int Recon::run_parallel(const ReconOptions& o) {
         fprintf(stderr, "ptrecon --delta-scan: %zu logged values, %zu known at the last boundary\n", N, known);
     }
 
-    std::vector<pid_t> kids;
-    for (int k = 0; k < jobs; k++) {
-        pid_t p = fork();
-        if (p < 0) { perror("fork"); return 2; }
-        if (p == 0) {
+    // ---- round 2: the chunks, `par' at a time; the parent appends each finished chunk's trace to
+    // the output as soon as every chunk before it is done, so the concatenation overlaps the tail
+    // of the reconstruction instead of following it.
+    uint64_t out_records = 0;
+    FILE* out = nullptr; std::vector<char> buf;
+    if (!o.out.empty()) {
+        out = fopen(o.out.c_str(), "wb"); if (!out) { perror("out"); return 1; }
+        mtrace_hdr h{}; h.magic = MTRACE_MAGIC; h.version = MTRACE_VERSION; h.tid_count = 1;
+        fwrite(&h, sizeof h, 1, out); buf.resize(4 << 20);
+    }
+    std::vector<char> fin(jobs, 0); int merged = 0; bool merge_bad = false;
+    auto merge_ready = [&]() {
+        while (merged < jobs && fin[merged]) {
+            if (out && !merge_bad) {
+                std::string cp = chunk_path(base, merged, ".mtrace");
+                FILE* in = fopen(cp.c_str(), "rb");
+                if (!in) { fprintf(stderr, "ptrecon: missing %s\n", cp.c_str()); merge_bad = true; }
+                else { fseek(in, sizeof(mtrace_hdr), SEEK_SET); size_t n;
+                       while ((n = fread(buf.data(), 1, buf.size(), in)) > 0) { fwrite(buf.data(), 1, n, out); out_records += n / sizeof(mtrace_rec); }
+                       fclose(in); remove(cp.c_str()); }
+            }
+            merged++;
+        }
+    };
+    int bad = pool(jobs, [&](int k) -> int {
             ReconOptions co = o;
             co.jobs = 1;
-            // ---- chunk warm-up ---------------------------------------------------------------
+            // ---- chunk warm-up -------------------------------------------------------------
             // Chunk k decodes [warm, bound[k+1]) but only EMITS from bound[k]: the prefix
             // [warm, bound[k]) is the tail of chunk k-1, decoded with every record and every
             // counter suppressed, purely so that the registers, the shadow memory, the
@@ -286,38 +363,14 @@ int Recon::run_parallel(const ReconOptions& o) {
             co.seed_fs = warm > 0 && !o.no_seed_fs;
             co.out = o.out.empty() ? std::string() : chunk_path(base, k, ".mtrace");
             co.summary = chunk_path(base, k, ".json");
+            co.site_stats = o.site_stats.empty() ? std::string() : chunk_path(base, k, ".sites.csv");
             co.text = false;
-            int rc = 1;
-            try {
-                if (shared) { shared->retarget(co); rc = shared->run(); }
-                else { Recon r(co); rc = r.run(); }
-            } catch (std::exception& e) { fprintf(stderr, "ptrecon chunk %d: %s\n", k, e.what()); rc = 1; }
-            _exit(rc);
-        }
-        kids.push_back(p);
-    }
-    int bad = 0;
-    for (size_t k = 0; k < kids.size(); k++) { int st = 0; waitpid(kids[k], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st)) bad++; }
+            if (shared) { shared->retarget(co); return shared->run(); }
+            Recon r(co); return r.run();
+        }, [&](int k, bool ok) { if (ok) { fin[k] = 1; merge_ready(); } });
     if (scan) for (int k = 1; k < jobs; k++) remove(chunk_path(base, k, ".dseed").c_str());
-    if (bad) { fprintf(stderr, "ptrecon: %d of %d chunks failed\n", bad, jobs); return 1; }
-
-    // ---- concatenate the chunk traces, in order -------------------------------------
-    uint64_t out_records = 0;
-    if (!o.out.empty()) {
-        FILE* out = fopen(o.out.c_str(), "wb"); if (!out) { perror("out"); return 1; }
-        mtrace_hdr h{}; h.magic = MTRACE_MAGIC; h.version = MTRACE_VERSION; h.tid_count = 1;
-        fwrite(&h, sizeof h, 1, out);
-        std::vector<char> buf(1 << 20);
-        for (int k = 0; k < jobs; k++) {
-            std::string cp = chunk_path(base, k, ".mtrace");
-            FILE* in = fopen(cp.c_str(), "rb"); if (!in) { fprintf(stderr, "ptrecon: missing %s\n", cp.c_str()); fclose(out); return 1; }
-            fseek(in, sizeof(mtrace_hdr), SEEK_SET);
-            size_t n;
-            while ((n = fread(buf.data(), 1, buf.size(), in)) > 0) { fwrite(buf.data(), 1, n, out); out_records += n / sizeof(mtrace_rec); }
-            fclose(in); remove(cp.c_str());
-        }
-        fclose(out);
-    }
+    if (out) fclose(out);
+    if (bad || merge_bad) { fprintf(stderr, "ptrecon: %d of %d chunks failed\n", bad, jobs); return 1; }
 
     // ---- merge the per-chunk summaries ----------------------------------------------
     static const char* SUM[] = {"records", "unknown_addr", "instructions", "pt_overflows", "resyncs", "sync_failures", "psb_repaired",
@@ -332,17 +385,27 @@ int Recon::run_parallel(const ReconOptions& o) {
                                 "keyframe_site_defs",
                                 "warm_instructions", nullptr};
     std::vector<uint64_t> tot; for (int i = 0; SUM[i]; i++) tot.push_back(0);
+    // --jitdump: the code table is read-only, so each chunk child loads it and reports its own
+    // read accounting; these are sums, and the coverage is recomputed from them.
+    static const char* JIT[] = {"reads_object", "reads_trampoline", "reads_slab", "reads_anon_dump",
+                                "reads_unmapped", "reads_ambiguous", "reads_time_keyed",
+                                "reads_composed", "time_behind", "jit_instructions", "jit_records",
+                                "jit_unknown_addr", "jit_lift_failures", nullptr};
+    std::vector<uint64_t> jtot; for (int i = 0; JIT[i]; i++) jtot.push_back(0);
+    bool have_jit = false; uint64_t jit_versions = 0, jit_moved = 0, jit_removed = 0, jit_behind_max = 0;
     uint64_t delta_values = 0;                 // the same in every chunk, not a sum
     uint64_t kf_values = 0, kf_resync_values = 0;      // ditto
     // Per-image records / unknown addresses, merged by path (the serial run's `images').
     struct ImgAgg { uint64_t lo = ~0ull, hi = 0, records = 0, unknown = 0; std::string code; };
     std::map<std::string, ImgAgg> imgs; std::vector<std::string> img_order;
     double wall_max = 0; std::string chunkjs = "[";
+    uint64_t rh = 0; bool have_rh = false;
     for (int k = 0; k < jobs; k++) {
         std::string sp = chunk_path(base, k, ".json");
         Json j;
         try { j = json_load(sp); } catch (std::exception&) { fprintf(stderr, "ptrecon: cannot read %s\n", sp.c_str()); continue; }
         for (int i = 0; SUM[i]; i++) tot[i] += j[SUM[i]].u64();
+        if (j.has("rec_hash")) { have_rh = true; rh = rh_add(rh_mul(rh, rh_pow(j["records"].u64())), j["rec_hash"].u64()); }
         if (j["delta_values"].u64() > delta_values) delta_values = j["delta_values"].u64();
         if (j["keyframe_values"].u64() > kf_values) kf_values = j["keyframe_values"].u64();
         if (j["keyframe_resync_values"].u64() > kf_resync_values) kf_resync_values = j["keyframe_resync_values"].u64();
@@ -356,11 +419,18 @@ int Recon::run_parallel(const ReconOptions& o) {
             a.records += im["records"].u64(); a.unknown += im["unknown_addr"].u64();
             if (a.code.empty()) a.code = im["code"].str();
         }
+        if (j["jit"].t == Json::OBJ) { have_jit = true;
+            for (int i = 0; JIT[i]; i++) jtot[i] += j["jit"][JIT[i]].u64();
+            if (j["jit"]["versions"].u64() > jit_versions) jit_versions = j["jit"]["versions"].u64();
+            if (j["jit"]["moved"].u64() > jit_moved) jit_moved = j["jit"]["moved"].u64();
+            if (j["jit"]["removed"].u64() > jit_removed) jit_removed = j["jit"]["removed"].u64();
+            if (j["jit"]["time_behind_max_tsc"].u64() > jit_behind_max) jit_behind_max = j["jit"]["time_behind_max_tsc"].u64(); }
         double w = j["wall_s"].dbl(); if (w > wall_max) wall_max = w;
         chunkjs += std::string(k ? "," : "") + "{\"chunk\":" + std::to_string(k) +
                    ",\"aux_from\":" + std::to_string(bound[k]) + ",\"aux_to\":" + std::to_string(bound[k + 1]) +
                    ",\"records\":" + std::to_string(j["records"].u64()) +
                    ",\"unknown_addr\":" + std::to_string(j["unknown_addr"].u64()) +
+                   (j.has("rec_hash") ? ",\"rec_hash\":" + std::to_string(j["rec_hash"].u64()) : std::string()) +
                    ",\"instructions\":" + std::to_string(j["instructions"].u64()) +
                    ",\"unanchored_records\":" + std::to_string(j["unanchored_records"].u64()) +
                    ",\"aux_warm_from\":" + std::to_string(j["aux_skip_bytes"].u64()) +
@@ -372,6 +442,47 @@ int Recon::run_parallel(const ReconOptions& o) {
     }
     chunkjs += "]";
 
+    // ---- merge the per-chunk --site-stats CSVs --------------------------------------
+    // One row per logged value; `count', `repeats' and `skipped' are sums over the
+    // chunks, everything else is identical in all of them.  (A chunk boundary loses one
+    // repeat comparison per value, which is noise against the counts this feeds.)
+    if (!o.site_stats.empty()) {
+        std::vector<std::string> order; std::map<std::string, std::array<uint64_t, 3>> num;
+        std::map<std::string, std::string> head;
+        std::string hdr;
+        for (int k = 0; k < jobs; k++) {
+            std::string cp = chunk_path(base, k, ".sites.csv");
+            FILE* f = fopen(cp.c_str(), "r"); if (!f) continue;
+            char line[4096]; bool first = true;
+            while (fgets(line, sizeof line, f)) {
+                std::string L(line); while (!L.empty() && (L.back() == '\n' || L.back() == '\r')) L.pop_back();
+                if (first) { first = false; if (hdr.empty()) hdr = L; continue; }
+                // image,site,orig_addr,tramp_addr,kind,arg,payload_bits,count,repeats,skipped
+                std::vector<std::string> c; size_t p0 = 0;
+                for (size_t i = 0; i <= L.size(); i++)
+                    if (i == L.size() || L[i] == ',') { c.push_back(L.substr(p0, i - p0)); p0 = i + 1; }
+                if (c.size() < 10) continue;
+                std::string key = c[0] + "," + c[1] + "," + c[5];
+                auto it = num.find(key);
+                if (it == num.end()) { order.push_back(key); num[key] = {0, 0, 0};
+                    head[key] = c[0] + "," + c[1] + "," + c[2] + "," + c[3] + "," + c[4] + "," + c[5] + "," + c[6];
+                    it = num.find(key); }
+                it->second[0] += strtoull(c[7].c_str(), nullptr, 10);
+                it->second[1] += strtoull(c[8].c_str(), nullptr, 10);
+                it->second[2] += strtoull(c[9].c_str(), nullptr, 10);
+            }
+            fclose(f); remove(cp.c_str());
+        }
+        FILE* f = fopen(o.site_stats.c_str(), "w");
+        if (f) {
+            fprintf(f, "%s\n", hdr.empty() ? "image,site,orig_addr,tramp_addr,kind,arg,payload_bits,count,repeats,skipped" : hdr.c_str());
+            for (auto& k : order) fprintf(f, "%s,%lu,%lu,%lu\n", head[k].c_str(),
+                (unsigned long)num[k][0], (unsigned long)num[k][1], (unsigned long)num[k][2]);
+            fclose(f);
+            fprintf(stderr, "site stats: %s (%zu logged values, merged from %d chunks)\n",
+                    o.site_stats.c_str(), order.size(), jobs);
+        }
+    }
     std::string js = "{";
     for (int i = 0; SUM[i]; i++) js += std::string(i ? "," : "") + "\"" + SUM[i] + "\":" + std::to_string(tot[i]);
     {   // per-image breakdown, biggest first
@@ -391,23 +502,25 @@ int Recon::run_parallel(const ReconOptions& o) {
         }
         js += "]";
     }
-    js += ",\"jit\":null";
+    if (have_jit) {
+        uint64_t served = jtot[0] + jtot[1] + jtot[2] + jtot[3] + jtot[4];
+        js += ",\"jit\":{\"versions\":" + std::to_string(jit_versions) + ",\"moved\":" + std::to_string(jit_moved) +
+              ",\"removed\":" + std::to_string(jit_removed);
+        for (int i = 0; JIT[i]; i++) js += std::string(",\"") + JIT[i] + "\":" + std::to_string(jtot[i]);
+        js += ",\"time_behind_max_tsc\":" + std::to_string(jit_behind_max) +
+              ",\"code_byte_coverage\":" + std::to_string(served ? (double)(jtot[0] + jtot[1] + jtot[2]) / (double)served : 0.0) + "}";
+    } else js += ",\"jit\":null";
     js += ",\"delta_values\":" + std::to_string(delta_values);
     js += ",\"keyframe_values\":" + std::to_string(kf_values) + ",\"keyframe_resync_values\":" + std::to_string(kf_resync_values);
-    js += ",\"warm_bytes\":" + std::to_string(o.warm_bytes);
+    if (have_rh) js += ",\"rec_hash\":" + std::to_string(rh);
+    js += ",\"warm_bytes\":" + std::to_string(o.warm_legacy ? o.warm_bytes : o.warm_min);
+    js += ",\"warm_rule\":" + std::string(o.exact_warm ? "\"exact\"" : !need_anchor ? "\"none\"" : o.warm_legacy ? "\"legacy\"" : "\"anchor\"");
+    js += ",\"par\":" + std::to_string(par);
     js += ",\"jobs\":" + std::to_string(jobs) + ",\"wall_s\":" + std::to_string(wall_max) +
           ",\"insn_per_s\":" + std::to_string(wall_max > 0 ? tot[2] / wall_max : 0) +
           ",\"chunks\":" + chunkjs + "}\n";
     if (!o.summary.empty()) { FILE* f = fopen(o.summary.c_str(), "w"); if (f) { fputs(js.c_str(), f); fclose(f); } }
     fprintf(stderr, "%s", js.c_str());
     if (!o.out.empty()) fprintf(stderr, "ptrecon --jobs %d: %lu records concatenated -> %s\n", jobs, (unsigned long)out_records, o.out.c_str());
-    // Same refusal as the serial run (Recon::run): a buffer-sink build given --cv from which no
-    // chunk consumed a single value.
-    uint64_t cv_used_total = 0; for (int i = 0; SUM[i]; i++) if (!strcmp(SUM[i], "cv_used")) cv_used_total = tot[i];
-    if (!o.cvfile.empty() && cv_used_total == 0 && shared->has_buffer_values()) {
-        fprintf(stderr, "ptrecon: REFUSING the result: --cv %s was given for a buffer-sink build and cv_used == 0 "
-                        "over all %d chunks\n", o.cvfile.c_str(), jobs);
-        return 3;
-    }
     return 0;
 }

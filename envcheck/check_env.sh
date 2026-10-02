@@ -5,9 +5,9 @@
 #
 #   bash envcheck/check_env.sh            # exit 0 = every hard check passed (warnings allowed)
 #
-# Hard checks (FAIL): Intel CPU; Intel PT PMU present; PTWRITE on every online core;
-# >= 8 online cores; >= 28 GiB RAM; >= 40 GB free disk.
-# Soft checks (WARN): perf_event_paranoid (the privileged container bypasses it), free disk
+# Hard checks (FAIL): Intel CPU; Intel PT PMU present; >= 8 online cores; >= 28 GiB RAM; >= 40 GB free disk.
+# PT required; PTWRITE only for the *-PTWRITE bars (WARN without it: every other configuration executes no PTWRITE).
+# Soft checks (WARN): PTWRITE on every online core, perf_event_paranoid (the privileged container bypasses it), free disk
 # < 100 GB, disk-write and DRAM bandwidth below thresholds, turbo / ASLR not controllable,
 # hybrid P/E cores, SMT on, kernel newer than tested.  Nothing on the host is changed.
 set -u
@@ -41,6 +41,12 @@ else
   fail "no Intel PT PMU at $PT (kernel without intel_pt, a VM without PT pass-through, or a CPU without PT)"
 fi
 
+PTS=$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)
+if [ "$PTS" = 0 ]; then
+  pass "kernel.yama.ptrace_scope=0"
+else
+  warn "kernel.yama.ptrace_scope=$PTS: the Java HiFi bars need 0 (Pin 4.4 attaches to a child the JVM execs): sudo sysctl -w kernel.yama.ptrace_scope=0"
+fi
 PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 99)
 PT_OK_HERE=1
 if [ "$IS_ROOT" = 1 ] || [ "$PARANOID" -le 1 ]; then
@@ -76,12 +82,12 @@ elif [ -d "$PT" ]; then
   warn "gcc not found: perf_event_open(intel_pt) not probed"
 fi
 
-# PTWRITE: the PMU advertises it (what the kernel read at boot) and CPUID.(14H,0):EBX[4]
+# PTWRITE (PT required; PTWRITE only for the *-PTWRITE bars): the PMU advertises it (what the kernel read at boot) and CPUID.(14H,0):EBX[4]
 # on every online core (hybrid parts can differ per core).
 if [ "$(cat $PT/caps/ptwrite 2>/dev/null)" = 1 ]; then
   pass "PTWRITE advertised by the PT PMU"
 else
-  fail "PTWRITE not advertised ($PT/caps/ptwrite != 1); needs Ice Lake / Gracemont or newer"
+  warn "PTWRITE not advertised ($PT/caps/ptwrite != 1): PT required; PTWRITE only for the *-PTWRITE bars (HiFi-PTWRITE, Fast-PTWRITE; 4th-gen Xeon Scalable / 12th-gen Core P-cores or newer, Goldmont Plus / Tremont / Gracemont) -- skip those bars on this machine"
 fi
 ONLINE=$(cat /sys/devices/system/cpu/online 2>/dev/null)
 CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
@@ -99,7 +105,7 @@ C
       taskset -c "$c" "$TMP/ptw" || MISSING="$MISSING $c"
     done
     if [ -z "$MISSING" ]; then pass "PTWRITE (CPUID 14H) on all online cores ($ONLINE)"
-    else fail "PTWRITE missing on core(s):$MISSING"; fi
+    else warn "PTWRITE missing on core(s):$MISSING (PT required; PTWRITE only for the *-PTWRITE bars)"; fi
   else warn "per-core PTWRITE CPUID probe skipped (gcc/taskset unavailable)"; fi
 fi
 
@@ -221,10 +227,11 @@ cat <<'T'
     SMT on              -> more variance; use the reported medians.
     slow disk / DRAM    -> accuracy re-runs (which write traces) get slower or lose packets;
                            overhead runs discard the streams and are unaffected.
-  Without root: run/experiments_v1.sh --dry-run needs nothing, not even Docker if
+  Without root: run/fig5.sh --dry-run needs nothing, not even Docker if
     python3 + matplotlib/numpy are installed.  A user in the docker group can run every
-    re-measurement (the privileged container opens Intel PT itself).  Only the turbo lock
-    (QUIET=1 in docker/run.sh) needs sudo; without it magnitudes drift a few percent.
+    re-measurement (the privileged container opens Intel PT itself).  sudo is used by docker/run.sh
+    for kernel.yama.ptrace_scope=0 during run/fig5.sh (Java HiFi bars) and for the optional turbo
+    lock (QUIET=1); without the lock magnitudes drift a few percent.
 T
 echo
 if [ "$FAIL" -eq 0 ]; then echo "RESULT: OK  (warnings: $WARN)"; exit 0; fi

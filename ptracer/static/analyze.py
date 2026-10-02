@@ -24,12 +24,12 @@ for n in ('angr', 'cle', 'pyvex', 'claripy'):
 REG_SPEC_NAME = {'fs': 'fs_base', 'gs': 'gs_base'}
 LOGGABLE = set(['rax', 'rcx', 'rdx', 'rbx', 'rsp', 'rbp', 'rsi', 'rdi', 'r8', 'r9', 'r10', 'r11', 'r12', 'r13', 'r14', 'r15', 'fs_base'] + ['xmm%d' % i for i in range(16)])
 UNLOGGABLE = []   # (addr, when, reg) skipped by sites_from_choice; reported in the summary
-ANALYZER_VERSION = 'v2.36'   # reported in the spec (`analyzer_version`)
+ANALYZER_VERSION = 'v2.37'   # reported in the spec (`analyzer_version`)
 # The per-function cache key carries CACHE_VERSION: bump it whenever a change alters the cached
 # per-function output. KEYFRAME_RULE is appended to the key only for keyframed runs (`--keyframe K>0`)
 # and is bumped when the keyframe/resync logged-set rule changes.
-CACHE_VERSION = 'v2.37'
-KEYFRAME_RULE = 'kf2'
+CACHE_VERSION = 'v2.38'
+KEYFRAME_RULE = 'kf3'
 
 
 def add_successor_sites(proj, df, roots, avoid):
@@ -225,7 +225,9 @@ def resync_sites(f, df, S, sites, K):
             if br.ends_call or (b in f.blocks and f.blocks[b].jumpkind == 'Ijk_Call'):
                 written_in |= CSAVE            # an in-loop call clobbers caller-saved
         across = (used_after - written_in) & ALL   # carried unchanged across the loop, read after it
-        for b in sorted(headers & comp):
+        # the outermost header(s) only: an inner-loop header would pay the counter on every
+        # inner iteration, for no bounded-loss benefit.
+        for b in sorted(h for h in headers & comp if f.loop_depth.get(h, 0) == 1):
             regs = []
             for r in sorted(reads):
                 v = df.resolve(df._in_value(b, r))
@@ -248,6 +250,45 @@ def resync_sites(f, df, S, sites, K):
                 out.append({'addr': b, 'when': 'before', 'kind': 'reg', 'regs': regs, 'orphan': b in f.orphans,
                             'resync': True, 'keyframe': K, 'note': 'resync'})
     return out
+
+
+def move_off_orphan_padding(proj, df, sites):
+    """An orphan block (reached only through an unresolved indirect jump) that the linear sweep
+    started at alignment padding is entered at its first real instruction, so a `before' site on
+    the padding never executes and the block's live-in values are never logged.  Move such a site
+    to the first non-nop instruction of its block (nops change no register: same logged values)."""
+    def is_nop(ins):
+        return ins.mnemonic.endswith('nop') or (ins.mnemonic == 'xchg' and ins.op_str == 'ax, ax')
+    insn_blk = {}
+    for b, br in df.results.items():
+        for i in br.insns:
+            insn_blk[i] = b
+    taken = {(st['addr'], st['when']) for st in sites}
+    for st in sites:
+        if not st.get('orphan') or st['when'] != 'before' or st['kind'] != 'reg':
+            continue
+        b = insn_blk.get(st['addr'])
+        if b is None or b != st['addr']:
+            continue
+        try:
+            insns = proj.factory.block(b, size=f_size(df, b)).capstone.insns
+        except Exception:
+            continue
+        if not insns or not is_nop(insns[0]):
+            continue
+        own = set(df.results[b].insns)
+        t = next((ins.address for ins in insns if ins.address in own and not is_nop(ins)), None)
+        if t is None or (t, 'before') in taken:
+            continue
+        taken.discard((st['addr'], 'before')); taken.add((t, 'before'))
+        st['moved_off_padding'] = st['addr']; st['addr'] = t
+    return sites
+
+
+def f_size(df, b):
+    br = df.results[b]
+    last = max(br.insns)
+    return last - b + 16
 
 
 def coalesce_fast(proj, df, sites):
@@ -512,12 +553,14 @@ def analyze_function(binary, name, start, end, mode='hifi', keyframe=0, avoid=No
         sites = coalesce_fast(proj, df, sites)
     if keyframe:
         sites += resync_sites(f, df, S, sites, keyframe)
+    sites = move_off_orphan_padding(proj, df, sites)
     dead = dataflow.flags_liveness(f, df.results)
     for st in sites:
         st['flags_dead'] = bool(dead(st['addr'], st['when']))
         st['dead_regs'] = rdead(st['addr'], st['when'])[:6]     # scratch registers the trampoline may use
     for st in sites:
         st['addr'] -= delta
+        if 'moved_off_padding' in st: st['moved_off_padding'] -= delta
     unc = S.uncoverable
     unc_ids = {n.id for n in unc}
     # per direct call site: which argument registers are computable offline from this function's
@@ -744,8 +787,23 @@ def _discover_functions(binary, funcs, exec_ranges, rounds=8):
                 return data[off + (a - lo): off + (a - lo) + n]
         return b''
 
+    import bisect as _bisect
+    _cov = {}
+
     def covered(a, table):
-        return any(st <= a < en for _, st, en in table.values())
+        # same answer as any(st <= a < en for every function): a prefix maximum of the extents' ends over the
+        # starts sorted, rebuilt only when `table' changes (once per round); a linear scan per query is too slow on
+        # large binaries
+        key = id(table), len(table)
+        if _cov.get('key') != key:
+            iv = sorted((st, en) for _, st, en in table.values())
+            mx, m = [], None
+            for _st, en in iv:
+                m = en if m is None or en > m else m
+                mx.append(m)
+            _cov.update(key=key, starts=[st for st, _ in iv], mx=mx)
+        i = _bisect.bisect_right(_cov['starts'], a) - 1
+        return i >= 0 and _cov['mx'][i] > a
 
     # RELOCATION SEEDS: a function reached only through a table of function pointers (vtables, ops
     # structs) is never the target of a direct call, so the call-target scan below cannot find it.
@@ -1061,10 +1119,16 @@ def main():
     # the hottest functions; re-anchoring there is a large share of all logged values), and
     # create an rsp-only entry site for main and the --anchor functions (--anchor-all: every function).
     anchors = set(args.anchor or []) | {'main'}
+    # the first `before' reg site at (function, entry address) -- an index, not a scan per function (a scan is
+    # O(functions x sites))
+    entry_site = {}
+    for st in sites:
+        if st['kind'] == 'reg' and st['when'] == 'before':
+            entry_site.setdefault((st['func'], st['addr']), st)
     for r in ([] if args.all_memops else results.values()):
         if 'error' in r or not r.get('name'):
             continue
-        ent = next((st for st in sites if st['func'] == r['name'] and st['addr'] == r['start'] and st['kind'] == 'reg' and st['when'] == 'before'), None)
+        ent = entry_site.get((r['name'], r['start']))
         if ent is not None:
             if 'rsp' not in ent['regs'] and (r.get('has_calls') or args.anchor_all or r['name'] in anchors):
                 ent['regs'] = sorted(set(ent['regs']) | {'rsp'})

@@ -13,6 +13,7 @@ directory today, the script is kept so the build calls the two directories the s
 | `libdft64/` | the DFT baseline: byte-level taint tracking over every memory and register operand; unmodified; `tools/obj-intel64/track.so` built against Pin 3.20 | github.com/AngoraFuzzer/libdft64, git 20804d5bae5d8aed31a71761b1a1149e35a0da95 |
 | `no_clone3/` | a seccomp shim that makes `clone3` return ENOSYS so glibc falls back to `clone`, which Pin 3.20 virtualizes; used in front of every Pin 3.20 run of a threaded target (`gcc -O2 -o no_clone3 no_clone3.c`) | local |
 | `spindle-plus/` | the Spindle S-Tracer baseline made thread-safe (see `OPTIONAL_TRACERS.md`); LLVM pass sources and runtime only, not built here | local + Spindle's MTS.cpp/MTS.h (github.com/thu-pacman/Spindle, git 15c68cbfe1559e0e4c70588e43725e0916bc5af7) |
+| `valgrind-3.22.0.tar.bz2` | Valgrind 3.22.0 source release, built by `run/lib/build_baselines.sh` with the patch below | sourceware.org/pub/valgrind, sha256 c811db5add2c5f729944caf47c4e7a65dcaabb9461e472b578765dd7bf6d2d4c, GPLv2 |
 | `valgrind-lackey-memtrace.patch` | the patch that turns Valgrind 3.22.0's lackey into a binary memory tracer (see `OPTIONAL_TRACERS.md`) | local |
 
 Rebuilding the Pintools:

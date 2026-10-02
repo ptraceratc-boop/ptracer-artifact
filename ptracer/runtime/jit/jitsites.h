@@ -143,7 +143,7 @@ static int ptj_parse_reply(const char *buf, size_t len, uint64_t base, PtjSite *
   return n;
 }
 
-// D-J6: `"restart_roots": [abs addr, ...]` -- the analyzer v2.21 reply carries, per function,
+// `"restart_roots": [abs addr, ...]` -- the analyzer v2.21 reply carries, per function,
 // the addresses at which its recursive descent RESTARTED after the descent from the entry ran
 // out (an optimised code object is entered in the middle by OSR / deopt / an exception handler,
 // so the reachable-from-offset-0 part of `JS:*array` is 39 of 1 888 bytes).  The patcher must
@@ -310,7 +310,7 @@ static inline uint64_t ptj_ns(void) {
 // drive this as a loop: request -> patch -> collect what would not go -> re-request with
 // the union of the failures -> patch again.  With navoid == 0 the request is byte-for-byte
 // what it was, so the V8 front end is unaffected.
-// D-J6: `roots` are extra entry offsets the VM knows about (HotSpot's jvmtiAddrLocationMap);
+// `roots` are extra entry offsets the VM knows about (HotSpot's jvmtiAddrLocationMap);
 // `data_from` is the offset of the object's first inline-data byte, which clips the analyzer's
 // restart fill.  `rroots`/`nrroots` receive the reply's `restart_roots` as OFFSETS -- the
 // patcher must decode from them too.  All four are optional; with them absent the request is
@@ -411,7 +411,7 @@ static void ptj_cache_path(PtjClient *c, const char *key, char *buf, size_t n) {
 
 // PTJITC1: off id when kind size nregs [regs...]          (pre-keyframe, still read)
 // PTJITC2: off id when kind size nregs flags_dead resync kf [regs...]
-// PTJITC3: header carries the number of `restart_roots' (D-J6) and one line of offsets before
+// PTJITC3: header carries the number of `restart_roots' and one line of offsets before
 //          the sites.  A cache entry without them would hand the patcher a site list it cannot
 //          place: the sites beyond the first restart are at boundaries the patcher's own sweep
 //          never reaches, and every one of them is dropped as `no_insn_boundary'.

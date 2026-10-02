@@ -1,8 +1,7 @@
 // jvmtiagent.cc -- PTracer v2, Stage 2 for HotSpot JIT code (decision D9, the Java half).
 //
 // A JVMTI agent (`-agentpath:`) that, on every `CompiledMethodLoad` and
-// `DynamicCodeGenerated`, dumps the generated code (the `JTR1` jitdump of
-// the design notes, asks the analyzer service for that code object's
+// `DynamicCodeGenerated`, dumps the generated code (the `JTR1` jitdump), asks the analyzer service for that code object's
 // critical value set (content-hash cached, D7) and patches E9Patch-style trampolines
 // into it -- exactly the pipeline `../jithook.cc` runs for V8, sharing `../jitsites.h`
 // (analyzer client + cache), `../jitpatch.h` (window selection + trampoline emission)
@@ -10,8 +9,8 @@
 //
 // The one thing that is *not* shared is how the detour is written.  V8 delivers
 // `CODE_ADDED` before the code object's first execution; HotSpot posts
-// `CompiledMethodLoad` on the **Service Thread after the nmethod is already reachable**
-// the design notes, so an application thread may be executing the very bytes we
+// `CompiledMethodLoad` on the **Service Thread after the nmethod is already reachable**,
+// so an application thread may be executing the very bytes we
 // are about to displace.  The install is therefore the Intel SDM cross-modifying-code
 // protocol -- the same one HotSpot uses for its own not-entrant patching:
 //
@@ -71,12 +70,13 @@ static int g_verbose = 0;
 static int g_relative_avoid = 0; // opt-in, offsets rather than process-specific addresses
 static int g_use_ptwrite = 1;
 static int g_pinbridge = 0;
+static int g_wpdef = 0;       // whole-program Fast => the extended patching options default on
 // Protected by g_lock, including publication versus JVMTI unload/reuse.
 static uint64_t g_pin_objects = 0, g_pin_sites = 0, g_pin_retired = 0;
 static uint64_t g_pin_objects_at_exit = 0, g_pin_sites_at_exit = 0;
 static uint64_t g_pin_generation = 0;
 static std::unordered_map<uint64_t, uint64_t> g_pin_live;
-// D-J14: every jmethodID the VM has already compiled once.  Guarded by g_lock, which every
+// Every jmethodID the VM has already compiled once.  Guarded by g_lock, which every
 // CompiledMethodLoad already holds; jmethodIDs are stable for the life of the VM.
 static std::unordered_set<uint64_t> g_seen_methods;
 static void pin_publish(uint64_t operation, uint64_t base, uint64_t length,
@@ -91,6 +91,8 @@ static void pin_publish(uint64_t operation, uint64_t base, uint64_t length,
 static int g_patch_interp = 0;       // native interp=1: legacy r13 probes; 2: full critical values
 static int g_patch_stubs = 0;        // stubs=1: also patch the other DynamicCodeGenerated blobs
 static uint64_t g_stub_secondary_entries = 0;
+static uint64_t g_zero_tail_trunc = 0, g_sig_handler_skips = 0;
+static uint64_t g_skipped_mh = 0;           // Stubs whose post-padding entry was forbidden
 static int g_diag = 0;
 static uint64_t g_min_patch = 0, g_max_patch = ~0ull, g_attempt = 0;
 static uint32_t g_space = 3;
@@ -100,7 +102,7 @@ static size_t g_arena_mb = 1024, g_slab_mb = 16;
 static FILE *g_hashdump = nullptr;   // "<masked hash> <addr> <len> <name>" per object
 static uint32_t g_maxlen = 0;        // skip analysis of objects larger than this (0 = no cap)
 static long g_drain_ms = 60000;      // how long VMDeath waits for the analysis pool
-// Measurement-only the design notes: ctr=1 prefixes every trampoline with a
+// Measurement-only: ctr=1 prefixes every trampoline with a
 // flags-safe `incq' so a run reports how many times each trampoline EXECUTED; ctrdump=PATH
 // writes `idx tramp_addr window_addr count' at VM death.  A counting configuration, not a
 // timing one -- the prologue is 20 bytes of extra work per trampoline execution.
@@ -114,7 +116,7 @@ static uint64_t (*g_instlog_buf)[3] = nullptr;
 static uint32_t g_instlog_n = 0;
 static const char *g_ctrdump = nullptr;
 static uint32_t g_ctr_max = 1u << 17;      // 128k counters = 1 MB at the head of the slab
-// Keyframes (defect D-J1) and the same-run ground truth (D-J2): the design notes
+// Keyframes and the same-run ground truth.
 static uint32_t g_keyframe = 1024;         // agent option `keyframe=K' (0 = the A/B control)
 static uint32_t g_kfctr_max = 16384;       // `kfctr=N' countdown cells (1 MiB of slab)
 static PtjGtRing g_gt;                     // `gt=1': the process's own address log
@@ -134,25 +136,28 @@ static struct {
   uint64_t skipped_small, skipped_cap, skipped_type, skipped_nolo;
   uint64_t readd, superseded, unload_retired;
   uint64_t installs, int3_traps, foreign_traps, sync_calls;
-  // D-J12b the design notes: the interior-quiescence phase of the install.
+  // The interior-quiescence phase of the install.
   uint64_t quiesce_rounds, quiesce_signals, quiesce_redirects, quiesce_timeouts,
            quiesce_unknown_rip, quiesce_ns;
+  uint64_t quiesce_blocked;   // Threads skipped because they block the signal
   uint64_t selftest_int3, selftest_quiesce;      // 1 = passed (VM_INIT), 0 = not run/failed
-  // D-J13 the design notes: HotSpot's IMPLICIT EXCEPTIONS inside a
+  // HotSpot's IMPLICIT EXCEPTIONS inside a
   // DISPLACED instruction.  A relocated load/store/safepoint-poll that faults does so at a
   // pc inside our trampoline slab, which is not in the code cache, so the VM's signal
   // handler cannot map it to the nmethod's implicit-exception continuation and the process
   // dies.  `xlat_hits' counts the faults we translated back to the original instruction's
   // address before chaining to the VM's handler; `xlat_other' faults elsewhere in the slab
   // (the buffer sink's guard pages are these); `xlat_relmap' the size of the pc map.
-  uint64_t xlat_hits, xlat_other, xlat_relmap, xlat_sigs;
+  uint64_t xlat_hits, xlat_other, xlat_relmap, xlat_sigs, xlat_relmap_lost;
   uint64_t ve_gt_20, ve_none;
   uint64_t locmap_entries, locmap_objs;
-  uint64_t restart_roots, restart_objs;   // D-J6: analyzer restart roots seeded into the sweep
+  uint64_t restart_roots, restart_objs;   // Analyzer restart roots seeded into the sweep
   uint64_t mprotect_calls, mprotect_fail;
   uint64_t entry_probe_tries;
   uint64_t interp_entries, interp_patched;
   uint64_t win_at_exit, val_at_exit, obj_at_exit, sites_at_exit;   // before the VMDeath drain
+  uint64_t uepentry_moved, uepentry_blocked, uepentry_clash;   // Entry-site moves (see apply_patch)
+  uint64_t death_ns, jobs_pending_at_death;   // When the timed program ended, and what was still queued
   // --- the `avoid` re-solve loop (analyzer v2.18) -----------------------------------
   uint64_t plan_ns, plan_passes;        // cost of the non-installing planning passes
   uint64_t avoid_objs;                  // objects that needed at least one re-solve
@@ -165,10 +170,10 @@ static struct {
   // --- when did patching converge?  CLOCK_MONOTONIC, comparable with the harness's
   // own time.monotonic() stamps on Renaissance's `iteration N completed' lines.
   uint64_t agent_load_ns, first_install_ns, last_install_ns;
-  // --- DEFECT D-J3.2: how long after its CODE_ADDED is an nmethod actually patched?
+  // --- How long after its CODE_ADDED is an nmethod actually patched?
   // A Java workload shorter than that is measured on an UNPATCHED JVM, whatever the
   // offline stage does, so this has to be a reported number and not a footnote.
-  uint64_t recompiles;                     // D-J14: events for a method compiled before
+  uint64_t recompiles;                     // Events for a method compiled before
   uint64_t lat_n, lat_sum, lat_max;        // CODE_ADDED -> the detour is installed
   uint64_t qlat_sum, qlat_max;             // ... of which spent waiting in the job queue
 } g_c;
@@ -184,7 +189,7 @@ static void note_latency(uint64_t enq_ns, uint64_t qwait) {
   pthread_mutex_unlock(&g_latlock);
 }
 
-// --- D-J14 (2026-09-22): WHERE the publication latency goes ------------------------------
+// --- WHERE the publication latency goes ------------------------------
 // `patch_latency_ms' said only "mean 2.5 s, of which 2.4 s was queue wait".  That is not a
 // fix, it is a symptom, so the path is split into the six stages a change could aim at:
 //   evt     the CompiledMethodLoad handler: name lookup, the jitdump record, the snapshot
@@ -198,19 +203,28 @@ static void note_latency(uint64_t enq_ns, uint64_t qwait) {
 struct StageTL { uint64_t hash, cache, anal, pub; };
 static thread_local StageTL g_sgtl;
 
-// D-J14 diagnosis: one line per published object, so the Pintool's `-jitmiss 3' addresses can
+// Diagnosis: one line per published object, so the Pintool's `-jitmiss 3' addresses can
 // be turned into names.  Written beside the stats file; diagnostic, off unless `objlog=' is set.
-struct ObjRec { uint64_t addr, len, pub_ns, lat_ns, q_ns, a_ns, c_ns; char name[96]; };
+// The log also records jobs that did NOT publish (stale, failed, forwarded) and
+// when each job was first queued, dequeued, how many analyzer round trips it made and whether it
+// was a tier-up (prio), so plan-queue latency can be attributed per method.  Same option.
+struct ObjRec { uint64_t addr, len, pub_ns, lat_ns, q_ns, a_ns, c_ns, q0_ns, deq_ns;
+                uint32_t ncalls; char outcome, lane, prio, ctype; char name[96]; };
+static thread_local uint32_t g_ncalls_tl = 0;
 static ObjRec *g_objlog = nullptr; static uint32_t g_objlog_n = 0, g_objlog_max = 0;
 static pthread_mutex_t g_objloglock = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_objlogfile = nullptr;
-static void obj_log(uint64_t addr, uint32_t len, uint64_t lat, uint64_t qw, const char *name) {
+static void obj_log(uint64_t addr, uint32_t len, uint64_t lat, uint64_t qw, const char *name,
+                    char outcome = 'P', char lane = 0, char prio = 0, char ctype = 0,
+                    uint64_t q0 = 0, uint64_t deq = 0) {
   if (!g_objlog) return;
   pthread_mutex_lock(&g_objloglock);
   if (g_objlog_n < g_objlog_max) {
     ObjRec *r = &g_objlog[g_objlog_n++];
     r->addr = addr; r->len = len; r->pub_ns = ns_now(); r->lat_ns = lat;
     r->q_ns = qw; r->a_ns = g_sgtl.anal; r->c_ns = g_sgtl.cache;
+    r->q0_ns = q0; r->deq_ns = deq; r->ncalls = g_ncalls_tl;
+    r->outcome = outcome; r->lane = lane; r->prio = prio; r->ctype = ctype;
     snprintf(r->name, sizeof r->name, "%s", name ? name : "");
   }
   pthread_mutex_unlock(&g_objloglock);
@@ -219,14 +233,16 @@ static void write_objlog(void) {
   if (!g_objlog || !g_objlogfile) return;
   FILE *f = fopen(g_objlogfile, "w");
   if (!f) return;
-  fprintf(f, "# addr len publish_ns latency_ns queue_ns analyze_ns cache_ns name   (agent_load_ns=%llu)\n",
+  fprintf(f, "# addr len publish_ns latency_ns queue_ns analyze_ns cache_ns q0_ns deq_ns ncalls outcome lane prio ctype name   (agent_load_ns=%llu)\n",
           (unsigned long long)g_c.agent_load_ns);
   for (uint32_t i = 0; i < g_objlog_n; i++)
-    fprintf(f, "%llu %llu %llu %llu %llu %llu %llu %s\n", (unsigned long long)g_objlog[i].addr,
+    fprintf(f, "%llu %llu %llu %llu %llu %llu %llu %llu %llu %u %c %d %d %d %s\n", (unsigned long long)g_objlog[i].addr,
             (unsigned long long)g_objlog[i].len, (unsigned long long)g_objlog[i].pub_ns,
             (unsigned long long)g_objlog[i].lat_ns, (unsigned long long)g_objlog[i].q_ns,
             (unsigned long long)g_objlog[i].a_ns, (unsigned long long)g_objlog[i].c_ns,
-            g_objlog[i].name);
+            (unsigned long long)g_objlog[i].q0_ns, (unsigned long long)g_objlog[i].deq_ns,
+            g_objlog[i].ncalls, g_objlog[i].outcome ? g_objlog[i].outcome : 'P',
+            g_objlog[i].lane, g_objlog[i].prio, g_objlog[i].ctype, g_objlog[i].name);
   fclose(f);
 }
 
@@ -288,7 +304,7 @@ static const size_t TSLAB_CHUNK = 1u << 20;
 
 // Only the pages that hold trampolines are RWX; the rest stays PROT_NONE and the live part
 // is int3-filled, so a detour that ever pointed at unused slab faults immediately instead
-// of running into zeros (the safety net of jit_runtime.md §6b-fix).
+// of running into zeros (a safety net).
 static void tslab_commit(size_t upto) {
   if (upto <= g_tslab_live || !g_tslab) return;
   size_t want = (upto + TSLAB_CHUNK - 1) & ~(TSLAB_CHUNK - 1);
@@ -308,7 +324,7 @@ static void tslab_commit(size_t upto) {
 // MAP_FIXED_NOREPLACE so the kernel cannot move it.
 static int tslab_try(uint64_t near, size_t cap);
 static void ctr_init_slab(void);   // ctr=1: carve the counter array out of the slab head
-static void kf_init_slab(void);    // keyframe counters + gt cursor, likewise (D-J1/D-J2)
+static void kf_init_slab(void);    // keyframe counters + gt cursor, likewise
 
 // The JVM reserves the heap, the compressed-class space and the code cache as one block,
 // and on some ASLR layouts there is no 64MB hole left within +-2GB of the code cache at
@@ -480,7 +496,7 @@ static void trap_install(void) {
 // ------------------------------------------- the two-phase atomic install ---
 // ptj_patch_object calls `hs_install` once per window; it performs phase 1 (the int3) and
 // queues the finished bytes.  `hs_commit` then runs phases 2-6 for the whole code object.
-// D-J12b the design notes: a window is usually SEVERAL instructions, and the
+// A window is usually SEVERAL instructions, and the
 // SDM's int3 protocol only covers one.  A thread whose rip sits on an INTERIOR instruction
 // boundary of the window when phase 3 overwrites those bytes (descheduled there, parked in a
 // page fault or a ptrace stop, ...) resumes into the rel32 -- seen as `NewVectorIterator.
@@ -492,7 +508,7 @@ static void trap_install(void) {
 // trampoline (exact: the copy is what the detour would have executed there), everyone acks,
 // and phase 3 runs only once every thread has answered.  After a thread's handler ran it can
 // only enter the window through the int3 at its first byte, so the invariant holds.
-struct PendWin { uint8_t *at; uint8_t bytes[32]; uint32_t n; uint64_t tramp;
+struct PendWin { uint8_t *at; uint8_t bytes[32]; uint8_t orig[32]; uint32_t n; uint64_t tramp;
                  uint32_t nint; uint32_t ioff[16]; uint64_t itramp[16]; };
 static PendWin g_pend[4096];
 static uint32_t g_npend = 0;
@@ -505,8 +521,20 @@ static volatile uint32_t g_q_gen = 0;     // generation carried in si_value
 static uint32_t g_q_acks = 0;
 
 static const PtjReloc *relocs_tail(uint32_t *n);   // defined after g_cx
+// The job's (just revalidated) snapshot, set by resolve_and_patch around apply_patch under
+// g_patchlock.  A window whose live bytes differ from the snapshot at install time is refused: the
+// object changed between the revalidation and this window (reuse during planning).
+static const uint8_t *g_inst_snap = nullptr; static uint64_t g_inst_base = 0; static uint32_t g_inst_len = 0;
+static uint64_t g_inst_snapdiff = 0;
+static uint64_t g_inst_nm = 0, g_inst_method = 0; static int32_t g_inst_cid = -1; static uint64_t g_inst_code = 0;
+static int nm_still(uint64_t nm, uint64_t code, uint64_t method, int32_t cid);
 static int hs_install(uint8_t *at, const uint8_t *bytes, uint32_t n, uint64_t tramp) {
   if (g_npend >= 4096) return 0;
+  if (g_inst_snap) {
+    uint64_t a = (uint64_t)(uintptr_t)at;
+    if (a < g_inst_base || a + n > g_inst_base + g_inst_len || memcmp(at, g_inst_snap + (a - g_inst_base), n)) {
+      g_inst_snapdiff++; return 0; }
+  }
   PendWin *w = &g_pend[g_npend];
   w->at = at; w->n = n; memcpy(w->bytes, bytes, n); w->tramp = tramp; w->nint = 0;
   // The interior boundaries -> their relocated copies.  ptj_patch_object appended one
@@ -529,6 +557,7 @@ static int hs_install(uint8_t *at, const uint8_t *bytes, uint32_t n, uint64_t tr
   // The redirect must be visible before the breakpoint is.
   wmap_put((uint64_t)at, tramp);
   memcpy(g_last_want, bytes, n); g_last_wlen = n;
+  memcpy(w->orig, at, n);                                  // What phase 3 expects to find
   __atomic_store_n(at, (uint8_t)0xcc, __ATOMIC_SEQ_CST);   // phase 1
   g_c.installs++;
   return 1;
@@ -569,6 +598,18 @@ static void quiesce_install(void) {
 }
 // Signal every other thread and wait for every ack.  Returns the number of threads that did
 // not answer within `timeout_ms'.
+static int thread_blocks_sig(uint64_t tid, int sig) {
+  char pth[64]; snprintf(pth, sizeof pth, "/proc/self/task/%llu/status", (unsigned long long)tid);
+  int fd = open(pth, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0;
+  char buf[4096]; ssize_t n = read(fd, buf, sizeof buf - 1); close(fd);
+  if (n <= 0) return 0;
+  buf[n] = 0;
+  const char *p = strstr(buf, "\nSigBlk:");
+  if (!p) return 0;
+  unsigned long long m = strtoull(p + 8, nullptr, 16);
+  return (sig >= 1 && sig <= 64) ? (int)((m >> (sig - 1)) & 1ull) : 0;
+}
 static uint32_t quiesce_all(int timeout_ms) {
   uint64_t t0 = ptj_ns();
   uint32_t gen = __atomic_add_fetch(&g_q_gen, 1, __ATOMIC_SEQ_CST);
@@ -582,6 +623,19 @@ static uint32_t quiesce_all(int timeout_ms) {
     if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
     uint64_t tid = strtoull(de->d_name, nullptr, 10);
     if ((pid_t)tid == self) continue;
+    // A thread that BLOCKS the quiescence signal can never ack, so every
+    // commit waited the full timeout for it (2 s each).  The buffer sink's raw-clone writer
+    // thread (rt/ptlogrt.c) blocks every signal for its whole life.  Such a
+    // thread cannot be redirected either way (the timeout path proceeded at the same risk);
+    // skipping it is counted in `quiesce_blocked'.
+    if (thread_blocks_sig(tid, g_qsig)) {
+      if (g_verbose && g_c.quiesce_blocked < 64) {
+        char pth[64], nm[32] = {0}; snprintf(pth, sizeof pth, "/proc/self/task/%llu/comm", (unsigned long long)tid);
+        int fd = open(pth, O_RDONLY | O_CLOEXEC); if (fd >= 0) { ssize_t k = read(fd, nm, sizeof nm - 1); if (k > 0) nm[k - 1] = 0; close(fd); }
+        fprintf(stderr, "PTJAVA quiesce: skip tid %llu (%s): blocks sig %d\n", (unsigned long long)tid, nm, g_qsig);
+      }
+      g_c.quiesce_blocked++; continue;
+    }
     siginfo_t si; memset(&si, 0, sizeof si);
     si.si_signo = g_qsig; si.si_code = SI_QUEUE; si.si_pid = pid; si.si_uid = getuid();
     si.si_value.sival_int = (int)gen;
@@ -604,7 +658,7 @@ static uint32_t quiesce_all(int timeout_ms) {
       missing = alive - __atomic_load_n(&g_q_acks, __ATOMIC_ACQUIRE);
       g_c.quiesce_timeouts++;
       // A timeout means a live thread is not running signal handlers (a debugger stop, a
-      // thread that blocks the signal); phase 3 proceeds at the pre-D-J12b risk for this
+      // thread that blocks the signal); phase 3 proceeds at the earlier (non-quiescent) risk for this
       // commit and the run reports it (`quiesce_timeouts').
       if (g_verbose) fprintf(stderr, "PTJAVA quiesce timeout: %u of %u threads silent after %d ms\n",
                              missing, ntid, timeout_ms);
@@ -616,8 +670,24 @@ static uint32_t quiesce_all(int timeout_ms) {
   return missing;
 }
 
-static void hs_commit(void) {
-  if (!g_npend) return;
+// The object can be FREED AND REUSED while it is being
+// installed.  The job is revalidated just before phase 1, but phase 2b (quiescence) can wait up
+// to 2 s on processes with many threads, and HotSpot's sweeper / code-cache unloading
+// frees nmethods without telling us in time (CompiledMethodUnload is a DEFERRED event, posted
+// by the ServiceThread after the memory is already back on the free list).  A new nmethod
+// allocated over the old one would then receive our phase-3 rel32 bytes and phase-5 `jmp' opcodes
+// in its header, relocations and code.  So phase 3
+// runs only if EVERY window still holds our int3 followed by the bytes it held at phase 1,
+// and phase 5 only if every window holds int3 + our rel32/pad.  On a mismatch the object is
+// abandoned: windows still in the phase-1 state get their original first byte back (a thread
+// that hit the int3 meanwhile was redirected to the complete trampoline, which returns to
+// the original code, so this is exact), nothing else is written.  The residual race is the
+// few microseconds between a check and its store, against a reuse that needs a whole
+// flush + allocation + code copy.  Returns 0 = committed, -1 = abandoned before phase 3,
+// -2 = abandoned before phase 5 (loud: phase-3 bytes were already written).
+static uint64_t g_commit_abort3 = 0, g_commit_abort3_wins = 0, g_commit_abort5 = 0;
+static int hs_commit(void) {
+  if (!g_npend) return 0;
   sync_cores();                                            // phase 2
   if (g_quiesce) {                                         // phase 2b: interior quiescence
     uint64_t lo = ~0ull, hi = 0;
@@ -630,18 +700,47 @@ static void hs_commit(void) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
     quiesce_all(2000);
   }
+  int rc = 0;
+  if (g_inst_nm && !nm_still(g_inst_nm, g_inst_code, g_inst_method, g_inst_cid)) rc = -1;
+  for (uint32_t i = 0; i < g_npend && !rc; i++) {         // Still ours?
+    const PendWin *w = &g_pend[i];
+    if (__atomic_load_n(w->at, __ATOMIC_SEQ_CST) != 0xcc || memcmp(w->at + 1, w->orig + 1, w->n - 1)) rc = -1;
+  }
+  if (rc) {
+    for (uint32_t i = 0; i < g_npend; i++) {
+      PendWin *w = &g_pend[i];
+      if (w->at[0] == 0xcc && !memcmp(w->at + 1, w->orig + 1, w->n - 1))
+        __atomic_store_n(w->at, w->orig[0], __ATOMIC_SEQ_CST);
+    }
+    sync_cores();
+    g_commit_abort3++; g_commit_abort3_wins += g_npend;
+    g_pend_lo = g_pend_hi = 0; g_npend = 0;
+    return -1;
+  }
   for (uint32_t i = 0; i < g_npend; i++)                   // phase 3
     memcpy(g_pend[i].at + 1, g_pend[i].bytes + 1, g_pend[i].n - 1);
   sync_cores();                                            // phase 4
+  for (uint32_t i = 0; i < g_npend && !rc; i++) {         // Phase 3 landed where we left it?
+    const PendWin *w = &g_pend[i];
+    if (__atomic_load_n(w->at, __ATOMIC_SEQ_CST) != 0xcc || memcmp(w->at + 1, w->bytes + 1, w->n - 1)) rc = -2;
+  }
+  if (rc) {
+    // Too late to undo cleanly; the int3 heads stay (the trap handler redirects them to the
+    // complete trampolines), so no window becomes a jmp over foreign bytes.
+    g_commit_abort5++;
+    g_pend_lo = g_pend_hi = 0; g_npend = 0;
+    return -2;
+  }
   for (uint32_t i = 0; i < g_npend; i++)                   // phase 5
     __atomic_store_n(g_pend[i].at, g_pend[i].bytes[0], __ATOMIC_SEQ_CST);
   sync_cores();                                            // phase 6
   g_pend_lo = g_pend_hi = 0;
   g_npend = 0;
+  return 0;
 }
 
-// D-J12a: is a planted `int3' actually delivered to trap_handler?  A ptrace tracer sees the
-// SIGTRAP first and may suppress it (pt_capture2 --sideband did, until 2026-09-17): the thread
+// Is a planted `int3' actually delivered to trap_handler?  A ptrace tracer sees the
+// SIGTRAP first and may suppress it: the thread
 // then resumes one byte into the window.  Nothing inside the process can repair that, so the
 // install protocol is unsafe under such a tracer and the run must not proceed silently.
 static int int3_selftest(void) {
@@ -664,7 +763,7 @@ static PtjClient g_cli;
 static PtjPatchCtx g_cx;
 static const PtjReloc *relocs_tail(uint32_t *n) { *n = g_cx.nrelocs; return g_cx.relocs; }
 
-// ------------------------------------------------- D-J13: implicit exceptions ----
+// ------------------------------------------------- Implicit exceptions ----
 // HotSpot does not test for null before most field loads, does not test the safepoint poll
 // word, and does not test a divisor for zero: it lets the access FAULT and turns the signal
 // into the right event by looking the faulting pc up in the nmethod's implicit-exception
@@ -684,7 +783,10 @@ static const PtjReloc *relocs_tail(uint32_t *n) { *n = g_cx.nrelocs; return g_cx
 // relocated instruction is by construction identical to the state at the original (the
 // site's push/pop are complete before it and after it), so the continuation the VM picks --
 // a deoptimisation, an NPE throw, a safepoint -- unwinds exactly the frame it would have.
-#define PTJ_RELMAP_BITS 19
+// The map must hold EVERY relocation (maxrelocs = 2^21): a dropped entry would leave an
+// implicit null check untranslated in the slab (SIGSEGV).  2^22
+// slots keep the load at <= 50 %; a failed put is counted (`xlat_relmap_lost') and must be 0.
+#define PTJ_RELMAP_BITS 22
 #define PTJ_RELMAP_N    (1u << PTJ_RELMAP_BITS)
 static uint64_t g_relmap_k[PTJ_RELMAP_N];      // relocated copy's address (0 = empty)
 static uint64_t g_relmap_v[PTJ_RELMAP_N];      // the original instruction's address
@@ -707,6 +809,7 @@ static void relmap_put(uint64_t k, uint64_t v) {
       return;
     }
   }
+  g_c.xlat_relmap_lost++;
 }
 static uint64_t relmap_get(uint64_t k) {
   uint32_t m = PTJ_RELMAP_N - 1, i = relmap_h(k) & m;
@@ -789,7 +892,7 @@ static PtjSite g_sitebuf[PTJ_MAXSITES];
 
 // in-memory content-hash cache (D7), same shape as jithook.cc's
 #define PTJ_KEYMAX 80          // 64 hex content hash + ".a" + 8 hex avoid hash + NUL
-#define PTJ_MAXROOTS 1024      // D-J6: analyzer restart roots kept per code object
+#define PTJ_MAXROOTS 1024      // Analyzer restart roots kept per code object
 struct CacheEnt { char key[PTJ_KEYMAX]; PtjSite *sites; int n;
                   uint32_t *rroots; int nrroots; };
 static CacheEnt *g_mem = nullptr;
@@ -817,7 +920,7 @@ static CacheEnt *mem_find(const char *k, int insert) {
 // The cache key masks every field the VM may relocate: >=32-bit immediates (embedded oops,
 // metadata, external references) and >=32-bit displacements.  Two compilations of the same
 // method then hash the same however the heap moved (D7).
-// D-J14.2: 0 = the old "give up at the first undecodable byte"; N > 0 = resynchronise and
+// 0 = "give up at the first undecodable byte"; N > 0 = resynchronise and
 // mask only after N consecutive successful decodes (see masked_hash).
 static int g_mask_resync = 4;
 static int g_mask_verify = 0;       // re-ask the analyzer on every cache hit and compare
@@ -826,7 +929,7 @@ static uint64_t g_mv_self_same = 0, g_mv_self_diff = 0;
 static uint64_t g_mv_same_values = 0, g_mv_diff_values = 0;
 static thread_local uint8_t *g_maskbuf = nullptr;
 static thread_local size_t g_maskcap = 0;
-// D-J6: `data_from` (the object's inline-data boundary) and `roots` (the jvmtiAddrLocationMap)
+// `data_from` (the object's inline-data boundary) and `roots` (the jvmtiAddrLocationMap)
 // are part of the ANSWER the analyzer gives, so they are part of the key.  `data_from` in
 // particular is derived from a rip-relative disp32, which the mask below zeroes out.
 static void masked_hash(const uint8_t *code, size_t len, char out[65],
@@ -835,7 +938,7 @@ static void masked_hash(const uint8_t *code, size_t len, char out[65],
   if (len > g_maskcap) { g_maskbuf = (uint8_t *)realloc(g_maskbuf, len * 2); g_maskcap = len * 2; }
   if (!g_maskbuf) { out[0] = 0; return; }
   memcpy(g_maskbuf, code, len);
-  // DEFECT D-J14.2.  This loop used to `break' at the first byte Zydis could not decode, and
+  // This loop used to `break' at the first byte Zydis could not decode, and
   // a generated code object may START with data: HotSpot's template interpreter blob opens
   // with an 8-byte pointer, so the decode died at offset 0xd and the remaining 97 743 bytes
   // were hashed RAW -- every embedded `call rel32' and `movabs imm64' included.  Those fields
@@ -850,7 +953,7 @@ static void masked_hash(const uint8_t *code, size_t len, char out[65],
   // first decodable prefix.  Masking more bytes makes the key COARSER, so the risk it adds
   // is a false cache HIT (two different objects sharing a site list), not a false miss.
   // `maskresync=0' is the A/B control and `maskverify=1' re-asks the analyzer on every hit
-  // and compares, which is how the coarsening was checked the design notes.
+  // and compares, to check the coarsening.
   //
   // The resync is CONFIDENCE-GATED.  Resuming one byte after a failure can land mid-data, and
   // masking there zeroes bytes that are not immediates at all -- which makes the key coarser
@@ -923,7 +1026,28 @@ static void obj_note(uint64_t a, uint32_t l, uint64_t tsc, uint32_t ns, uint32_t
   }
 }
 
+// Diagnostic (`plog=FILE'): one line per installed window, written AT INSTALL (a crash loses
+// nothing): window, object, rule counters that moved for it (slide/shift/kf-flag-save), the
+// original bytes, and the whole trampoline -- enough to map an hs_err pc to the window and to
+// disassemble what our detour runs there.
+static int g_plogfd = -1;
+static uint64_t g_plog_slid = 0, g_plog_shifted = 0, g_plog_kfs = 0, g_plog_uepm = 0;
+static void plog_window(PtjPatchCtx *cx, uint8_t *code, size_t clen, uint8_t *t, size_t tlen) {
+  static char buf[8192];
+  int n = snprintf(buf, sizeof buf, "W %#llx obj=%#llx+%u off=%u wlen=%u tramp=%#llx tlen=%u slid=%llu shifted=%llu kfs=%llu uepm=%llu orig=",
+                   (unsigned long long)(uintptr_t)code, (unsigned long long)cx->last_obj_addr, cx->last_obj_len,
+                   cx->last_off, (unsigned)clen, (unsigned long long)(uintptr_t)t, (unsigned)tlen,
+                   (unsigned long long)(cx->slid - g_plog_slid), (unsigned long long)(cx->shifted - g_plog_shifted),
+                   (unsigned long long)(cx->kf_flags_saved - g_plog_kfs), (unsigned long long)(g_c.uepentry_moved - g_plog_uepm));
+  g_plog_slid = cx->slid; g_plog_shifted = cx->shifted; g_plog_kfs = cx->kf_flags_saved; g_plog_uepm = g_c.uepentry_moved;
+  for (uint32_t z = 0; z < cx->last_orig_len && n < (int)sizeof buf - 8; z++) n += snprintf(buf + n, sizeof buf - n, "%02x", cx->last_orig[z]);
+  n += snprintf(buf + n, sizeof buf - n, " tr=");
+  for (size_t z = 0; z < tlen && n < (int)sizeof buf - 8; z++) n += snprintf(buf + n, sizeof buf - n, "%02x", t[z]);
+  buf[n++] = '\n';
+  ssize_t w = write(g_plogfd, buf, (size_t)n); (void)w;
+}
 static void note_tramp(PtjPatchCtx *cx, uint8_t *code, size_t clen, uint8_t *t, size_t tlen) {
+  if (g_plogfd >= 0) plog_window(cx, code, clen, t, tlen);
   if (g_prec && g_nprec < PREC_MAX) {
     PatchRec *r = &g_prec[g_nprec++];
     r->addr = (uint64_t)code; r->tramp = (uint64_t)t; r->tsc = cx->tsc;
@@ -969,6 +1093,268 @@ static int safe_read(const void *src, void *dst, size_t n) {
 // The rule is therefore `lo = max(last aligned bang in the first 0x80 bytes, 0x20) + 5`:
 // conservative (a false positive can only raise `lo`, i.e. cost coverage) and it protects
 // the verified entry whether it is at 0 or at 0x20.
+// The verified entry (aligned stack bang in the first 0x80 bytes), or -1 if none was found.
+static int g_uep = 0;
+static int g_uepentry = 1;       // Move entry sites out of the unverified-entry region (see apply_patch)
+static int32_t hs_bang_off(const uint8_t *code, size_t len) {
+  int32_t ve = -1;
+  size_t lim = len < 0x80 ? len : 0x80;
+  for (size_t o = 0; o + 7 <= lim; o += 32)
+    if (code[o] == 0x89 && code[o + 1] == 0x84 && code[o + 2] == 0x24) {
+      int32_t d; memcpy(&d, code + o + 3, 4);
+      if (d < 0) ve = (int32_t)o;
+    }
+  return ve;
+}
+// Read the Java heap's reserved range and the compressed oop/klass bases from the VM's own
+// vmStructs table (the Serviceability Agent's interface; exported by libjvm.so).  Used only by
+// the immediate rule (jitpatch.h ptj_imm_rewritable); on any failure the rule stays off.
+static int g_vms_done = 0;
+static const uint64_t *g_vms_kb = nullptr;   // &CompressedKlassPointers base: set late in VM start-up
+static const char *g_vms_err = "not run";
+static void *vms_lookup(const char *type, const char *field, int *is_static) {
+  void **ps = (void **)dlsym(RTLD_DEFAULT, "gHotSpotVMStructs");
+  uint64_t *stride = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryArrayStride");
+  uint64_t *tno = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryTypeNameOffset");
+  uint64_t *fno = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryFieldNameOffset");
+  uint64_t *iso = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryIsStaticOffset");
+  uint64_t *oo  = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryOffsetOffset");
+  uint64_t *ao  = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryAddressOffset");
+  if (!ps || !*ps || !stride || !*stride || !tno || !fno || !iso || !oo || !ao) return (void *)-1;
+  for (char *e = (char *)*ps; ; e += *stride) {
+    const char *tn = *(const char **)(e + *tno);
+    if (!tn) break;
+    const char *fn = *(const char **)(e + *fno);
+    if (!fn || strcmp(tn, type) || strcmp(fn, field)) continue;
+    *is_static = *(int32_t *)(e + *iso);
+    return *is_static ? *(void **)(e + *ao) : (void *)(uintptr_t)*(uint64_t *)(e + *oo);
+  }
+  return (void *)-1;
+}
+static void hs_vmstructs_init(void) {
+  g_vms_done = 1;
+  if (getenv("PTJ_VMS_DUMP")) {           // diagnostic: list the compressed-pointer entries
+    void **ps = (void **)dlsym(RTLD_DEFAULT, "gHotSpotVMStructs");
+    uint64_t *stride = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryArrayStride");
+    uint64_t *tno = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryTypeNameOffset");
+    uint64_t *fno = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryFieldNameOffset");
+    uint64_t *ao  = (uint64_t *)dlsym(RTLD_DEFAULT, "gHotSpotVMStructEntryAddressOffset");
+    if (ps && *ps && stride && tno && fno && ao)
+      for (char *e = (char *)*ps; *(const char **)(e + *tno); e += *stride) {
+        const char *tn = *(const char **)(e + *tno), *fn = *(const char **)(e + *fno);
+        if (strstr(tn, "Compressed") || strstr(tn, "Universe"))
+          fprintf(stderr, "PTJVMS %s::%s addr=%p val=%#llx\n", tn, fn ? fn : "?", *(void **)(e + *ao),
+                  *(void **)(e + *ao) ? (unsigned long long)**(uint64_t **)(e + *ao) : 0ull);
+      }
+  }
+  int st = 0;
+  void *ob = vms_lookup("CompressedOops", "_narrow_oop._base", &st);
+  void *os_ = vms_lookup("CompressedOops", "_narrow_oop._shift", &st);
+  void *kb = vms_lookup("CompressedKlassPointers", "_narrow_klass._base", &st);
+  void *uh = vms_lookup("Universe", "_collectedHeap", &st);
+  void *rs = vms_lookup("CollectedHeap", "_reserved", &st);
+  void *ms = vms_lookup("MemRegion", "_start", &st);
+  void *mw = vms_lookup("MemRegion", "_word_size", &st);
+  if (ob == (void *)-1 || os_ == (void *)-1 || kb == (void *)-1 || uh == (void *)-1 ||
+      rs == (void *)-1 || ms == (void *)-1 || mw == (void *)-1) { g_vms_err = "vmStructs entry missing"; return; }
+  char *heap = *(char **)uh;
+  if (!heap) { g_vms_err = "no heap yet"; g_vms_done = 0; return; }
+  char *mr = heap + (uintptr_t)rs;
+  uint64_t start = *(uint64_t *)(mr + (uintptr_t)ms), words = *(uint64_t *)(mr + (uintptr_t)mw);
+  g_ptj_obase = *(uint64_t *)ob; g_ptj_oshift = *(int *)os_; g_vms_kb = (const uint64_t *)kb; g_ptj_kbase = *g_vms_kb;
+  if (!start || !words || g_ptj_oshift < 0 || g_ptj_oshift > 8) {
+    g_vms_err = "implausible heap (retrying)"; g_vms_done = 0; return;   // heap not reserved yet: ask again next object
+  }
+  g_ptj_heap_lo = start; g_ptj_heap_hi = start + words * 8;
+  g_vms_err = "ok";
+}
+// HotSpot's INDIRECT entries into an nmethod.  The JVMTI map (PcDescs) is
+// not the set of places the VM can transfer control to: the exception blob jumps (`jmp r8') to
+// a handler pc from the nmethod's ExceptionHandlerTable, an implicit exception resumes at a
+// continuation from its ImplicitExceptionTable, the exception/deopt stubs and the OSR entry are
+// entered from outside.  None of them is a direct-branch target, so (E) a handler that is a
+// soft PcDesc could sit INSIDE a slid window, and (D) a handler that was not decoded at all
+// could hide its own `jmp' into a window interior.  Read the tables through
+// vmStructs (the same symbol table immrule uses) and hand every entry to the patcher as a HARD
+// root: decoded, and never a window interior.  Option `vmentries=0' disables it.
+static int g_vment = 1;
+static int g_vment_init = 0;
+static long g_vo_cb_code_begin = -1, g_vo_cb_header_size = -1, g_vo_ht = -1, g_vo_nc = -1, g_vo_end = -1,
+            g_vo_exc = -1, g_vo_deopt = -1, g_vo_osr = -1, g_vo_method = -1, g_vo_cid = -1,
+            g_vo_content = -1;
+static uint64_t g_vment_objs = 0, g_vment_nohdr = 0, g_vment_handlers = 0, g_vment_conts = 0, g_vment_stubs = 0;
+static uint64_t g_vment_jt = 0, g_vment_jt_objs = 0;   // C2 jump-table entries (consts section)
+static long vms_off(const char *t1, const char *t2, const char *f) {
+  int st = 0; void *p = vms_lookup(t1, f, &st);
+  if (p == (void *)-1 && t2) p = vms_lookup(t2, f, &st);
+  if (p == (void *)-1 || st) return -1;
+  return (long)(uintptr_t)p;
+}
+static void vment_init(void) {
+  g_vment_init = 1;
+  g_vo_cb_code_begin = vms_off("CodeBlob", nullptr, "_code_begin");
+  g_vo_cb_header_size = vms_off("CodeBlob", nullptr, "_header_size");
+  g_vo_ht  = vms_off("nmethod", "CompiledMethod", "_handler_table_offset");
+  g_vo_nc  = vms_off("nmethod", "CompiledMethod", "_nul_chk_table_offset");
+  g_vo_end = vms_off("nmethod", "CompiledMethod", "_nmethod_end_offset");
+  g_vo_exc = vms_off("nmethod", "CompiledMethod", "_exception_offset");
+  g_vo_deopt = vms_off("CompiledMethod", "nmethod", "_deopt_handler_begin");
+  g_vo_osr = vms_off("nmethod", "CompiledMethod", "_osr_entry_point");
+  g_vo_content = vms_off("CodeBlob", nullptr, "_content_begin");   // Consts section start
+  if (g_vo_cb_code_begin < 0 || g_vo_cb_header_size < 0 || g_vo_ht < 0 || g_vo_nc < 0 || g_vo_end < 0) g_vment = 0;
+  g_vo_method = vms_off("CompiledMethod", "nmethod", "_method");
+  g_vo_cid = vms_off("nmethod", "CompiledMethod", "_compile_id");
+}
+// Is the memory at `code' still the nmethod the event described?  JDK 17 posts
+// CompiledMethodLoad from the ServiceThread (deferred); under heavy class unloading the
+// nmethod can be gone and its memory reused before the event is handled, so the snapshot, the analysis
+// and every later revalidation describe the NEW occupant at the OLD bounds: windows land in its header,
+// relocations and at non-boundaries of its code.  Byte checks cannot see
+// that; the header can: CodeBlob::_code_begin == code, CompiledMethod::_method == the event's Method*,
+// nmethod::_compile_id unchanged.  Returns 1 = found (nm/method/cid filled), 0 = no header found.
+static uint64_t g_ident_multi = 0, g_ident_skipfirst = 0, g_ident_hsdiff = 0; static int g_ident_hs0 = -1;
+static int g_ident_log = 0;   // PTJ_IDENT_LOG=N: print the first N mismatches (diagnostics)
+// Scans EVERY candidate header in [code-0x1000, code-16]: a header field other than _code_begin can hold
+// the value `code' (e.g. _verified_entry_point of a method whose verified entry is code_begin), so the
+// nearest candidate is not necessarily the header.  Prefers the candidate whose _method == `expect'.
+static int nm_ident(uint64_t code, uint64_t expect, uint64_t *nm, uint64_t *method, int32_t *cid) {
+  if (!g_vment_init) vment_init();
+  if (g_vo_cb_code_begin < 0 || g_vo_cb_header_size < 0 || g_vo_method < 0) return 0;
+  int ncand = 0; uint64_t f_nm = 0, f_m = 0; int32_t f_c = -1; int f_hs = 0;
+  for (uint32_t off = 16; off <= 0x1000; off += 8) {         // header size of an nmethod: ~0x100-0x200
+    uint64_t cand = code - off, cb = 0; int hs = 0;
+    if (!safe_read((const void *)(uintptr_t)(cand + g_vo_cb_code_begin), &cb, 8) || cb != code) continue;
+    if (!safe_read((const void *)(uintptr_t)(cand + g_vo_cb_header_size), &hs, 4) || hs <= 0 || (uint32_t)hs > off) continue;
+    uint64_t m = 0; int32_t c = -1;
+    if (!safe_read((const void *)(uintptr_t)(cand + g_vo_method), &m, 8)) continue;
+    if (g_vo_cid >= 0 && !safe_read((const void *)(uintptr_t)(cand + g_vo_cid), &c, 4)) c = -1;
+    ncand++;
+    if (ncand == 1) { f_nm = cand; f_m = m; f_c = c; f_hs = hs; }
+    if (m == expect) {
+      if (ncand > 1) g_ident_skipfirst++;
+      if (g_ident_hs0 < 0) g_ident_hs0 = hs; else if (hs != g_ident_hs0) g_ident_hsdiff++;
+      *nm = cand; *method = m; *cid = c; return 1;
+    }
+  }
+  if (!ncand) return 0;
+  if (ncand > 1) g_ident_multi++;
+  if (g_ident_log > 0) {
+    g_ident_log--;
+    fprintf(stderr, "PTJIDENT ev_bad code=%#lx expect=%#lx ncand=%d first_off=%#lx first_hs=%#x first_m=%#lx first_cid=%d hs0=%#x\n",
+            (unsigned long)code, (unsigned long)expect, ncand, (unsigned long)(code - f_nm), f_hs, (unsigned long)f_m, f_c, g_ident_hs0);
+  }
+  *nm = f_nm; *method = f_m; *cid = f_c; return 1;
+}
+static uint64_t g_ident_ev_bad = 0, g_ident_ev_nohdr = 0, g_ident_ev_ok = 0, g_ident_late_bad = 0;
+// MethodHandle.linkTo*/invokeBasic are signature-polymorphic natives.  Their compiled intrinsics
+// (one nmethod per erased signature) carry a GENERATED Method* in CompiledMethod::_method, while the load
+// event names the declared java.lang.invoke.MethodHandle method: a live nmethod whose _method != the
+// event's is expected there and is not reuse.
+static uint64_t g_ident_mh = 0;
+static int mh_intrinsic(jvmtiEnv *jvmti, jmethodID method) {
+  jboolean nat = JNI_FALSE; jclass cls; char *csig = nullptr; int r = 0;
+  if (jvmti->IsMethodNative(method, &nat) != JVMTI_ERROR_NONE || !nat) return 0;
+  if (jvmti->GetMethodDeclaringClass(method, &cls) != JVMTI_ERROR_NONE) return 0;
+  if (jvmti->GetClassSignature(cls, &csig, nullptr) == JVMTI_ERROR_NONE && csig) {
+    r = !strcmp(csig, "Ljava/lang/invoke/MethodHandle;");
+    jvmti->Deallocate((unsigned char *)csig);
+  }
+  return r;
+}
+static int nm_still(uint64_t nm, uint64_t code, uint64_t method, int32_t cid) {
+  if (!nm) return 1;                                           // nothing recorded: byte checks only
+  uint64_t cb = 0, m = 0; int32_t c = -1; int why = 0;
+  if (!safe_read((const void *)(uintptr_t)(nm + g_vo_cb_code_begin), &cb, 8) || cb != code) why = 1;
+  else if (!safe_read((const void *)(uintptr_t)(nm + g_vo_method), &m, 8) || m != method) why = 2;
+  else if (g_vo_cid >= 0 && (!safe_read((const void *)(uintptr_t)(nm + g_vo_cid), &c, 4) || c != cid)) why = 3;
+  if (!why) return 1;
+  if (g_ident_log > 0) {
+    g_ident_log--;
+    fprintf(stderr, "PTJIDENT late why=%d code=%#lx off=%#lx cb=%#lx m=%#lx/%#lx cid=%d/%d\n", why, (unsigned long)code,
+            (unsigned long)(code - nm), (unsigned long)cb, (unsigned long)m, (unsigned long)method, c, cid);
+  }
+  return 0;
+}
+template <class F>
+static void hs_vm_entries(uint64_t code, uint32_t len, F add) {
+  if (!g_vment) return;
+  if (!g_vment_init) vment_init();
+  if (!g_vment) return;
+  static uint8_t hb[0x10000];
+  uint32_t W = sizeof hb;
+  while (W >= 0x400 && !safe_read((const void *)(uintptr_t)(code - W), hb, W)) W >>= 1;
+  if (W < 0x400) { g_vment_nohdr++; return; }
+  uint64_t nm = 0;
+  for (uint32_t off = 16; off <= W; off += 8) {             // the header ends at or before the code
+    uint64_t cand = code - off;
+    long i = (long)(W - off) + g_vo_cb_code_begin;
+    if (i + 8 > (long)W) continue;
+    uint64_t cb; memcpy(&cb, hb + i, 8);
+    if (cb != code) continue;
+    long h = (long)(W - off) + g_vo_cb_header_size;
+    int hs; memcpy(&hs, hb + h, 4);
+    if (hs <= 0 || (uint32_t)hs > off) continue;
+    nm = cand; break;
+  }
+  if (!nm) { g_vment_nohdr++; return; }
+  int ht = 0, nc = 0, end = 0;
+  if (!safe_read((const void *)(uintptr_t)(nm + g_vo_ht), &ht, 4) || !safe_read((const void *)(uintptr_t)(nm + g_vo_nc), &nc, 4) ||
+      !safe_read((const void *)(uintptr_t)(nm + g_vo_end), &end, 4)) { g_vment_nohdr++; return; }
+  if (ht <= 0 || nc < ht || end < nc || end > (64 << 20)) { g_vment_nohdr++; return; }
+  g_vment_objs++;
+  uint64_t cbo = code - nm;                                  // code offset from the header
+  static uint8_t tb[1 << 16];
+  // ExceptionHandlerTable: subtables {len, catch_pco, 0} + len x {bci, handler_pco, scope_depth}
+  uint32_t hsz = (uint32_t)(nc - ht); if (hsz > sizeof tb) hsz = sizeof tb;
+  if (hsz >= 12 && safe_read((const void *)(uintptr_t)(nm + ht), tb, hsz)) {
+    uint32_t ne = hsz / 12, i = 0;
+    while (i < ne) {
+      int32_t e[3]; memcpy(e, tb + 12 * i, 12);
+      int32_t n = e[0];
+      if (n < 0 || i + 1 + (uint32_t)n > ne) break;
+      for (int32_t k = 1; k <= n; k++) {
+        int32_t h[3]; memcpy(h, tb + 12 * (i + k), 12);
+        if (h[1] >= 0 && (uint32_t)h[1] < len) { add((uint32_t)h[1]); g_vment_handlers++; }
+      }
+      i += 1 + (uint32_t)n;
+    }
+  }
+  // ImplicitExceptionTable: len, then len x {exec_off, cont_off}; cont == exec means "deoptimize"
+  uint32_t isz = (uint32_t)(end - nc); if (isz > sizeof tb) isz = sizeof tb;
+  if (isz >= 4 && safe_read((const void *)(uintptr_t)(nm + nc), tb, isz)) {
+    uint32_t n; memcpy(&n, tb, 4);
+    for (uint32_t q = 0; q < n && 4 + 8 * (q + 1) <= isz; q++) {
+      uint32_t ex, co; memcpy(&ex, tb + 4 + 8 * q, 4); memcpy(&co, tb + 8 + 8 * q, 4);
+      if (co != ex && co < len) { add(co); g_vment_conts++; }
+    }
+  }
+  // exception + deopt handler stubs, OSR entry
+  if (g_vo_exc >= 0) { int eo = 0; if (safe_read((const void *)(uintptr_t)(nm + g_vo_exc), &eo, 4) && eo > 0 &&
+                         (uint64_t)eo >= cbo && (uint64_t)eo - cbo < len) { add((uint32_t)((uint64_t)eo - cbo)); g_vment_stubs++; } }
+  uint64_t a = 0;
+  if (g_vo_deopt >= 0 && safe_read((const void *)(uintptr_t)(nm + g_vo_deopt), &a, 8) && a >= code && a < code + len) {
+    add((uint32_t)(a - code)); g_vment_stubs++; }
+  a = 0;
+  if (g_vo_osr >= 0 && safe_read((const void *)(uintptr_t)(nm + g_vo_osr), &a, 8) && a > code && a < code + len) {
+    add((uint32_t)(a - code)); g_vment_stubs++; }
+  // C2 tableswitch = `movabs r, <table in the CONSTANTS section>; jmp [r+idx*8+d]'.
+  // The table sits in [content_begin, code) -- outside the code JVMTI hands us, so neither the descent nor
+  // ptj_scan_data_from sees it -- and its 8-byte entries are absolute case-label addresses.  A case label
+  // strictly inside a displaced window would be entered in the middle of our `jmp rel32'.  Every aligned 8-byte word of the
+  // constants section that points into [code, code+len) is therefore a forbidden interior and a decode root,
+  // exactly like a PcDesc.  A double constant that happens to equal a code address only forbids a window.
+  a = 0;
+  if (g_vo_content >= 0 && safe_read((const void *)(uintptr_t)(nm + g_vo_content), &a, 8) && a > nm && a < code &&
+      code - a <= sizeof tb && safe_read((const void *)(uintptr_t)a, tb, (size_t)(code - a))) {
+    uint32_t cs = (uint32_t)(code - a), nj = 0;
+    for (uint32_t q = (uint32_t)((8 - (a & 7)) & 7); q + 8 <= cs; q += 8) {
+      uint64_t v; memcpy(&v, tb + q, 8);
+      if (v > code && v < code + len) { add((uint32_t)(v - code)); nj++; }
+    }
+    g_vment_jt += nj; if (nj) g_vment_jt_objs++;
+  }
+}
+
 static uint32_t hs_patch_lo(const uint8_t *code, size_t len) {
   uint32_t ve = 0; int found = 0;
   size_t lim = len < 0x80 ? len : 0x80;
@@ -1024,8 +1410,9 @@ static uint32_t hs_entry_off(const uint8_t *code, size_t len, uint32_t lo) {
 // so they go into `cx->forbid`: no displaced window may contain one strictly inside.
 static uint32_t g_forbid[65536];
 static uint32_t g_nforbid = 0;
+static uint32_t g_npc = 0;     // g_forbid[0, g_npc) are PcDescs (soft with `pcsoft=1')
 static void build_forbid(const void *code_addr, jint map_length, const jvmtiAddrLocationMap *map) {
-  g_nforbid = 0;
+  g_nforbid = 0; g_npc = 0;
   if (!map || map_length <= 0) return;
   uint64_t base = (uint64_t)code_addr;
   for (jint i = 0; i < map_length && g_nforbid < 65536; i++) {
@@ -1034,6 +1421,7 @@ static void build_forbid(const void *code_addr, jint map_length, const jvmtiAddr
   }
   g_c.locmap_entries += (uint64_t)g_nforbid;
   if (g_nforbid) g_c.locmap_objs++;
+  g_npc = g_nforbid;
 }
 
 // -------------------------------------- the interpreter template blob --------
@@ -1115,7 +1503,10 @@ static void harvest_interp_entries(uint64_t lo, uint64_t hi) {
       str = (const char *)(m + sh[sh[i].sh_link].sh_offset);
     }
   if (!sym) { munmap(m, stb.st_size); return; }
-  static const char *PFX[] = {"_ZN19TemplateInterpreter", "_ZN18AbstractInterpreter", nullptr};
+  // AbstractInterpreter has 19 characters: its tables (_entry_table: the method ENTRY points --
+// zerolocals, native, synchronized, accessors, math intrinsics) must be harvested so the native
+// entry is a decode root.
+static const char *PFX[] = {"_ZN19TemplateInterpreter", "_ZN19AbstractInterpreter", "_ZN18AbstractInterpreter", nullptr};
   uint32_t cap = 65536;
   g_interp_roots = (uint32_t *)malloc(cap * 4);
   if (!g_interp_roots) { munmap(m, stb.st_size); return; }
@@ -1126,6 +1517,7 @@ static void harvest_interp_entries(uint64_t lo, uint64_t hi) {
     int hit = 0;
     for (int k = 0; PFX[k]; k++) if (!strncmp(nm, PFX[k], strlen(PFX[k]))) hit = 1;
     if (!hit) continue;
+    if (strstr(nm, "_native_entry_end")) continue;   // an END marker, not an entry
     uint64_t a = base + sym[i].st_value, n = sym[i].st_size / 8;
     tables++;
     for (uint64_t w = 0; w < n; w++) {
@@ -1185,7 +1577,9 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
                        const uint32_t *forbid, uint32_t nforbid,
                        const uint32_t *roots = nullptr, uint32_t nroots = 0,
                        int plan_only = 0, uint32_t *unp = nullptr,
-                       uint32_t *nunp = nullptr, uint32_t maxunp = 0) {
+                       uint32_t *nunp = nullptr, uint32_t maxunp = 0,
+                       uint32_t nsoft = 0, const uint32_t *rr = nullptr, uint32_t nrr = 0,
+                       const uint8_t *snap = nullptr, const uint64_t *jid = nullptr) {
   if (g_pinbridge) {
     // The worker holds g_lock: unloading cannot retire and then reinstall an old job.
     // Pin owns executable-code instrumentation; no prologue exclusions or native detours.
@@ -1213,6 +1607,60 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
   g_cx.roots = nroots ? roots : nullptr; g_cx.nroots = nroots;
   g_cx.hi = 0;
   g_cx.lo = (code_type == 1) ? hs_patch_lo(code, len) : 0;
+  // PcDescs soft, verified-entry hole instead of a floor, HotSpot immediate rule
+  g_cx.nsoft = nsoft; g_cx.rr = nrr ? rr : nullptr; g_cx.nrr = nrr;
+  g_cx.hole_lo = g_cx.hole_hi = 0;
+  if (code_type == 1 && g_uep) {
+    int32_t ve = hs_bang_off(code, len);
+    // Only an instance method's inline-cache check [0, ve) is opened up (ve >= 0x20).  With ve == 0
+    // (static and OSR nmethods) the floor 0x25 stays: an OSR nmethod's osr_entry follows its
+    // prologue and is known to us only through that floor.
+    if (ve >= 0x20) { g_cx.lo = 0; g_cx.hole_lo = (uint32_t)ve; g_cx.hole_hi = (uint32_t)ve + 5; }
+    // The analyzer places the object's ENTRY site (registers
+    // live at the first instruction: args, r12, r15 ...) `before' offset 0 -- but offset 0 is only
+    // the UNVERIFIED entry.  Direct calls enter at the verified entry `ve' and never execute a
+    // window in [0, ve), so every value that site logs would be missing on those paths.  Both paths reach the instruction after
+    // the stack bang, and [0, ve) writes only r10/r11/flags (IC check) -- the inline-cache miss
+    // `jne' leaves the object for good.  So a `reg'/before site in [0, ve) whose registers are not
+    // written there moves to the first instruction after the bang, where it covers BOTH entries.
+    // Cost: the site instruction's own access on the unverified path (one klass load per virtual
+    // call).  `uepentry=0' disables the move.
+    if (ve >= 0x20 && g_uepentry && n > 0) {
+      ZydisDecodedInstruction ins; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+      uint32_t tgt = 0;
+      if ((size_t)ve < len && ZYAN_SUCCESS(ZydisDecoderDecodeFull(&g_dec, code + ve, len - ve, &ins, ops,
+                                                                   ZYDIS_MAX_OPERAND_COUNT, 0)))
+        tgt = (uint32_t)ve + ins.length;
+      for (int q = 0; tgt && q < n; q++) {
+        PtjSite *st = &sites[q];
+        if (st->off >= (uint32_t)ve || st->kind != PTJ_KIND_REG || st->when != PTJ_WHEN_BEFORE || st->kf) continue;
+        int clash = 0;
+        for (int r = 0; r < n; r++) if (r != q && sites[r].off > st->off && sites[r].off <= tgt) { clash = 1; break; }
+        if (clash) { g_c.uepentry_clash++; continue; }
+        uint32_t o = st->off; int ok = 1;
+        while (o < tgt) {
+          if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&g_dec, code + o, len - o, &ins, ops, ZYDIS_MAX_OPERAND_COUNT, 0))) { ok = 0; break; }
+          for (int k = 0; ok && k < ins.operand_count; k++) {
+            if (ops[k].type != ZYDIS_OPERAND_TYPE_REGISTER) continue;
+            if (!(ops[k].actions & (ZYDIS_OPERAND_ACTION_WRITE | ZYDIS_OPERAND_ACTION_CONDWRITE))) continue;
+            ZydisRegister big = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, ops[k].reg.value);
+            for (int r = 0; r < st->nregs; r++) {
+              int x = st->regs[r];
+              ZydisRegister sr = x < 16 ? (ZydisRegister)(ZYDIS_REGISTER_RAX + x)
+                               : x < 32 ? (ZydisRegister)(ZYDIS_REGISTER_XMM0 + (x - 16)) : ZYDIS_REGISTER_NONE;
+              if (sr == ZYDIS_REGISTER_NONE || ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, sr) == big) { ok = 0; break; }
+            }
+          }
+          if (!ok) break;
+          o += ins.length;
+        }
+        if (!ok || o != tgt) { g_c.uepentry_blocked++; continue; }
+        st->off = tgt; st->flags_dead = 0; g_c.uepentry_moved++;
+      }
+    }
+  }
+  if (g_ptj_immrule && !g_vms_done) hs_vmstructs_init();
+  if (g_vms_kb) g_ptj_kbase = *g_vms_kb;       // re-read: the klass base is set after the heap
   if (g_cx.lo + 8 >= len) { if (!plan_only) g_c.skipped_nolo++; pthread_mutex_unlock(&g_patchlock); return 0; }
   if (!plan_only) {
     live_retire((uint64_t)code, (uint64_t)code + len, &g_c.superseded);
@@ -1228,7 +1676,8 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
   if (plan_only) {
     // save everything ptj_patch_object appends to, then put it all back
     uint32_t s_ent = g_cx.nentries, s_rel = g_cx.nrelocs, s_tr = g_cx.ntramps;
-    uint64_t s_val = g_cx.n_values, s_drop[PTJ_DROP_N];
+    uint64_t s_val = g_cx.n_values, s_drop[PTJ_DROP_N], s_slid = g_cx.slid, s_shifted = g_cx.shifted, s_kfs = g_cx.kf_flags_saved;
+    uint64_t s_wide = g_cx.wide_memop_sites;
     size_t s_slab = g_tslab_used;
     memcpy(s_drop, g_cx.drops, sizeof s_drop);
     int (*s_inst)(uint8_t *, const uint8_t *, uint32_t, uint64_t) = g_cx.install;
@@ -1238,6 +1687,8 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
     g_cx.nentries = s_ent; g_cx.nrelocs = s_rel; g_cx.ntramps = s_tr;
     g_cx.n_values = s_val; g_tslab_used = s_slab;
     memcpy(g_cx.drops, s_drop, sizeof s_drop);
+    g_cx.slid = s_slid; g_cx.shifted = s_shifted; g_cx.kf_flags_saved = s_kfs;
+    g_cx.wide_memop_sites = s_wide;
     g_npend = 0;                                 // nothing was queued; make sure of it
     if (nunp) *nunp = g_cx.nunpatched;
     g_cx.unpatched = nullptr; g_cx.maxunpatched = 0;
@@ -1247,9 +1698,24 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
     return (int)ost.patched;
   }
   uint32_t rel0 = g_cx.nrelocs;
+  g_inst_snap = snap; g_inst_base = (uint64_t)(uintptr_t)code; g_inst_len = (uint32_t)len;
+  g_inst_nm = jid ? jid[0] : 0; g_inst_method = jid ? jid[1] : 0; g_inst_cid = jid ? (int32_t)jid[2] : -1;
+  g_inst_code = (uint64_t)(uintptr_t)code;
+  g_ptj_dd_active = 1;
   ptj_patch_object(&g_cx, code, len, sites, n, &ost, nullptr, nullptr, note_tramp);
-  hs_commit();                                   // finish the cross-modifying sequence
-  // D-J13: publish every relocated instruction's copy -> original mapping BEFORE the
+  g_ptj_dd_active = 0;
+  g_inst_snap = nullptr;
+  if (hs_commit() < 0) {                         // The object moved under us
+    live_note((uint64_t)code, (uint32_t)len, first);
+    live_retire((uint64_t)code, (uint64_t)code + len, &g_c.superseded);
+    if (nunp) *nunp = 0;
+    g_cx.unpatched = nullptr; g_cx.maxunpatched = 0;
+    g_c.patch_ns += ptj_ns() - p0;
+    g_cx.obj++;
+    pthread_mutex_unlock(&g_patchlock);
+    return -2;
+  }
+  // Publish every relocated instruction's copy -> original mapping BEFORE the
   // window can execute... it already can (hs_commit returned), but a fault needs the
   // instruction to be REACHED, which needs the detour, which needs phase 5 above; the map
   // is filled within microseconds of that and a miss is counted, not silently ignored.
@@ -1263,7 +1729,7 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
     g_c.objs_patched++;
     uint64_t now = ptj_ns();
     if (!g_c.first_install_ns) g_c.first_install_ns = now;
-    g_c.last_install_ns = now;                  // convergence: see jit_java_perf.md
+    g_c.last_install_ns = now;                  // convergence time
     if (g_instlog_buf && g_instlog_n < PTJ_INSTLOG_MAX) {
       g_instlog_buf[g_instlog_n][0] = now;
       g_instlog_buf[g_instlog_n][1] = g_nprec;          // cumulative windows installed
@@ -1287,7 +1753,7 @@ static int apply_patch(uint8_t *code, size_t len, PtjSite *sites, int n, uint8_t
 // forbidden addresses are a different question and get a different answer.  This mirrors
 // analyze.py's own `avoid_key` -- a short hash of the sorted address list appended to the
 // content hash -- so the two caches partition the space the same way.
-// D-J14.2 validation.  A coarser cache key can only fail one way: by handing an object the
+// Resynchronisation validation.  A coarser cache key can only fail one way: by handing an object the
 // site list of a DIFFERENT object.  Nothing downstream would notice -- the Pintool would
 // instrument the wrong offsets and log the wrong values -- so the coarsening is checked
 // head-on: with `maskverify=1' every cache hit is re-asked of the analyzer and the two site
@@ -1360,7 +1826,26 @@ static void mask_verify(PtjClient *cli, const uint8_t *snap, size_t len, uint64_
   }
 }
 
-// `cache_only' (D-J14): answer from the content-hash cache or return -3 without calling the
+// Cache-identity accounting.  [k][o]: k = 0 round-0 key (no avoid set),
+// 1 avoid-round key; o = 0 memory hit, 1 disk hit, 2 miss answered by the analyzer, 3 miss
+// in the cache lane (forwarded to the analyzer lane, which looks up again).  `lookupdump=PATH'
+// appends one line per final round-0 lookup (outcome, len, key, name, code hex) so misses can
+// be diffed against the same method's code in another run.
+static uint64_t g_kc[2][4];
+static FILE *g_lkdump = nullptr;
+static pthread_mutex_t g_lkdlock = PTHREAD_MUTEX_INITIALIZER;
+static void lk_note(int avoidk, int outcome, const char *key, const char *name,
+                    const uint8_t *snap, size_t len, uint64_t base) {
+  __atomic_fetch_add(&g_kc[avoidk][outcome], 1, __ATOMIC_RELAXED);
+  if (!g_lkdump || avoidk) return;   // diag: C (cache-lane miss) lines too
+  pthread_mutex_lock(&g_lkdlock);
+  fprintf(g_lkdump, "%c %zu %s %#llx %s ", "MDAC"[outcome], len, key, (unsigned long long)base,
+          name ? name : "?");
+  for (size_t q = 0; q < len; q++) fprintf(g_lkdump, "%02x", snap[q]);
+  fputc('\n', g_lkdump); fflush(g_lkdump);
+  pthread_mutex_unlock(&g_lkdlock);
+}
+// `cache_only': answer from the content-hash cache or return -3 without calling the
 // analyzer.  The caller then hands the job to the analyzer lane instead of holding a worker
 // for the ~0.5 s a round trip costs.  Nothing about the ANSWER changes -- same key, same
 // cache, same analyzer, same site list; only which thread waits for it.
@@ -1372,7 +1857,7 @@ static int resolve_sites(PtjClient *cli, const uint8_t *snap, size_t len, uint64
                          int cache_only = 0) {
   char key[PTJ_KEYMAX];
   uint64_t h0 = ptj_ns();
-  // D-J6: the analyzer must see the same inline-data boundary and the same extra entry points
+  // The analyzer must see the same inline-data boundary and the same extra entry points
   // the patcher's own sweep uses, or its sites land on boundaries the patcher never decodes.
   uint32_t data_from = ptj_scan_data_from(&g_dec, snap, len);
   masked_hash(snap, len, key, data_from, roots, nroots);
@@ -1395,6 +1880,7 @@ static int resolve_sites(PtjClient *cli, const uint8_t *snap, size_t len, uint64
                                        memcpy(rroots, ce->rroots, sizeof(uint32_t) * (size_t)k); *nrroots = k; } }
     pthread_mutex_unlock(&g_cachelock);
     if (n >= 0) {
+      lk_note(navoid > 0, 0, key, name, snap, len, base);
       g_sgtl.cache += ptj_ns() - h1;
       mask_verify(cli, snap, len, base, name, out, n, avoid, navoid, roots, nroots, data_from);
       return n;
@@ -1402,9 +1888,12 @@ static int resolve_sites(PtjClient *cli, const uint8_t *snap, size_t len, uint64
   }
   int n = key[0] ? ptj_cache_load(cli, key, out, maxs, rroots, maxrroots, nrroots) : -1;
   g_sgtl.cache += ptj_ns() - h1;
-  if (n >= 0)
+  if (n >= 0) {
+    lk_note(navoid > 0, 1, key, name, snap, len, base);
     mask_verify(cli, snap, len, base, name, out, n, avoid, navoid, roots, nroots, data_from);
-  if (n < 0 && cache_only) return -3;            // hand it to the analyzer lane
+  }
+  if (n < 0 && cache_only) { lk_note(navoid > 0, 3, key, name, snap, len, base); return -3; }
+  if (n < 0) lk_note(navoid > 0, 2, key, name, snap, len, base);            // hand it to the analyzer lane
   // NOT `&& cli->fd >= 0'.  That guard made the re-dial inside ptj_analyze unreachable: a
   // worker whose `analyze.py --serve' had died stopped analysing anything for the rest of
   // the run, `analysis_calls' and `analysis_unserved' both stayed at 0, and every object
@@ -1413,6 +1902,7 @@ static int resolve_sites(PtjClient *cli, const uint8_t *snap, size_t len, uint64
   // 0 and validated.  ptj_analyze returns -1 by itself when it cannot connect.
   if (n < 0) {
     uint64_t a0 = ptj_ns();
+    g_ncalls_tl++;
     n = ptj_analyze(cli, snap, len, base, name, out, maxs, avoid, navoid,
                     roots, (int)nroots, data_from, rroots, maxrroots, nrroots);
     g_sgtl.anal += ptj_ns() - a0;
@@ -1441,18 +1931,20 @@ static int resolve_sites(PtjClient *cli, const uint8_t *snap, size_t len, uint64
 
 // --- the job queue -----------------------------------------------------------
 struct Job {
-  uint64_t enq_ns;                   // when the CompiledMethodLoad event queued it (D-J3.2)
-  uint64_t ev_ns;                    // D-J14: when the event handler itself started
-  uint64_t q0_ns;                    // D-J14: FIRST enqueue -- keeps patch_latency_ms's
+  uint64_t enq_ns;                   // when the CompiledMethodLoad event queued it
+  uint64_t ev_ns;                    // When the event handler itself started
+  uint64_t q0_ns;                    // FIRST enqueue -- keeps patch_latency_ms's
                                      //        definition (enqueue -> published) unchanged
-  uint64_t qwait;                    // D-J14: time on queues, summed over both lanes
-  uint64_t s_hash, s_cache;          // D-J14: stage time already spent in the cache lane
+  uint64_t qwait;                    // Time on queues, summed over both lanes
+  uint64_t s_hash, s_cache;          // Stage time already spent in the cache lane
   uint64_t pin_generation;
+  uint64_t nm, method; int32_t cid;  // The nmethod header, its Method* and compile id at the event
   uint64_t addr; uint32_t len; uint8_t code_type;
-  uint8_t prio;                      // D-J14: 1 = the runtime has compiled this before
+  uint8_t prio;                      // 1 = the runtime has compiled this before
   uint8_t *snap;                     // the code bytes at event time (owned)
   uint32_t nforbid; uint32_t *forbid;
-  // D-J6: the analyzer's `restart_roots' for this object, plus the union with `forbid' that
+  uint32_t npc;                      // forbid[0, npc) are PcDescs
+  // The analyzer's `restart_roots' for this object, plus the union with `forbid' that
   // the patcher's recursive descent is seeded with.
   uint32_t nrroots; uint32_t *rroots;      // owned by the worker that runs the job
   char name[128];
@@ -1464,8 +1956,25 @@ static pthread_cond_t g_qcond = PTHREAD_COND_INITIALIZER;
 static int g_qstop = 0, g_nworkers = 0, g_workers_busy = 0;
 static uint64_t g_q_enq = 0, g_q_done = 0, g_q_dropped = 0, g_q_stale = 0;
 static PtjClient *g_wcli = nullptr;
+// Plan-queue timeline, so a timed window can be shown to start with 0 plans pending.
+// (t since agent load in ms, enq - done) at every change, rate-limited to one sample per 10 ms except
+// that a transition to or from 0 is always kept.  Called with g_qlock held.
+#define PTJ_QTL_N 16384
+static uint32_t g_qtl_t[PTJ_QTL_N], g_qtl_p[PTJ_QTL_N], g_qtl_n = 0, g_qtl_lastp = 0; static uint64_t g_qtl_lastns = 0;
+static uint64_t g_qtl_t0 = 0;
+static void qtl_note(void) {
+  uint64_t e = g_q_enq, d = g_q_done, p = e > d ? e - d : 0, now = ns_now();
+  if (!g_qtl_t0) g_qtl_t0 = g_c.agent_load_ns ? g_c.agent_load_ns : now;
+  if ((uint32_t)p == g_qtl_lastp) return;
+  int edge = (p == 0) || (g_qtl_lastp == 0);
+  g_qtl_lastp = (uint32_t)p;
+  if (!edge && now - g_qtl_lastns < 10000000ull) return;
+  if (g_qtl_n >= PTJ_QTL_N) return;
+  g_qtl_t[g_qtl_n] = (uint32_t)((now - g_qtl_t0) / 1000000ull); g_qtl_p[g_qtl_n] = (uint32_t)p; g_qtl_n++;
+  g_qtl_lastns = now;
+}
 
-// --- D-J14: the analyzer lane -------------------------------------------------------------
+// --- The analyzer lane -------------------------------------------------------------
 // Measured cause of the 0.5-3.1 s publication latency: NOT steady-state capacity (analyzer
 // time over worker-seconds is 21-74 % across cells) and NOT the analyzer's own speed.  It is
 // HEAD-OF-LINE BLOCKING in a burst.  About one job in twenty misses the content-hash cache
@@ -1485,7 +1994,7 @@ static uint32_t g_aqhihead = 0, g_aqhitail = 0;
 static pthread_cond_t g_aqcond = PTHREAD_COND_INITIALIZER;   // guarded by g_qlock
 static int g_lanes = 1, g_nfast = 0, g_fast_busy = 0, g_prio = 1;
 static uint64_t g_aq_enq = 0, g_aq_done = 0, g_aq_dropped = 0, g_aq_hi = 0;
-// D-J14, second fix: the analyzer lane is FIFO, and its jobs cost ~0.6 s each, so a burst of
+// Second fix: the analyzer lane is FIFO, and its jobs cost ~0.6 s each, so a burst of
 // them takes ~20 s to drain on four workers.  Attribution (-jitmiss 3) showed the residual
 // unplanned executions are not spread evenly over that burst: they are a handful of HOT
 // methods (`String.split', the Scrabble lambdas) whose C2 code is profile-dependent and
@@ -1498,10 +2007,26 @@ static PtjClient *g_fcli = nullptr;                          // cache-lane clien
 // An nmethod whose memory was handed back can be reused by a later compilation; a job that
 // was queued before that must not write into it.  Cheap guard: remember every unloaded
 // address, and re-check a prefix/suffix of the snapshot against the live bytes.
-static uint64_t g_unloaded[4096]; static uint32_t g_nunloaded = 0;
+// An open-addressing set: large programs unload many thousands of nmethods.
+#define PTJ_UNL_BITS 17
+static uint64_t g_unloaded[1u << PTJ_UNL_BITS]; static uint32_t g_nunloaded = 0;
+static inline uint32_t unl_h(uint64_t a) { return (uint32_t)((a * 0x9E3779B97F4A7C15ull) >> (64 - PTJ_UNL_BITS)); }
+static void unloaded_add(uint64_t a) {
+  uint32_t m = (1u << PTJ_UNL_BITS) - 1, i = unl_h(a) & m;
+  if (!a || g_nunloaded >= m / 2) return;
+  for (;; i = (i + 1) & m) {
+    uint64_t c = __atomic_load_n(&g_unloaded[i], __ATOMIC_ACQUIRE);
+    if (c == a) return;
+    if (!c) { __atomic_store_n(&g_unloaded[i], a, __ATOMIC_RELEASE); g_nunloaded++; return; }
+  }
+}
 static int was_unloaded(uint64_t a) {
-  for (uint32_t i = 0; i < g_nunloaded && i < 4096; i++) if (g_unloaded[i] == a) return 1;
-  return 0;
+  uint32_t m = (1u << PTJ_UNL_BITS) - 1, i = unl_h(a) & m;
+  for (;; i = (i + 1) & m) {
+    uint64_t c = __atomic_load_n(&g_unloaded[i], __ATOMIC_ACQUIRE);
+    if (c == a) return 1;
+    if (!c) return 0;
+  }
 }
 static int snapshot_still_valid(const Job *j) {
   size_t k = j->len < 64 ? j->len : 64;
@@ -1512,6 +2037,91 @@ static int snapshot_still_valid(const Job *j) {
     if (memcmp(cur, j->snap + j->len - 64, 64)) return 0;
   }
   return 1;
+}
+
+// A job whose raw prefix/suffix no longer matches the live code is not
+// necessarily stale.  HotSpot re-links compiled code IN PLACE after the load event (call rel32
+// re-pointed from the resolve stub, inline-cache `movabs rbx', oops): exactly the >=32-bit
+// immediate/displacement fields the content-hash key already masks.  A hot method is the one
+// most likely to have been executed, hence re-linked, while it waited.  If the live object's masked hash equals the
+// snapshot's, every instruction boundary, every non-relocatable byte and hence the analyzer's
+// site list are unchanged, so the plan is still correct for the live code: refresh the snapshot
+// from the live bytes and patch.  Patching reads the LIVE bytes anyway, and the rules that keep
+// later HotSpot re-linking out of our windows (calls are never displaced, VM-rewritable
+// immediates are refused by immrule) are the ones every installed plan already relies on.
+// A genuinely different object (not-entrant entry jmp, address reuse) changes unmasked bytes
+// and stays stale.  `stalemask=0' restores the raw check.
+static int g_stalemask = 0;   // set from the option in Agent_OnLoad
+static int g_ident = 1;       // `ident=0' disables the nmethod identity checks
+static uint64_t g_q_revalid = 0, g_q_prestale = 0;
+static int snapshot_revalidate(Job *j) {
+  if (g_ident && j->nm && !nm_still(j->nm, j->addr, j->method, j->cid)) { g_ident_late_bad++; return 0; }
+  if (snapshot_still_valid(j)) return 1;
+  if (!g_stalemask) return 0;
+  uint8_t *live = (uint8_t *)malloc(j->len);
+  if (!live) return 0;
+  int ok = 0;
+  if (safe_read((const void *)j->addr, live, j->len)) {
+    char k1[65], k2[65];
+    masked_hash(j->snap, j->len, k1); masked_hash(live, j->len, k2);
+    if (k1[0] && !strcmp(k1, k2)) { memcpy(j->snap, live, j->len); ok = 1;
+                                    __atomic_fetch_add(&g_q_revalid, 1, __ATOMIC_RELAXED); }
+  }
+  free(live);
+  return ok;
+}
+
+// NOT-ENTRANT-AT-EVENT canonicalisation of the cache key.
+// HotSpot posts CompiledMethodLoad deferred, from the ServiceThread; by then a short-lived nmethod
+// (C1 tier-3 code replaced by C2, a deopt) may already be not-entrant, i.e. HotSpot has written
+// its 5-byte `jmp <handle_wrong_method>' over the first 5 bytes of the 7-byte stack bang at the
+// verified entry (NativeJump::patch_verified_entry).  The snapshot then differs from the entrant
+// version of the SAME code in unmasked bytes (the opcode, and the `fe ff' tail of the bang, which
+// no longer decodes and pushes the masker into its resync gate), so it would miss the plan cache
+// and cost a fresh analyzer round trip.  Canonicalise: the key AND the analyzer see the entrant bytes, rebuilt from
+// the bang this JVM emits (learned from the first entrant snapshot: `89 84 24 <disp32>' is one
+// constant per VM, StackShadowPages).  j->snap stays RAW (staleness is judged on raw bytes), and
+// patching decodes the LIVE bytes, where the verified-entry prologue [ve, ve+7) is already
+// forbidden to every window, so a plan made for the entrant bytes places nothing there and is
+// exact for the rest of the object, which is byte-identical.  Rule applies only when the jmp's
+// target is OUTSIDE the object and the 2-byte tail equals the learned bang's.  `necanon=0' disables it.
+static int g_necanon = 1;
+static uint64_t g_bang7 = 0;            // learned `89 84 24 d0 d1 d2 d3' (+1 in byte 7 = valid)
+static uint64_t g_ne_canon = 0, g_ne_nobang = 0;
+static thread_local uint8_t *g_nebuf = nullptr;
+static thread_local size_t g_necap = 0;
+static const uint8_t *ne_canonical(const uint8_t *snap, size_t len, uint64_t addr) {
+  if (!g_necanon || len < 0x28) return snap;
+  static const uint32_t ves[2] = {0, 0x20};
+  uint64_t b = __atomic_load_n(&g_bang7, __ATOMIC_ACQUIRE);
+  if (!b) {                                              // learn from an entrant snapshot
+    for (int q = 0; q < 2; q++) {
+      const uint8_t *c = snap + ves[q];
+      int32_t d; memcpy(&d, c + 3, 4);
+      if (c[0] == 0x89 && c[1] == 0x84 && c[2] == 0x24 && d < 0) {
+        uint64_t v = 0; memcpy(&v, c, 7); v |= 1ull << 56;
+        uint64_t z = 0; __atomic_compare_exchange_n(&g_bang7, &z, v, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        b = __atomic_load_n(&g_bang7, __ATOMIC_ACQUIRE); break;
+      }
+    }
+  }
+  for (int q = 0; q < 2; q++) {
+    const uint8_t *c = snap + ves[q];
+    if (c[0] != 0xe9) continue;
+    int32_t rel; memcpy(&rel, c + 1, 4);
+    uint64_t tgt = addr + ves[q] + 5 + (int64_t)rel;
+    if (tgt >= addr && tgt < addr + len) continue;         // an in-object jump: not HotSpot's patch
+    if (!b) { __atomic_fetch_add(&g_ne_nobang, 1, __ATOMIC_RELAXED); return snap; }
+    uint8_t bb[8]; memcpy(bb, &b, 8);
+    if (c[5] != bb[5] || c[6] != bb[6]) continue;          // the bang's surviving tail must match
+    if (len > g_necap) { g_nebuf = (uint8_t *)realloc(g_nebuf, len * 2); g_necap = g_nebuf ? len * 2 : 0; }
+    if (!g_nebuf) return snap;
+    memcpy(g_nebuf, snap, len);
+    memcpy(g_nebuf + ves[q], bb, 5);
+    __atomic_fetch_add(&g_ne_canon, 1, __ATOMIC_RELAXED);
+    return g_nebuf;
+  }
+  return snap;
 }
 
 // ---------------------------------------------------- the `avoid` re-solve loop ----
@@ -1528,7 +2138,7 @@ static int snapshot_still_valid(const Job *j) {
 // site set is installed, exactly once.
 static const uint32_t AVOID_MAX = 512;
 static int g_avoid_rounds = 2;
-static int g_noroots = 0;      // agent option `noroots=1': the D-J6 A/B control (see Agent_OnLoad)
+static int g_noroots = 0;      // agent option `noroots=1': restart-roots control (see Agent_OnLoad)
 
 // returns sites placed, -1 analyzer failure, -2 the snapshot went stale,
 // -3 (cache_only) the content-hash cache did not answer: give it to the analyzer lane
@@ -1538,16 +2148,25 @@ static int resolve_and_patch(PtjClient *cli, Job *j, PtjSite *buf, uint32_t *roo
   uint32_t unp[AVOID_MAX], nunp = 0;
   int navoid = 0, n, plan0 = -1, base_unpl = 0, rounds = 0;
   int nrr = 0;
-  // D-J6: the descent roots BOTH sides start from.  The jvmtiAddrLocationMap (HotSpot's PcDesc
+  // The descent roots BOTH sides start from.  The jvmtiAddrLocationMap (HotSpot's PcDesc
   // table: every safepoint and call return) goes to the analyzer as `"roots"`, and the analyzer's
   // `restart_roots` come back and join it here, so the patcher's recursive-descent sweep decodes
   // exactly the boundaries the analyzer placed sites on.  Both are also forbidden window
   // interiors (`forbid`), which is what they already were.
   uint32_t nroot = 0;
-  if (!g_noroots)
-    for (uint32_t q = 0; q < j->nforbid && nroot < (uint32_t)PTJ_MAXROOTS; q++) rootbuf[nroot++] = j->forbid[q];
+  // Do not spend an analyzer round trip (seconds for a large C2 blob) on a job that is
+  // already stale.
+  if (g_stalemask && !g_pinbridge && (was_unloaded(j->addr) || !snapshot_revalidate(j))) {
+    __atomic_fetch_add(&g_q_prestale, 1, __ATOMIC_RELAXED); return -2; }
+  // The VM-entry roots (C1 patch-site continuations, handlers, continuations, stubs) are
+  // appended AFTER the PcDescs; put them first, so the PTJ_MAXROOTS cap can only cost PcDescs.
+  if (!g_noroots) {
+    for (uint32_t q = j->npc; q < j->nforbid && nroot < (uint32_t)PTJ_MAXROOTS; q++) rootbuf[nroot++] = j->forbid[q];
+    for (uint32_t q = 0; q < j->npc && q < j->nforbid && nroot < (uint32_t)PTJ_MAXROOTS; q++) rootbuf[nroot++] = j->forbid[q];
+  }
+  const uint8_t *asnap = ne_canonical(j->snap, j->len, j->addr);   // key + analyzer only
   for (int round = 0; ; round++) {
-    n = resolve_sites(cli, j->snap, j->len, j->addr, j->name, buf, PTJ_MAXSITES,
+    n = resolve_sites(cli, asnap, j->len, j->addr, j->name, buf, PTJ_MAXSITES,
                       navoid ? avoid : nullptr, navoid,
                       // noroots>=2: do not even SEND the jvmtiAddrLocationMap as `"roots"',
                       // i.e. ask the analyzer the pre-v2.21 question (bar `data_from').
@@ -1565,11 +2184,12 @@ static int resolve_and_patch(PtjClient *cli, Job *j, PtjSite *buf, uint32_t *roo
       if (nrr) { __atomic_fetch_add(&g_c.restart_objs, 1, __ATOMIC_RELAXED);
                  __atomic_fetch_add(&g_c.restart_roots, (uint64_t)nrr, __ATOMIC_RELAXED); }
     }
-    if ((!g_pinbridge && was_unloaded(j->addr)) || !snapshot_still_valid(j)) return -2;
+    if ((!g_pinbridge && was_unloaded(j->addr)) || !(g_pinbridge ? snapshot_still_valid(j) : snapshot_revalidate(j))) return -2;
     if (g_avoid_rounds <= 0) break;                    // loop disabled: old behaviour
     nunp = 0;
     int pl = apply_patch((uint8_t *)j->addr, j->len, buf, n, j->code_type,
-                         j->forbid, j->nforbid, rootbuf, nroot, 1, unp, &nunp, AVOID_MAX);
+                         j->forbid, j->nforbid, rootbuf, nroot, 1, unp, &nunp, AVOID_MAX,
+                         j->npc, j->rroots, j->nrroots);
     if (round == 0) { plan0 = pl; base_unpl = (int)nunp; }
     if (nunp == 0) { if (round) __atomic_fetch_add(&g_c.avoid_converged, 1, __ATOMIC_RELAXED); break; }
     if (round >= g_avoid_rounds) break;                // out of rounds; install what we have
@@ -1587,6 +2207,7 @@ static int resolve_and_patch(PtjClient *cli, Job *j, PtjSite *buf, uint32_t *roo
     pthread_mutex_lock(&g_lock);
     auto current = g_pin_live.find(j->addr);
     if (current == g_pin_live.end() || current->second != j->pin_generation ||
+        (g_ident && j->nm && !nm_still(j->nm, j->addr, j->method, j->cid) && ++g_ident_late_bad) ||   // identity re-check
         !snapshot_still_valid(j)) {
       pthread_mutex_unlock(&g_lock);
       return -2;
@@ -1597,9 +2218,10 @@ static int resolve_and_patch(PtjClient *cli, Job *j, PtjSite *buf, uint32_t *roo
     pthread_mutex_unlock(&g_lock);
     return placed;
   }
-  if (was_unloaded(j->addr) || !snapshot_still_valid(j)) return -2;
+  if (was_unloaded(j->addr) || !snapshot_revalidate(j)) return -2;
+  const uint64_t jid3[3] = {g_ident ? j->nm : 0, j->method, (uint64_t)(int64_t)j->cid};
   if (g_verbose >= 2) {
-    // D-J11 diagnosis the design notes: the object exactly as the VM emitted it
+    // Diagnosis: the object exactly as the VM emitted it
     // (the analysed snapshot), the VM roots (jvmtiAddrLocationMap) and the analyzer's restart
     // roots, all as OFFSETS, so a crash can be replayed with runtime/jit/diag/dj11_phase.py.
     static pthread_mutex_t vl = PTHREAD_MUTEX_INITIALIZER;
@@ -1615,7 +2237,8 @@ static int resolve_and_patch(PtjClient *cli, Job *j, PtjSite *buf, uint32_t *roo
     pthread_mutex_unlock(&vl);
   }
   int placed = apply_patch((uint8_t *)j->addr, j->len, buf, n, j->code_type,
-                           j->forbid, j->nforbid, rootbuf, nroot);
+                           j->forbid, j->nforbid, rootbuf, nroot, 0, nullptr, nullptr, 0,
+                           j->npc, j->rroots, j->nrroots, j->snap, jid3);
   note_full_interpreter(j->name, placed);
   if (rounds) {
     __atomic_fetch_add(&g_c.avoid_objs, 1, __ATOMIC_RELAXED);
@@ -1655,14 +2278,13 @@ static int analyzer_lane_push(const Job *j) {
 }
 
 // lane 0 = the analyzer lane (owns g_wcli[w]); lane 1 = the cache lane (g_fcli[w], no socket).
-// With `lanes=0' there is no cache lane and lane 0 reads the single FIFO, i.e. the behaviour
-// measured before D-J14.
+// With `lanes=0' there is no cache lane and lane 0 reads the single FIFO.
 struct LaneArg { int lane; int w; };
 static void *worker_main(void *arg) {
   LaneArg la = *(LaneArg *)arg; free(arg);
   const int cache_lane = la.lane;
   PtjSite *buf = (PtjSite *)malloc(sizeof(PtjSite) * PTJ_MAXSITES);
-  // D-J6: per-worker scratch for the analyzer's restart roots and for the union of them with
+  // Per-worker scratch for the analyzer's restart roots and for the union of them with
   // the jvmtiAddrLocationMap that the patcher's sweep is seeded with.
   uint32_t *rrbuf = (uint32_t *)malloc(sizeof(uint32_t) * PTJ_MAXROOTS);
   uint32_t *rootbuf = (uint32_t *)malloc(sizeof(uint32_t) * PTJ_MAXROOTS);
@@ -1696,23 +2318,42 @@ static void *worker_main(void *arg) {
     j.qwait += (deq_ns > j.enq_ns) ? deq_ns - j.enq_ns : 0;
     int forwarded = 0;
     if (buf && rrbuf && rootbuf) {
-      stage_reset();
+      stage_reset(); g_ncalls_tl = 0;
       if (!cache_lane) { g_sgtl.hash = j.s_hash; g_sgtl.cache = j.s_cache; }
       j.rroots = rrbuf; j.nrroots = 0;
       int r = resolve_and_patch(cli, &j, buf, rootbuf, cache_lane && g_lanes);
+      const char ln = (char)(cache_lane ? 'c' : 'a'), pr = (char)j.prio, ct = (char)j.code_type;
       if (r == -3) {
         // Ownership of snap/forbid moves with the job.  If the lane is full the push fails,
         // the job is freed below and the object stays unplanned -- counted, never silent.
         forwarded = analyzer_lane_push(&j);
+        obj_log(j.addr, j.len, ns_now() - j.q0_ns, j.qwait, j.name, forwarded ? 'F' : 'D', ln, pr, ct, j.q0_ns, deq_ns);
       } else if (r == -2) {
         __atomic_fetch_add(&g_q_stale, 1, __ATOMIC_RELAXED);
+        char sc = 'S';
+        if (g_objlog) {           // Diagnosis: WHY stale -- unloaded, or only relocatable fields moved
+          if (was_unloaded(j.addr)) sc = 'U';
+          else {
+            uint8_t *live = (uint8_t *)malloc(j.len);
+            if (live && safe_read((const void *)j.addr, live, j.len)) {
+              char k1[65], k2[65];
+              masked_hash(j.snap, j.len, k1); masked_hash(live, j.len, k2);
+              if (!strcmp(k1, k2)) sc = 's';                    // masked-equal: in-place re-linking only
+              else if (live[0] == 0xe9 && j.snap[0] != 0xe9) sc = 'N';
+            }
+            free(live);
+          }
+        }
+        obj_log(j.addr, j.len, ns_now() - j.q0_ns, j.qwait, j.name, sc, ln, pr, ct, j.q0_ns, deq_ns);
+      } else if (r < 0) {
+        obj_log(j.addr, j.len, ns_now() - j.q0_ns, j.qwait, j.name, 'E', ln, pr, ct, j.q0_ns, deq_ns);
       } else if (r >= 0) {
-        note_latency(j.q0_ns, j.qwait);                     // D-J3.2
+        note_latency(j.q0_ns, j.qwait);
         // q0_ns, not enq_ns: a forwarded job is enqueued twice, and `evt' means the event
         // handler, not the second enqueue.  (Using enq_ns charged the cache-lane pass to
         // `evt' and made the analyzer row read 226 ms of "dump".)
-        stage_note(j.ev_ns, j.q0_ns, j.qwait);              // D-J14
-        obj_log(j.addr, j.len, ns_now() - j.q0_ns, j.qwait, j.name);
+        stage_note(j.ev_ns, j.q0_ns, j.qwait);
+        obj_log(j.addr, j.len, ns_now() - j.q0_ns, j.qwait, j.name, 'P', ln, pr, ct, j.q0_ns, deq_ns);
       }
     }
     if (!forwarded) { free(j.snap); free(j.forbid); }
@@ -1720,6 +2361,7 @@ static void *worker_main(void *arg) {
     if (cache_lane)   g_fast_busy--;
     else            { g_workers_busy--; if (g_lanes) g_aq_done++; }
     if (!forwarded) g_q_done++;                  // a forwarded job is done by the other lane
+    qtl_note();
     pthread_cond_broadcast(&g_qcond);
     pthread_cond_broadcast(&g_aqcond);
     pthread_mutex_unlock(&g_qlock);
@@ -1728,8 +2370,14 @@ static void *worker_main(void *arg) {
   return nullptr;
 }
 
-static thread_local uint64_t g_ev_ns = 0;      // D-J14: when this thread's callback started
-static thread_local uint8_t g_ev_prio = 0;     // D-J14: ... and whether it is a recompilation
+static thread_local uint64_t g_ev_ns = 0;      // When this thread's callback started
+static thread_local uint64_t g_ev_nm = 0, g_ev_method = 0; static thread_local int32_t g_ev_cid = -1;
+// The identity belongs to the event's nmethod ONLY.  The ServiceThread also posts DynamicCodeGenerated
+// (vtable/itable stubs, adapters) and the interpreter job is queued from inside the first load callback; both
+// must not inherit the thread-local identity of the LAST nmethod event: when that nmethod was later flushed every
+// such job would fail nm_still() and be dropped.
+static thread_local uint64_t g_ev_code = 0, g_ev_clen = 0;
+static thread_local uint8_t g_ev_prio = 0;     // ... and whether it is a recompilation
 static void enqueue_job(const uint8_t *code, size_t len, const char *name, size_t name_len,
                         uint8_t code_type, const uint32_t *forbid, uint32_t nforbid) {
   uint64_t ev_ns = g_ev_ns;
@@ -1752,6 +2400,9 @@ static void enqueue_job(const uint8_t *code, size_t len, const char *name, size_
   j->qwait = 0;
   j->addr = (uint64_t)code; j->len = (uint32_t)len; j->code_type = code_type;
   j->prio = prio;
+  if (g_ev_nm && (uint64_t)code >= g_ev_code && (uint64_t)code < g_ev_code + g_ev_clen) {
+    j->nm = g_ev_nm; j->method = g_ev_method; j->cid = g_ev_cid;
+  } else { j->nm = 0; j->method = 0; j->cid = -1; }
   // enqueue_job is called under the callback lock. A fresh generation permits
   // legitimate address reuse but never publication of the previous occupant's plan.
   j->pin_generation = generation;
@@ -1760,13 +2411,14 @@ static void enqueue_job(const uint8_t *code, size_t len, const char *name, size_
   memcpy(j->snap, code, len);
   j->rroots = nullptr; j->nrroots = 0;
   j->nforbid = nforbid;
+  j->npc = (forbid == g_forbid && g_npc <= nforbid) ? g_npc : 0;
   j->forbid = nforbid ? (uint32_t *)malloc(nforbid * 4) : nullptr;
   if (j->forbid) memcpy(j->forbid, forbid, nforbid * 4);
   else j->nforbid = 0;
   size_t nl = name_len > 120 ? 120 : name_len;
   if (name && nl) memcpy(j->name, name, nl);
   j->name[nl] = 0;
-  g_qtail++; g_q_enq++;
+  g_qtail++; g_q_enq++; qtl_note();
   pthread_cond_signal(&g_qcond);
   pthread_mutex_unlock(&g_qlock);
 }
@@ -1783,6 +2435,33 @@ static void drain_queue(int max_ms) {
     ts.tv_sec = 0; ts.tv_nsec = 10000000;
     nanosleep(&ts, nullptr);
   }
+}
+
+// The Java analogue of node's WTB_DRAIN_MS / the hook's drain()): an UNTIMED wait at the
+// warm-up/timed boundary until every queued plan is analysed and installed, bounded by `ms'.  Called by the
+// Renaissance plugin `PtjDrain' (runtime/jit/java/ptjdrain/) from afterOperationSetUp of the first timed
+// iteration, in BOTH arms: the vanilla JVM has no agent, the JNI lookup fails, and the plugin returns at once, so
+// the two arms run identical iteration counts.  HotSpot resolves this symbol by searching the -agentpath
+// libraries (nativeLookup.cpp) after the plugin's class loader.  Returns a one-line JSON summary.
+static uint64_t g_bd_n = 0, g_bd_before = 0, g_bd_after = 0, g_bd_ns = 0, g_bd_at_ms = 0;
+extern "C" JNIEXPORT jstring JNICALL Java_PtjDrain_drain(JNIEnv *env, jclass, jlong ms) {
+  uint64_t t0 = ns_now();
+  pthread_mutex_lock(&g_qlock);
+  uint64_t before = g_q_enq > g_q_done ? g_q_enq - g_q_done : 0;
+  pthread_mutex_unlock(&g_qlock);
+  drain_queue((int)(ms > 0 ? ms : 0));
+  pthread_mutex_lock(&g_qlock);
+  uint64_t after = g_q_enq > g_q_done ? g_q_enq - g_q_done : 0;
+  int busy = g_workers_busy + g_fast_busy;
+  pthread_mutex_unlock(&g_qlock);
+  uint64_t t1 = ns_now();
+  g_bd_n++; g_bd_before = before; g_bd_after = after; g_bd_ns = t1 - t0;
+  g_bd_at_ms = g_c.agent_load_ns && t0 > g_c.agent_load_ns ? (t0 - g_c.agent_load_ns) / 1000000ull : 0;
+  char b[256];
+  snprintf(b, sizeof b, "{\"agent\":1,\"pending_before\":%llu,\"pending_after\":%llu,\"busy_after\":%d,"
+           "\"wait_ms\":%.1f,\"at_ms\":%llu,\"bound_ms\":%lld}", (unsigned long long)before,
+           (unsigned long long)after, busy, (t1 - t0) / 1e6, (unsigned long long)g_bd_at_ms, (long long)ms);
+  return env->NewStringUTF(b);
 }
 
 // The synchronous path: entry-only mode (no analyzer call at all) and the DynamicCode blobs.
@@ -1835,9 +2514,34 @@ static void JNICALL cb_compiled_load(jvmtiEnv *jvmti, jmethodID method, jint cod
   uint64_t t0 = ns_now();
   g_ev_ns = t0;
   pthread_mutex_lock(&g_lock);
-  // D-J14: has the VM compiled this method before?  If so it is tiering it up, i.e. the VM's
+  // Has the VM compiled this method before?  If so it is tiering it up, i.e. the VM's
   // own profiler has just called it hot, and its analysis goes to the head of the analyzer
   // lane.  One bit, no extra JVMTI call, no tier-specific knowledge.
+  g_ev_nm = 0; g_ev_method = 0; g_ev_cid = -1;
+  g_ev_code = (uint64_t)(uintptr_t)code_addr; g_ev_clen = (uint64_t)(code_size > 0 ? code_size : 0);
+  if (g_ident) {                    // under the Pin bridge too (freed and reused nmethods)
+    uint64_t nm = 0, m = 0; int32_t c = -1, want = 0;
+    uint64_t expect = 0;
+    if (method && safe_read((const void *)method, &expect, 8)) want = 1;
+    if (want && nm_ident((uint64_t)(uintptr_t)code_addr, expect, &nm, &m, &c)) {
+      if (m != expect && mh_intrinsic(jvmti, method)) { g_ident_mh++; expect = m; }
+      if (m != expect) {                                     // the memory holds another method's code now
+        g_ident_ev_bad++; g_c.load++;
+        if (g_ident_log > 0) {
+          char *mn = nullptr; jclass cl; char *cs = nullptr;
+          jvmti->GetMethodName(method, &mn, nullptr, nullptr);
+          if (jvmti->GetMethodDeclaringClass(method, &cl) == JVMTI_ERROR_NONE) jvmti->GetClassSignature(cl, &cs, nullptr);
+          fprintf(stderr, "PTJIDENT ev_bad_name %s.%s code=%p size=%d\n", cs ? cs : "?", mn ? mn : "?", code_addr, (int)code_size);
+          if (mn) jvmti->Deallocate((unsigned char *)mn);
+          if (cs) jvmti->Deallocate((unsigned char *)cs);
+        }
+        pthread_mutex_unlock(&g_lock);
+        g_c.hook_ns += ns_now() - t0;
+        return;
+      }
+      g_ident_ev_ok++; g_ev_nm = nm; g_ev_method = m; g_ev_cid = c;
+    } else g_ident_ev_nohdr++;
+  }
   g_ev_prio = g_seen_methods.insert((uint64_t)(uintptr_t)method).second ? 0 : 1;
   if (g_ev_prio) g_c.recompiles++;
   g_c.load++; g_c.nmethod_bytes += (uint64_t)code_size;
@@ -1877,7 +2581,7 @@ static void JNICALL cb_compiled_load(jvmtiEnv *jvmti, jmethodID method, jint cod
       // The template interpreter is the single hottest generated-code object in a JVM and it
       // is known to be so before it runs a byte.  It goes to the head of the lane too.
       uint8_t save = g_ev_prio; g_ev_prio = 1;
-      if (g_verbose) {                     // D-J14: why is the interpreter never a cache hit?
+      if (g_verbose) {                     // Why is the interpreter never a cache hit?
         char raw[65], msk[65], rt[65];
         PtjSha sh; ptj_sha_init(&sh);
         ptj_sha_update(&sh, (const void *)g_interp_addr, g_interp_len);
@@ -1915,12 +2619,23 @@ static void JNICALL cb_compiled_load(jvmtiEnv *jvmti, jmethodID method, jint cod
                            g_interp_roots, g_n_interp_roots,
                            g_interp_roots, g_n_interp_roots);
       g_c.interp_entries = g_n_interp_roots;
-      g_c.interp_patched = (uint64_t)np;
+      g_c.interp_patched = np > 0 ? (uint64_t)np : 0;
       free(ss);
     }
   }
   if (g_mode >= MODE_ENTRY) {
     build_forbid(code_addr, map_length, map);
+    // The instruction after a C1 patch site's `bytes_to_copy' is real code the descent
+    // cannot reach through the site's leftover bytes -> a decode root for both the analyzer
+    // and the patcher (and a forbidden window interior, which it is anyway).
+    if (g_ptj_hs_callstub)
+      g_ptj_c1_patchsites += (uint64_t)ptj_hs_c1_patchsites((const uint8_t *)code_addr, (size_t)code_size,
+          [&](uint32_t site, uint32_t n, uint32_t, uint32_t) {
+            if (g_nforbid < 65536) g_forbid[g_nforbid++] = site + n;
+          });
+    if (g_ptj_hs_callstub)                                   // Handler/continuation/stub entries
+      hs_vm_entries((uint64_t)(uintptr_t)code_addr, (uint32_t)code_size, [&](uint32_t o) {
+        if (g_nforbid < 65536) g_forbid[g_nforbid++] = o; });
     patch_object((uint8_t *)code_addr, (size_t)code_size, nbuf, nl, 1, g_mode == MODE_ENTRY);
   }
   pthread_mutex_unlock(&g_lock);
@@ -1942,7 +2657,7 @@ static void JNICALL cb_compiled_unload(jvmtiEnv *jvmti, jmethodID method, const 
     ptj_arena_record(&g_dump, 2, 1, code_addr, nullptr, nullptr, 0, nullptr, 0, 0);
     pthread_mutex_unlock(&g_patchlock);
   }
-  if (g_nunloaded < 4096) g_unloaded[g_nunloaded++] = (uint64_t)code_addr;
+  unloaded_add((uint64_t)code_addr);
   // Retire the trampolines of the nmethod that lived here: its address can be handed to a
   // new compilation at any time, and a stale record would make `verify()` and the offline
   // time-keyed lookup both wrong.
@@ -1955,11 +2670,42 @@ static void JNICALL cb_compiled_unload(jvmtiEnv *jvmti, jmethodID method, const 
   g_c.hook_ns += ns_now() - t0;
 }
 
+// HotSpot posts DATA as DynamicCodeGenerated too.  Every
+// constant pool that a StubCodeMark wraps -- StubRoutines::x86 float/double_sign_mask/_flip (the
+// operands of C2's AbsF/AbsD/NegF/NegD: `andpd/xorpd xmm, [double_sign_flip]'), the vector_* masks,
+// iota_indices, the AES/SHA/GHASH shuffle masks -- arrives as a "stub" of 16-64 bytes.  Planning
+// decodes e.g. double_sign_flip (00 00 00 00 00 00 00 80 x2) as `add [rax],al' memop sites and
+// installs a detour INTO THE CONSTANT: the int3 and then `e9 rel32' overwrote the mask's low
+// mantissa bytes, so every compiled negation XORed garbage bits into its operand (small per
+// operation, visible only as an occasional numerical failure).  Rule: a blob is
+// patched only if its linear decode from the start reaches an UNCONDITIONAL transfer (ret, jmp,
+// ud2, hlt) before the first undecodable byte.  Code cannot fall off the end of a stub, so every
+// real stub has one (what follows it may be unwritten slop: HotSpot posts vtable/itable stubs with
+// their size-limit tail, e.g. `... ff 63 40 | 78'); a data blob either fails to decode first
+// (double_sign_mask `ff ff'), decodes as straight-line arithmetic (double_sign_flip), or only
+// branches conditionally (vector_byte_shuffle_mask = 0x70 x 32 = a `jo' chain, which a "contains
+// any control transfer" rule accepts).  A misclassified code blob would only lose its values
+// (completeness), never correctness.  Counter `stub_data_skips'; names with PTJ_STUB_DATA_LOG=1.
+static uint64_t g_stub_data_skips = 0;
+static int hs_blob_is_code(const uint8_t *code, size_t len) {
+  size_t off = 0;
+  while (off < len) {
+    ZydisDecodedInstruction ins; ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&g_dec, code + off, len - off, &ins, ops, ZYDIS_MAX_OPERAND_COUNT, 0)))
+      return 0;
+    if (ins.meta.category == ZYDIS_CATEGORY_RET || ins.meta.category == ZYDIS_CATEGORY_UNCOND_BR ||
+        ins.mnemonic == ZYDIS_MNEMONIC_UD2 || ins.mnemonic == ZYDIS_MNEMONIC_HLT) return 1;
+    off += ins.length;
+  }
+  return 0;
+}
+
 static void JNICALL cb_dynamic_code(jvmtiEnv *jvmti, const char *name,
                                     const void *address, jint length) {
   (void)jvmti;
   uint64_t t0 = ns_now();
   g_ev_ns = t0;
+  g_ev_nm = 0; g_ev_method = 0; g_ev_cid = -1; g_ev_code = 0; g_ev_clen = 0;
   pthread_mutex_lock(&g_lock);
   g_c.dyn++; g_c.dyn_bytes += (uint64_t)length;
   note_event_thread();
@@ -1976,14 +2722,42 @@ static void JNICALL cb_dynamic_code(jvmtiEnv *jvmti, const char *name,
   }
   int is_interp = (name && !strcmp(name, "Interpreter"));
   if (is_interp) { g_interp_addr = (uint64_t)address; g_interp_len = (uint32_t)length; }
-  if (g_mode >= MODE_ENTRY && !is_interp && g_patch_stubs) {
-    g_nforbid = 0;
+  // HotSpot posts each method-handle intrinsic
+  // entry ("_linkToSpecial", "_linkToVirtual", "_invokeBasic", ...) with its alignment padding: the
+  // posted region starts with a NOP and the entry every caller branches to is the NEXT byte
+  // (+1).  A 5-byte detour at +0 would cover that entry, so the next call would land mid-jmp.
+  // The first
+  // instruction after leading 0x90 padding is a forbidden-interior boundary, like arraycopy's +4.
+  uint32_t pad = 0;
+  while (pad < (uint32_t)length && pad < 16 && ((const uint8_t *)address)[pad] == 0x90) pad++;
+  int is_mh = 0;
+  // A BufferBlob that HotSpot FILLS INCREMENTALLY ("native signature handlers":
+  // SignatureHandlerLibrary appends each new handler into the posted blob) arrives with an
+  // unfilled, zeroed tail.  A plan computed then decodes the zeros as `add [rax],al' sites and
+  // places detours there; when HotSpot later writes a handler into that space our install would tear
+  // it.  Never patch such a blob, and never patch a
+  // zero tail of any stub blob (its future contents are unknown to the plan).
+  if (name && (strstr(name, "ignature handler") || strstr(name, "ignature Handler"))) is_mh = 1;
+  if (!is_mh && length > 0) {
+    const uint8_t *cb = (const uint8_t *)address; jint L = length;
+    while (L > 0 && cb[L - 1] == 0) L--;
+    if (length - L >= 16) { g_zero_tail_trunc++; length = (L + 15) & ~15; }
+  }
+  if (is_mh && g_mode >= MODE_ENTRY) g_sig_handler_skips++;
+  if (g_mode >= MODE_ENTRY && !is_interp && !is_mh && g_patch_stubs) {
+    (void)0;
+    g_nforbid = 0; g_npc = 0;
     // Other arraycopy blobs branch directly to +4, bypassing the frame prologue.
     // Without that cross-object entry a 5-byte detour at +0 can overwrite it.
     // Feed the verified boundary to BOTH analysis and the window planner; the
     // existing root-aware cache identity keeps old plans separate.
-    uint32_t secondary = !g_pinbridge ? ptj_hs_arraycopy_entry((const uint8_t *)address, (size_t)length, name) : 0;
+    uint32_t secondary = ptj_hs_arraycopy_entry((const uint8_t *)address, (size_t)length, name);   // a decode root under Pin too
     if (secondary) { g_forbid[g_nforbid++] = secondary; g_stub_secondary_entries++; }
+    if (pad && pad < (uint32_t)length && pad != secondary) { g_forbid[g_nforbid++] = pad; g_skipped_mh++; }
+    if (!hs_blob_is_code((const uint8_t *)address, (size_t)length)) {   // data blobs are skipped under Pin too
+      g_stub_data_skips++;
+      if (getenv("PTJ_STUB_DATA_LOG")) fprintf(stderr, "PTJAVA stub_data_skip %s %p %d\n", name ? name : "?", address, (int)length);
+    } else
     patch_object((uint8_t *)address, (size_t)length, name, nl, 3, g_mode == MODE_ENTRY);
   } else if (g_mode >= MODE_ENTRY) {
     g_c.skipped_type++;
@@ -2009,8 +2783,7 @@ static void verify_pass(uint64_t *intact, uint64_t *clob, uint64_t *retired, uin
     else (*other)++;
 #ifdef PTJ_CLOBDUMP
     // Diagnostic build (`./build.sh --clobdump`, path in $PTJ_CLOBDUMP): dump enough to
-    // disassemble the window and name whatever overwrote it.  See jit_java.md section 5b,
-    // "One open issue the loop exposed".
+    // disassemble the window and name whatever overwrote it.
     { FILE *cd = fopen(getenv("PTJ_CLOBDUMP") ? getenv("PTJ_CLOBDUMP") : "/tmp/ptj_clob.txt", "a");
       if (cd) {
         fprintf(cd, "addr=%#llx obj=%#llx+%u off=%llu wlen=%u kind=%s\n",
@@ -2047,6 +2820,19 @@ static void write_ctrdump(void) {
   fclose(f);
 }
 
+// dropdump=PATH: `addr reason kind when nregs kf' per site the install pass dropped.
+static const char *g_dropdump = nullptr;
+static void write_dropdump(void) {
+  if (!g_dropdump || !g_ptj_dd) return;
+  FILE *f = fopen(g_dropdump, "w");
+  if (!f) return;
+  fprintf(f, "# addr reason kind when nregs kf   (records=%u max=%u)\n", g_ptj_dd_n, g_ptj_dd_max);
+  for (uint32_t i = 0; i < g_ptj_dd_n; i++)
+    fprintf(f, "%llx %s %u %u %u %u\n", (unsigned long long)g_ptj_dd[i].addr, PTJ_DROP_NAME[g_ptj_dd[i].reason],
+            g_ptj_dd[i].kind, g_ptj_dd[i].when, g_ptj_dd[i].nregs, g_ptj_dd[i].kf);
+  fclose(f);
+}
+
 static void write_instlog(void) {
   if (!g_instlog || !g_instlog_buf) return;
   FILE *f = fopen(g_instlog, "w");
@@ -2062,6 +2848,7 @@ static void write_instlog(void) {
 
 static void write_stats(void) {
   write_ctrdump();
+  write_dropdump();
   write_instlog();
   write_objlog();
   FILE *f = g_statsfile ? fopen(g_statsfile, "w") : stderr;
@@ -2072,7 +2859,7 @@ static void write_stats(void) {
     g_cli.disk_writes += g_wcli[w].disk_writes; g_cli.errors += g_wcli[w].errors;
     g_cli.reconnects += g_wcli[w].reconnects; g_cli.unserved += g_wcli[w].unserved;
   }
-  for (int w = 0; w < g_nfast && g_fcli; w++) {          // D-J14: the cache lane
+  for (int w = 0; w < g_nfast && g_fcli; w++) {          // The cache lane
     g_cli.calls += g_fcli[w].calls; g_cli.call_ns += g_fcli[w].call_ns;
     g_cli.mem_hits += g_fcli[w].mem_hits; g_cli.disk_hits += g_fcli[w].disk_hits;
     g_cli.disk_writes += g_fcli[w].disk_writes; g_cli.errors += g_fcli[w].errors;
@@ -2084,10 +2871,34 @@ static void write_stats(void) {
   fprintf(f, "\"mode\":%d,\"ptw\":%d,", g_mode, g_use_ptwrite);
   fprintf(f, "\"analysis_fast\":%d,\"noroots\":%d,\"interp_mode\":%d,\"patch_stubs\":%d,",
           g_cli.fast, g_noroots, g_patch_interp, g_patch_stubs);
-  fprintf(f, "\"stub_secondary_entries\":%llu,", (unsigned long long)g_stub_secondary_entries);
+  fprintf(f, "\"stub_secondary_entries\":%llu,\"padded_entries\":%llu,\"zero_tail_trunc\":%llu,\"sig_handler_skips\":%llu,\"stub_data_skips\":%llu,", (unsigned long long)g_stub_secondary_entries, (unsigned long long)g_skipped_mh, (unsigned long long)g_zero_tail_trunc, (unsigned long long)g_sig_handler_skips, (unsigned long long)g_stub_data_skips);
   fprintf(f, "\"bootstrap_ms\":%u,\"bootstrap_ns\":%llu,", g_bootstrap_ms,
           (unsigned long long)g_bootstrap_ns);
+  if (g_lkdump) fflush(g_lkdump);
   fprintf(f, "\"relative_avoid\":%d,", g_relative_avoid);
+  fprintf(f, "\"necanon\":{\"on\":%d,\"canon\":%llu,\"nobang\":%llu,\"bang\":\"%014llx\"},", g_necanon,
+          (unsigned long long)g_ne_canon, (unsigned long long)g_ne_nobang, (unsigned long long)(g_bang7 & 0xffffffffffffffull));
+  pthread_mutex_lock(&g_qlock);
+  fprintf(f, "\"qtl\":{\"t0_ms\":%.1f,\"n\":%u,\"s\":[", g_qtl_t0 && g_qtl_t0 > g_c.agent_load_ns ? (g_qtl_t0 - g_c.agent_load_ns) / 1e6 : 0.0, g_qtl_n);
+  for (uint32_t q = 0; q < g_qtl_n; q++) fprintf(f, "%s[%u,%u]", q ? "," : "", g_qtl_t[q], g_qtl_p[q]);
+  fprintf(f, "]},");
+  pthread_mutex_unlock(&g_qlock);
+  fprintf(f, "\"boundary_drain\":{\"n\":%llu,\"at_ms\":%llu,\"pending_before\":%llu,\"pending_after\":%llu,\"wait_ms\":%.1f},",
+          (unsigned long long)g_bd_n, (unsigned long long)g_bd_at_ms, (unsigned long long)g_bd_before,
+          (unsigned long long)g_bd_after, g_bd_ns / 1e6);
+  fprintf(f, "\"at_death\":{\"t_ms\":%.1f,\"jobs_pending\":%llu,\"sites_patched\":%llu},",
+          g_c.death_ns ? (g_c.death_ns - g_c.agent_load_ns) / 1e6 : -1.0,
+          (unsigned long long)g_c.jobs_pending_at_death, (unsigned long long)g_c.sites_at_exit);
+  fprintf(f, "\"callstub\":{\"on\":%d,\"refused\":%llu,\"c1_patchsites\":%llu,\"c1_beinginit\":%llu},", g_ptj_hs_callstub,
+          (unsigned long long)g_ptj_callstub_refused, (unsigned long long)g_ptj_c1_patchsites, (unsigned long long)g_ptj_c1_beinginit);
+  fprintf(f, "\"vmentries\":{\"on\":%d,\"objs\":%llu,\"nohdr\":%llu,\"handlers\":%llu,\"conts\":%llu,\"stubs\":%llu,\"jt\":%llu,\"jt_objs\":%llu},", g_vment,
+          (unsigned long long)g_vment_objs, (unsigned long long)g_vment_nohdr, (unsigned long long)g_vment_handlers,
+          (unsigned long long)g_vment_conts, (unsigned long long)g_vment_stubs, (unsigned long long)g_vment_jt,
+          (unsigned long long)g_vment_jt_objs);
+  fprintf(f, "\"keyclass\":{\"base\":[%llu,%llu,%llu,%llu],\"avoid\":[%llu,%llu,%llu,%llu]},",
+          (unsigned long long)g_kc[0][0], (unsigned long long)g_kc[0][1], (unsigned long long)g_kc[0][2],
+          (unsigned long long)g_kc[0][3], (unsigned long long)g_kc[1][0], (unsigned long long)g_kc[1][1],
+          (unsigned long long)g_kc[1][2], (unsigned long long)g_kc[1][3]);
   fprintf(f, "\"pin_bridge\":%d,\"pin_objects\":%llu,\"pin_sites\":%llu,\"pin_retired\":%llu,"
              "\"pin_objects_at_exit\":%llu,\"pin_sites_at_exit\":%llu,",
           g_pinbridge, (unsigned long long)g_pin_objects, (unsigned long long)g_pin_sites,
@@ -2104,7 +2915,7 @@ static void write_stats(void) {
   fprintf(f, "\"analysis_calls\":%llu,\"analysis_errors\":%llu,",
           (unsigned long long)g_cli.calls, (unsigned long long)g_cli.errors);
   // unserved > 0 means objects went UNANALYSED because no `--serve` process answered:
-  // the run is then silently less instrumented than it looks.  See jit_java_perf.md.
+  // the run is then silently less instrumented than it looks.
   fprintf(f, "\"analysis_unserved\":%llu,\"analysis_reconnects\":%llu,",
           (unsigned long long)g_cli.unserved, (unsigned long long)g_cli.reconnects);
   fprintf(f, "\"cache_mem_hits\":%llu,\"cache_disk_hits\":%llu,\"cache_disk_writes\":%llu,",
@@ -2136,17 +2947,32 @@ static void write_stats(void) {
           g_have_sync_core);
   fprintf(f, "\"quiesce\":%d,\"qsig\":%d,\"quiesce_rounds\":%llu,\"quiesce_signals\":%llu,"
              "\"quiesce_redirects\":%llu,\"quiesce_timeouts\":%llu,\"quiesce_unknown_rip\":%llu,"
-             "\"quiesce_ns\":%llu,\"selftest_int3\":%llu,\"selftest_quiesce\":%llu,",
+             "\"quiesce_ns\":%llu,\"quiesce_blocked\":%llu,\"selftest_int3\":%llu,\"selftest_quiesce\":%llu,"
+             "\"commit_abort3\":%llu,\"commit_abort3_wins\":%llu,\"commit_abort5\":%llu,\"unloaded_set\":%u,\"inst_snapdiff\":%llu,\"ident\":{\"on\":%d,\"ev_ok\":%llu,\"ev_bad\":%llu,\"ev_nohdr\":%llu,\"late_bad\":%llu,\"cid_off\":%ld,\"multi\":%llu,\"skipfirst\":%llu,\"hs0\":%d,\"hsdiff\":%llu,\"mh\":%llu},",
           g_quiesce, g_qsig, (unsigned long long)g_c.quiesce_rounds, (unsigned long long)g_c.quiesce_signals,
           (unsigned long long)g_c.quiesce_redirects, (unsigned long long)g_c.quiesce_timeouts,
           (unsigned long long)g_c.quiesce_unknown_rip, (unsigned long long)g_c.quiesce_ns,
-          (unsigned long long)g_c.selftest_int3,
-          (unsigned long long)g_c.selftest_quiesce);
-  // D-J13: implicit exceptions translated out of the trampoline slab.
+          (unsigned long long)g_c.quiesce_blocked, (unsigned long long)g_c.selftest_int3,
+          (unsigned long long)g_c.selftest_quiesce,
+          (unsigned long long)g_commit_abort3, (unsigned long long)g_commit_abort3_wins,
+          (unsigned long long)g_commit_abort5, g_nunloaded, (unsigned long long)g_inst_snapdiff,
+          g_ident, (unsigned long long)g_ident_ev_ok, (unsigned long long)g_ident_ev_bad, (unsigned long long)g_ident_ev_nohdr,
+          (unsigned long long)g_ident_late_bad, g_vo_cid, (unsigned long long)g_ident_multi, (unsigned long long)g_ident_skipfirst, g_ident_hs0, (unsigned long long)g_ident_hsdiff, (unsigned long long)g_ident_mh);
+  // Implicit exceptions translated out of the trampoline slab.
   fprintf(f, "\"xlat\":%d,\"xlat_hits\":%llu,\"xlat_other\":%llu,\"xlat_sigs\":%llu,"
-             "\"xlat_relmap\":%llu,",
+             "\"xlat_relmap\":%llu,\"xlat_relmap_lost\":%llu,\"relocs_max\":%u,",
           g_xlat, (unsigned long long)g_c.xlat_hits, (unsigned long long)g_c.xlat_other,
-          (unsigned long long)g_c.xlat_sigs, (unsigned long long)g_c.xlat_relmap);
+          (unsigned long long)g_c.xlat_sigs, (unsigned long long)g_c.xlat_relmap,
+          (unsigned long long)g_c.xlat_relmap_lost, g_cx.maxrelocs);
+  fprintf(f, "\"m6\":{\"pcsoft\":%d,\"slide\":%d,\"shift\":%d,\"uep\":%d,\"immrule\":%d,\"vms\":\"%s\","
+             "\"heap_lo\":%llu,\"heap_hi\":%llu,\"obase\":%llu,\"oshift\":%d,\"kbase\":%llu,"
+             "\"kf_flags_saved\":%llu,\"slid\":%llu,\"shifted\":%llu,\"imm_ok32\":%llu,\"imm_ok64\":%llu,\"imm_ref32\":%llu,\"imm_ref64\":%llu,\"uepentry\":%d,\"uepentry_moved\":%llu,\"uepentry_blocked\":%llu,\"uepentry_clash\":%llu},",
+          g_cx.pcsoft, g_cx.slide, g_cx.shift, g_uep, g_ptj_immrule, g_vms_err,
+          (unsigned long long)g_ptj_heap_lo, (unsigned long long)g_ptj_heap_hi, (unsigned long long)g_ptj_obase,
+          g_ptj_oshift, (unsigned long long)g_ptj_kbase, (unsigned long long)g_cx.kf_flags_saved, (unsigned long long)g_cx.slid,
+          (unsigned long long)g_cx.shifted, (unsigned long long)g_ptj_imm_ok32, (unsigned long long)g_ptj_imm_ok64,
+          (unsigned long long)g_ptj_imm_ref32, (unsigned long long)g_ptj_imm_ref64, g_uepentry,
+          (unsigned long long)g_c.uepentry_moved, (unsigned long long)g_c.uepentry_blocked, (unsigned long long)g_c.uepentry_clash);
   fprintf(f, "\"restart_objs\":%llu,\"restart_roots\":%llu,",
           (unsigned long long)g_c.restart_objs, (unsigned long long)g_c.restart_roots);
   fprintf(f, "\"ve_none\":%llu,\"ve_gt_0x20\":%llu,\"locmap_objs\":%llu,\"locmap_entries\":%llu,",
@@ -2190,7 +3016,7 @@ static void write_stats(void) {
           (unsigned long long)__atomic_load_n(&g_interp_full_sites, __ATOMIC_ACQUIRE),
           (unsigned long long)g_interp_full_sites_at_exit,
           (unsigned long long)__atomic_load_n(&g_interp_install_ns, __ATOMIC_ACQUIRE));
-  // DEFECT D-J3.2: CODE_ADDED -> patched, in milliseconds.  A workload shorter than p90
+  // CODE_ADDED -> patched, in milliseconds.  A workload shorter than p90
   // here ran on a JVM whose hot nmethods were never instrumented.
   fprintf(f, "\"patch_latency_ms\":{\"n\":%llu,\"mean\":%.1f,\"p50\":%.1f,\"p90\":%.1f,"
              "\"p99\":%.1f,\"max\":%.1f,\"queue_mean\":%.1f,\"queue_max\":%.1f},",
@@ -2199,25 +3025,27 @@ static void write_stats(void) {
           lat_pct(50) / 1e6, lat_pct(90) / 1e6, lat_pct(99) / 1e6, g_c.lat_max / 1e6,
           g_c.lat_n ? (double)g_c.qlat_sum / g_c.lat_n / 1e6 : 0.0, g_c.qlat_max / 1e6);
   fprintf(f, "\"keyframe\":{\"period\":%u,\"requested\":%llu,\"sites\":%llu,\"values\":%llu,"
-             "\"counters\":%u},",
+             "\"counters\":%u,\"gs_base\":%u,\"gs_cells\":%u},",
           g_keyframe, (unsigned long long)g_cx.kf_requested, (unsigned long long)g_cx.kf_sites,
-          (unsigned long long)g_cx.kf_values, g_cx.kfctr_used);
+          (unsigned long long)g_cx.kf_values, g_cx.kfctr_used, g_cx.kf_gs_base, g_cx.kf_gs_n);
+  fprintf(f, "\"wide_memop_sites\":%llu,", (unsigned long long)g_cx.wide_memop_sites);
   fprintf(f, "\"gt\":{\"sites\":%u,\"refused\":%llu,\"records\":%llu},",
           g_cx.ngtents, (unsigned long long)g_cx.gt_refused,
           (unsigned long long)(g_gt.base ? (ptj_gt_used(&g_gt) - 32) / 16 : 0));
   fprintf(f, "\"queue\":{\"enqueued\":%llu,\"done\":%llu,\"dropped\":%llu,\"stale\":%llu,"
              "\"workers\":%d,\"lanes\":%d,\"fastworkers\":%d,\"analyzer_lane\":%llu,"
-             "\"analyzer_lane_done\":%llu,\"analyzer_lane_dropped\":%llu,\"analyzer_lane_hi\":%llu,\"prio\":%d},\"maskverify\":{\"checked\":%llu,\"same\":%llu,\"different\":%llu,\"analyzer_self_same\":%llu,\"analyzer_self_diff\":%llu,\"diff_same_value_set\":%llu,\"diff_other_value_set\":%llu,\"resync\":%d},",
+             "\"analyzer_lane_done\":%llu,\"analyzer_lane_dropped\":%llu,\"analyzer_lane_hi\":%llu,\"prio\":%d,\"stalemask\":%d,\"revalidated\":%llu,\"prestale\":%llu,\"avoidrounds\":%d},\"maskverify\":{\"checked\":%llu,\"same\":%llu,\"different\":%llu,\"analyzer_self_same\":%llu,\"analyzer_self_diff\":%llu,\"diff_same_value_set\":%llu,\"diff_other_value_set\":%llu,\"resync\":%d},",
           (unsigned long long)g_q_enq, (unsigned long long)g_q_done,
           (unsigned long long)g_q_dropped, (unsigned long long)g_q_stale, g_nworkers,
           g_lanes, g_nfast, (unsigned long long)g_aq_enq,
           (unsigned long long)g_aq_done, (unsigned long long)g_aq_dropped,
-          (unsigned long long)g_aq_hi, g_prio,
+          (unsigned long long)g_aq_hi, g_prio, g_stalemask, (unsigned long long)g_q_revalid,
+          (unsigned long long)g_q_prestale, g_avoid_rounds,
           (unsigned long long)g_mv_checked, (unsigned long long)g_mv_same,
           (unsigned long long)g_mv_diff, (unsigned long long)g_mv_self_same,
           (unsigned long long)g_mv_self_diff, (unsigned long long)g_mv_same_values,
           (unsigned long long)g_mv_diff_values, g_mask_resync);
-  // D-J14: the same publication latency, split by stage and by who answered.  Milliseconds,
+  // The same publication latency, split by stage and by who answered.  Milliseconds,
   // MEANS over the population named by "n".  evt+queue+hash+cache+anal+pub should account for
   // `total' up to scheduling slop.
   {
@@ -2250,17 +3078,19 @@ static void (*g_rt_arm)(void) = nullptr;
 // page, stack banging) AFTER Agent_OnLoad and does not chain to what it displaced unless
 // libjsig is preloaded.  VM_INIT is the first point at which the VM's handlers are all in
 // place, so this is where the buffer sink's guard-page handler goes back in FRONT of them,
-// keeping HotSpot's as its own chain target the design notes.
+// keeping HotSpot's as its own chain target.
 static void JNICALL cb_vm_init(jvmtiEnv *jvmti, JNIEnv *env, jthread thr) {
+  if (getenv("PTJ_IDENT_LOG")) g_ident_log = atoi(getenv("PTJ_IDENT_LOG"));   // identity-check diagnostics
+  if (getenv("PTJ_VMS_DUMP")) { hs_vmstructs_init(); g_vms_done = 0; }   // diagnostic
   (void)jvmti; (void)env; (void)thr;
   if (g_pinbridge) return;   // no native detours, signal handlers or quiescence protocol
   if (g_cx.sink_buffer && g_rt_arm) g_rt_arm();
   if (g_mode >= MODE_ENTRY) {
-    // D-J13: our fault translator goes in front of the VM's handlers (and of the buffer
+    // Our fault translator goes in front of the VM's handlers (and of the buffer
     // sink's, armed just above), so that an implicit exception in a displaced instruction
     // still reaches the VM as one.
     if (g_xlat) xlat_install();
-    // D-J12a/b self-tests, after the VM's own handlers are installed (VM_INIT is the first
+    // Self-tests, after the VM's own handlers are installed (VM_INIT is the first
     // point where they all are): (1) an int3 we plant must reach trap_handler; (2) every
     // thread must answer the quiescence signal.
     int r = int3_selftest();
@@ -2268,7 +3098,7 @@ static void JNICALL cb_vm_init(jvmtiEnv *jvmti, JNIEnv *env, jthread thr) {
     if (r != 1) {
       fprintf(stderr, "PTJAVA FATAL: a planted int3 did not reach the SIGTRAP redirect handler "
                       "(r=%d): a ptrace tracer is swallowing SIGTRAP, or the handler was displaced. "
-                      "The int3->jmp install would resume racing threads at site+1 (D-J12a). "
+                      "The int3->jmp install would resume racing threads at site+1. "
                       "%s\n", r, g_selftest ? "Aborting (selftest=0 overrides)." : "Continuing (selftest=0).");
       if (g_selftest) _exit(72);
     }
@@ -2322,6 +3152,9 @@ static void JNICALL cb_vm_death(jvmtiEnv *jvmti, JNIEnv *env) {
   // be counted as coverage during the run.
   g_c.win_at_exit = g_nprec; g_c.val_at_exit = g_cx.n_values; g_c.obj_at_exit = g_cx.obj;
   g_c.sites_at_exit = g_c.sites_patched;   // in-run site coverage, before the drain
+  g_c.death_ns = ns_now();
+  { uint64_t e = __atomic_load_n(&g_q_enq, __ATOMIC_RELAXED), d = __atomic_load_n(&g_q_done, __ATOMIC_RELAXED);
+    g_c.jobs_pending_at_death = e > d ? e - d : 0; }
   if (g_nworkers) {
     drain_queue((int)g_drain_ms);
     pthread_mutex_lock(&g_qlock); g_qstop = 1;
@@ -2389,6 +3222,51 @@ static long opt_num(char *opts, const char *k, long dflt) {
   return v ? atol(v) : dflt;
 }
 
+// ---- REDUMP (DIAGNOSTIC): snapshot every anonymous executable
+// mapping when the capture's trace-control file changes state ('0' -> '1' = PT on, '1' -> '0'
+// = PT off).  Agent options `redump=<trace-control file>,redumpout=<file>'.  Record: u32 magic
+// "RDMP", u32 state char, u64 rdtscp, u64 addr, u64 len, then len bytes padded to 8; pages that
+// cannot be read are written as zeros and listed in the log line.  Never used in timing runs.
+static const char *g_redump_ctl = nullptr, *g_redump_out = nullptr;
+static void redump_once(int fd, char state) {
+  FILE *m = fopen("/proc/self/maps", "r");
+  if (!m) return;
+  char line[1024]; uint64_t nreg = 0, nbytes = 0, nbad = 0;
+  static uint8_t *buf = nullptr; static size_t bufcap = 0;
+  while (fgets(line, sizeof line, m)) {
+    unsigned long lo, hi; char perms[8] = {0}; unsigned long off; char dev[16]; unsigned long ino;
+    char path[512] = {0};
+    int n = sscanf(line, "%lx-%lx %7s %lx %15s %lu %511s", &lo, &hi, perms, &off, dev, &ino, path);
+    if (n < 6 || perms[2] != 'x' || (n == 7 && path[0] == '/') || (n == 7 && path[0] == '[')) continue;
+    size_t len = hi - lo;
+    if (len > bufcap) { free(buf); buf = (uint8_t *)malloc(len); bufcap = buf ? len : 0; if (!buf) continue; }
+    uint64_t t = ptj_rdtscp();
+    for (size_t o = 0; o < len; o += 4096) {
+      struct iovec li = {buf + o, 4096}, ri = {(void *)(lo + o), 4096};
+      if (syscall(SYS_process_vm_readv, getpid(), &li, 1, &ri, 1, 0) != 4096) { memset(buf + o, 0, 4096); nbad++; }
+    }
+    struct { uint32_t magic, state; uint64_t tsc, addr, len; } h = {0x504d4452u, (uint32_t)state, t, lo, len};
+    if (write(fd, &h, sizeof h) != (ssize_t)sizeof h) break;
+    size_t w = 0; while (w < len) { ssize_t r = write(fd, buf + w, len - w); if (r <= 0) break; w += r; }
+    nreg++; nbytes += len;
+  }
+  fclose(m);
+  fprintf(stderr, "PTJAVA redump state=%c regions=%llu bytes=%llu unreadable_pages=%llu\n", state,
+          (unsigned long long)nreg, (unsigned long long)nbytes, (unsigned long long)nbad);
+}
+static void *redump_main(void *) {
+  int fd = open(g_redump_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) { fprintf(stderr, "PTJAVA redump: cannot open %s\n", g_redump_out); return nullptr; }
+  char last = '0';
+  for (;;) {
+    int c = open(g_redump_ctl, O_RDONLY); char v = last;
+    if (c >= 0) { if (read(c, &v, 1) != 1) v = last; close(c); }
+    if (v != last && (v == '0' || v == '1')) { redump_once(fd, v); last = v; }
+    struct timespec ts = {0, 500000}; nanosleep(&ts, nullptr);
+  }
+  return nullptr;
+}
+
 JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
   g_c.agent_load_ns = ptj_ns();
   (void)reserved;
@@ -2414,6 +3292,8 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
     fprintf(stderr, "PTJAVA: relativeavoid must be 0 or 1\n"); _exit(71);
   }
   g_relative_avoid = !strcmp(relative_avoid, "1");
+  g_necanon = (int)opt_num(o, "necanon", 1);
+  { const char *ld = opt_str(o, "lookupdump", nullptr); if (ld) g_lkdump = fopen(ld, "a"); }
   g_diag = (int)opt_num(o, "diag", 0);
   g_use_ptwrite = (int)opt_num(o, "ptw", 1);
   if (g_pinbridge) g_use_ptwrite = 0;
@@ -2445,6 +3325,9 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
   g_sitemapfile = opt_str(o, "sitemap", nullptr);
   g_statsfile = opt_str(o, "stats", nullptr);
   g_mapsfile = opt_str(o, "maps", nullptr);
+  g_redump_ctl = opt_str(o, "redump", nullptr);
+  g_redump_out = opt_str(o, "redumpout", nullptr);
+  if (g_redump_ctl && g_redump_out) { pthread_t th; pthread_create(&th, nullptr, redump_main, nullptr); pthread_detach(th); }
 
   g_maxlen = (uint32_t)opt_num(o, "maxlen", 0);
   if (g_mode >= MODE_DUMP) {
@@ -2456,7 +3339,7 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
   if (g_mode >= MODE_ENTRY) {
     if (!g_pinbridge) { sync_core_init(); trap_install(); }
     g_quiesce = (int)opt_num(o, "quiesce", 1);
-    g_xlat = (int)opt_num(o, "xlat", 1);   // D-J13 fault translation (xlat=0 = the A/B control)
+    g_xlat = (int)opt_num(o, "xlat", 1);   // fault translation (xlat=0 disables it)
     if (g_pinbridge) { g_quiesce = 0; g_xlat = 0; }
     g_qsig = (int)opt_num(o, "qsig", 0);
     g_selftest = (int)opt_num(o, "selftest", 1);
@@ -2467,14 +3350,14 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
     g_cx.space = (int)g_space;
     g_cx.sparkplug = 0;                       // a V8 rule; HotSpot has its own (hs_patch_lo)
     g_cx.single = (int)opt_num(o, "single", 0);
-    // ---- BUFFER SINK the design notes ---------------------------------
+    // ---- BUFFER SINK ---------------------------------
     // `sink=buffer': a logged value is STORED into the thread's %gs ring instead of being
     // PTWRITEd.  The ring, its guard-page handler, the cv files and the sync markers are
     // runtime/rt/ptlogrt.c -- the same runtime the E9Patch buffer sink uses -- so `ptrecon'
     // consumes the run unchanged.  Both it and the pthread shim must be preloaded:
     //   LD_PRELOAD=runtime/rt/ptlogmt.so:runtime/rt/ptlogrt.so
-    // The shim gives every Java thread its OWN region .  Unlike a whole-program ELF
-    // build it is SUFFICIENT here (no spare-TCB handoff needed,  the earliest
+    // The shim gives every Java thread its OWN region.  Unlike a whole-program ELF
+    // build it is SUFFICIENT here (no spare-TCB handoff needed): the earliest
     // instrumented instruction a new thread can execute is JIT code, which is far past the
     // pthread start-routine wrapper, so no thread ever logs through its creator's cursor.
     { const char *sk = opt_str(o, "sink", nullptr);
@@ -2489,6 +3372,14 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
         g_cx.sink_buffer = 1;
         const char *sy = getenv("PTLOG_SYNC");     // MUST equal the runtime's own period
         g_cx.sync = sy ? (uint32_t)strtoul(sy, nullptr, 0) : 4096u;
+        const char *sc = getenv("PTLOG_SYNC_CARRIER");   // `tnt': no PTWRITE (rewrite.py --sync-carrier)
+        g_cx.sync_tnt = (sc && !strcmp(sc, "tnt")) ? 1 : 0;
+        if (g_cx.sync_tnt) {
+          g_cx.maxtnts = 3u << 21;
+          g_cx.tnts = (PtjTntMark *)mmap(nullptr, (size_t)g_cx.maxtnts * sizeof(PtjTntMark),
+              PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+          if (g_cx.tnts == MAP_FAILED) { g_cx.tnts = nullptr; g_cx.maxtnts = 0; }
+        }
         g_cx.maxsyncs = 1u << 21;
         g_cx.syncs = (PtjSyncMark *)mmap(nullptr, (size_t)g_cx.maxsyncs * sizeof(PtjSyncMark),
             PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -2498,8 +3389,8 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
         _exit(71);
       } }
     g_ctr_on = (int)opt_num(o, "ctr", 0);
-    // ---- keyframes (defect D-J1, the design notes -------------------------
-    // HotSpot enters a freshly compiled nmethod by OSR at a loop header and (D-J3) patches
+    // ---- keyframes -------------------------
+    // HotSpot enters a freshly compiled nmethod by OSR at a loop header and patches
     // it seconds after CODE_ADDED, so the object's entry anchor may never execute.
     // `keyframe=K' asks the analyzer for `resync' sites at loop back-edge headers, logged
     // every K-th execution; the countdown cell is per SITE and shared by every thread in
@@ -2507,7 +3398,27 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
     g_keyframe = (uint32_t)opt_num(o, "keyframe", 1024);
     { long kc = opt_num(o, "kfctr", -1); if (kc > 0) g_kfctr_max = (uint32_t)kc; }
     g_cx.kf_flags_live = (int)opt_num(o, "kfflagslive", 0);
-    // ---- same-run ground truth (defect D-J2) ----------------------------------------
+    // The extended patching option set is the DEFAULT for whole-program
+    // Fast (buffer sink + fast=1, not the Pin bridge).  Every other configuration keeps the
+    // conservative defaults; any option given explicitly (e.g. `uep=0') still wins.
+    g_wpdef = (g_cx.sink_buffer && opt_num(o, "fast", 0) && !g_pinbridge) ? 1 : 0;
+    g_cx.kf_flags_save = (int)opt_num(o, "kfflagsave", g_wpdef);
+    // `kfgs=BASE': PER-THREAD countdown cells in the ptlog
+    // runtime's %gs keyframe array, indices [BASE, PTLOG_KF_N) -- the launcher raises PTLOG_KF_N
+    // past the ELF images' own cells (BASE = their kfplan PTLOG_KF_N) to reserve them.
+    { long kb = opt_num(o, "kfgs", -1);
+      const char *kn = getenv("PTLOG_KF_N");
+      long n = kn ? atol(kn) : 0;
+      if (kb >= 0 && n > kb) {
+        g_cx.kf_gs_base = (uint32_t)kb;
+        g_cx.kf_gs_n = (uint32_t)(n - kb);
+        fprintf(stderr, "ptjava: per-thread JIT keyframe counters %%gs:[%u..%ld) (%u cells)\n",
+                (unsigned)kb, n, g_cx.kf_gs_n);
+      } else if (kb >= 0) {
+        fprintf(stderr, "ptjava: WARNING kfgs=%ld but PTLOG_KF_N=%ld reserves no cells: "
+                        "keeping the SHARED rip-relative keyframe counters\n", kb, n);
+      } }
+    // ---- same-run ground truth ----------------------------------------
     if ((int)opt_num(o, "gt", 0)) {
       g_gtdir = opt_str(o, "gtdir", ".");
       g_gt_mb = (size_t)opt_num(o, "gtmb", 4096);
@@ -2524,6 +3435,8 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
       }
     }
     g_ctrdump = opt_str(o, "ctrdump", nullptr);
+    g_dropdump = opt_str(o, "dropdump", nullptr);
+    if (g_dropdump) { g_ptj_dd_max = 1u << 22; g_ptj_dd = (PtjDropRec *)calloc(g_ptj_dd_max, sizeof(PtjDropRec)); }
     g_instlog = opt_str(o, "instlog", nullptr);
     if (g_instlog) g_instlog_buf = (uint64_t (*)[3])calloc(PTJ_INSTLOG_MAX, 24);
     { long cm = opt_num(o, "ctrmax", -1); if (cm > 0) g_ctr_max = (uint32_t)cm; }
@@ -2580,31 +3493,41 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
     // The analysis pool: N worker threads, one analyzer service each.  One service per
     // worker because analyze.py serves a connection synchronously.
     g_nworkers = (int)opt_num(o, "workers", 4);
-    g_avoid_rounds = (int)opt_num(o, "avoidrounds", 2);
+    g_avoid_rounds = (int)opt_num(o, "avoidrounds", g_wpdef ? 0 : 2);
+    g_stalemask = (int)opt_num(o, "stalemask", g_wpdef);
+    g_ident = (int)opt_num(o, "ident", 1);
     if (g_pinbridge) g_avoid_rounds = 0;
-  // D-J6 A/B control (mirrors the V8 front end's PTJIT_NOROOTS): still ASK the analyzer with
+  // Restart-roots control (mirrors the V8 front end's PTJIT_NOROOTS): still ASK the analyzer with
   // `roots'/`data_from', but do not seed the patcher's own recursive descent with the reply's
   // `restart_roots' (nor with the jvmtiAddrLocationMap).  Every site beyond the first restart
   // then lands on an offset the sweep never decoded and is dropped as `no_insn_boundary',
   // which is the pre-v2.21 behaviour.
   // noroots=1: ask as usual, do not seed the patcher's sweep (isolates the patcher half).
   // noroots=2: also stop sending the jvmtiAddrLocationMap as `"roots"' (isolates the analyzer half).
-  // Was 1 for part of 2026-09-17 (D-J11, the design notes: under analyzer v2.22/23 a
-  // restart root could be one byte inside a real instruction and the seeded sweep displaced a
-  // non-boundary -- philosophers died 19/20 in G1's code-cache unloading).  DEFAULT 0 again
-  // since analyzer v2.24 (phase-anchored restarts, jit_accuracy.md 9: 20/20 clean with the roots
-  // seeded, cold and warm cache).  `noroots=1' is the A/B control.
+  // DEFAULT 0 (the analyzer's restart roots are phase-anchored, so seeding them is safe).
   g_noroots = (int)opt_num(o, "noroots", 0);
     g_ptj_no_disp32 = (int)opt_num(o, "nodisp32", 0);
+    g_ptj_hs_callstub = (int)opt_num(o, "callstub", 1);   // On by default for HotSpot
+    g_vment = (int)opt_num(o, "vmentries", 1);
+    // Re-admit refused sites.  Default ON for whole-program
+    // Fast (g_wpdef), OFF otherwise.
+    g_cx.pcsoft = (int)opt_num(o, "pcsoft", g_wpdef);
+    g_cx.slide = (int)opt_num(o, "slide", g_wpdef);
+    g_cx.shift = (int)opt_num(o, "shift", g_wpdef);
+    g_uep = (int)opt_num(o, "uep", g_wpdef);
+    g_uepentry = (int)opt_num(o, "uepentry", 1);
+    g_ptj_immrule = (int)opt_num(o, "immrule", g_wpdef);
     if (g_nworkers < 1) g_nworkers = 1;
     if (g_nworkers > 32) g_nworkers = 32;
     g_drain_ms = opt_num(o, "drainms", 60000);
     g_qcap = (uint32_t)opt_num(o, "qcap", 1 << 14);
     g_q = (Job *)calloc(g_qcap, sizeof(Job));
     g_wcli = (PtjClient *)calloc((size_t)g_nworkers, sizeof(PtjClient));
-    // D-J14: the cache lane.  `lanes=0' is the A/B control (one FIFO, the old behaviour);
+    // The cache lane.  `lanes=0' disables it (one FIFO);
     // `fastworkers' sizes the lane.  These threads hold no analyzer connection -- they hash,
     // probe the content-hash cache, and either publish or hand the job to the analyzer lane.
+    { const char *pl = opt_str(o, "plog", nullptr);
+      if (pl) g_plogfd = open(pl, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644); }
     g_objlogfile = opt_str(o, "objlog", nullptr);
     if (g_objlogfile) {
       g_objlog_max = 1u << 14;
@@ -2644,7 +3567,7 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
       else fprintf(stderr, "PTJAVA: worker %d could not %s analyzer service %s: %s\n",
                    w, nospawn ? "connect to" : "start", c->sock, strerror(errno));
     }
-    // DEFECT D-J3.3 the design notes: with `nospawn=1' and nothing listening,
+    // With `nospawn=1' and nothing listening,
     // every code object used to be "analysed" with an EMPTY site list and the agent wrote a
     // syntactically valid site map with zero entries -- a silently unpatched JVM that looks
     // like a successful run.  Mode 3/4 has no meaning without a service, so refuse to run.
@@ -2654,7 +3577,7 @@ JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM *vm, char *options, void *reserved) {
               "PTJAVA: FATAL -- mode %d needs an analyzer service and not one of the %d workers\n"
               "        could reach `%s.<w>'.  Start them with\n"
               "          for w in $(seq 0 %d); do %s %s --serve %s.$w & done\n"
-              "        or drop `nospawn=1' to let the agent spawn them (but see D-J3: with\n"
+              "        or drop `nospawn=1' to let the agent spawn them (note: with\n"
               "        `pt_capture2 --cpu N' those children are pinned to the traced core).\n"
               "        `allowempty=1' overrides this check.\n",
               g_mode, g_nworkers, g_cli.sock, g_nworkers - 1, g_cli.py, g_cli.script, g_cli.sock);
