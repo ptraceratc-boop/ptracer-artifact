@@ -1,4 +1,5 @@
 # Fast-PTWRITE sites of libm.so.6 (5 M values/s budget): <addr> <when> <sha1 of the spec site>
+# budgeted on count runs of all 94 pyperformance benchmarks
 0x10560 before 21d6883b05c8
 0x10640 before 10c12f72cacb
 0x107b0 before c7601e337f7b
@@ -481,7 +482,6 @@
 0x33332 before 9a3ba5f585fa
 0x33454 after cce45e68acdb
 0x33740 before 4822ad8e3aab
-0x33960 before 3fbad6b5b8af
 0x33a8e before 6dc8974a812a
 0x33aa0 before 7d0e266d3456
 0x33beb before a612631b9b97
@@ -590,7 +590,6 @@
 0x42dc0 before a934e7a906b8
 0x42f40 before eee300ff376e
 0x43023 before 7515b3e935b5
-0x43070 before e5a3b5485a01
 0x43090 before ef26d709624c
 0x430d0 before 87f72686f81c
 0x43152 before 54f0a9935d0a
@@ -7397,7 +7396,6 @@
 0x71162 before 7d149ebaeb5b
 0x711d6 after 19df72b35c84
 0x7137c after 34ca13580db5
-0x716b0 before 69b049007a5e
 0x71771 after 675e6fce8e30
 0x717b4 before f5e413440ed5
 0x717cb before 3ca8db2a215e
@@ -7440,11 +7438,8 @@
 0x72a3a before f295bde48b15
 0x72a67 before 2c0145b8cac4
 0x72a77 before 8b568059b364
-0x72b10 before 9fb8c8974b39
-0x72b90 before 15ab9f22f359
 0x72b97 before f20d3e63005e
 0x72ba7 before 192bdf8e02f6
-0x72c40 before 58c7e39f0551
 0x72ca7 before 9aa5df4125f1
 0x72cc1 before 4b17d1331117
 0x72ccf before df28cab66492
@@ -7827,23 +7822,9 @@
 0x77a90 before 2a053e7d4ddb
 0x77a99 before a22623adb3e4
 0x77aa8 before 69622991d117
-0x77ca0 before ea7a8a3ef66d
-0x77d20 before b832e723a47f
 0x77d90 before 9c39f2992305
 0x77e00 before 988593c9d4a8
 0x77f00 before 23fb702eaf65
-0x780a0 before f7ad1b37c062
-0x78130 before cb1a792f0d7a
-0x781a0 before fd12639c27b2
-0x78200 before 58036b8e1626
-0x78210 before 415e19eb0f18
-0x78230 before 33660b501dff
-0x78260 before dbf2a9112d7c
-0x78270 before cbc14da549b0
-0x78280 before 3c92e50baab9
-0x78290 before e4b931cd5f45
-0x782a0 before a0f4a243f8a8
-0x782b0 before a1eab4ebcaac
 0x782c0 before b8b79f3627b4
 0x7869c after 19d2c02bffc7
 0x789c0 before dba41349fe72
@@ -7925,7 +7906,6 @@
 0x7f914 after 6d41a46b2154
 0x7fc50 before aff299c2cdad
 0x7fcf2 after 19733cc615bd
-0x803f0 before 8bf4066fd2bb
 0x8060e after 7d93d109708e
 0x80740 after 46edd8fea323
 0x80a10 before a5c68f877256
@@ -7960,7 +7940,6 @@
 0x8321f after 7d8a97dd38f5
 0x83300 after 8057ba70f037
 0x8352f before 0b3a074aa178
-0x837b0 before d26b9899ad5a
 0x83a4b after ce7eaa245785
 0x83c3e after 5d53241c6968
 0x83fb8 before 844e1f47939f

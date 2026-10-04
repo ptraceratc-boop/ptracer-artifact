@@ -526,7 +526,7 @@ def wrap(cfg, cores, prog_argv, suite, cell, aux_mb=512):
         for c in cl:
             percpu += ["--cpu", str(c)]
         extra = ["--sideband", os.path.join(JIT["statsdir"], "sb.%s.%s.json" % (suite, cell))]
-        for k, v in e9fast_child_env(suite).items():
+        for k, v in e9fast_child_env(suite, cfg).items():
             extra += ["--child-env", "%s=%s" % (k, v)]
         return (["taskset", "-c", HELPER_CORES, "setarch", "-R", PC,
                  "--aux-mb", str(max(128, aux_mb // max(1, len(cl)))), ptw_flag(cfg), "--no-decode",
@@ -771,7 +771,10 @@ def run(argv, cwd=None, env=None, timeout=3600):
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         kill_session(p.pid, "stopped at its time limit")
-        p.communicate()
+        try:
+            p.communicate(timeout=120)      # a process that left the session may still hold the pipes
+        except subprocess.TimeoutExpired:
+            p.kill()
         raise
     wall = time.monotonic() - t0
     kill_session(p.pid, "left behind by the finished run")
@@ -870,7 +873,8 @@ def cell_rust(cfg, v, args):
 
 def cell_node(cfg, n, args):
     iters = int(os.environ.get("WTB_ITERS") or dict(NODE).get(n, 10))
-    argv = [JITWP["manifest"]["node"] if cfg in E9FAST_CFGS else NODE_BIN]
+    man = JITWP["ptw"] if cfg == E9FAST_PTW and JITWP.get("ptw") else JITWP["manifest"]
+    argv = [man["node"] if cfg in E9FAST_CFGS else NODE_BIN]
     argv += os.environ.get("PTJ_NODE_V8FLAGS", "").split()   # fig5: same V8 flags every arm
     if cfg in E9FAST_CFGS and "--no-short-builtin-calls" not in argv:
         # V8's short builtin calls remap node's embedded builtins, and the remapped copy's `jmp rel32'
@@ -922,7 +926,8 @@ def cell_java(cfg, b, args):
     iters, drop = dict((x[0], (x[1], x[2])) for x in JAVA_B)[b]
     if cfg in HIFI_CFGS or cfg == "pinnoop" or cfg in BASELINE_CFGS or os.environ.get("PTJ_JAVA_ITERS_ALL") == "1":
         iters, drop = args.java_pin_iters, args.java_pin_drop   # the slow arms run fewer iterations
-    argv = [JITWP["manifest"]["java"] if cfg in E9FAST_CFGS else JAVA]
+    man = JITWP["ptw"] if cfg == E9FAST_PTW and JITWP.get("ptw") else JITWP["manifest"]
+    argv = [man["java"] if cfg in E9FAST_CFGS else JAVA]
     env = None
     if JIT["on"] and cfg in E9FAST_CFGS:
         # whole-program Fast: the rewritten JDK shadow tree + the agent's Fast objective with the whole-program

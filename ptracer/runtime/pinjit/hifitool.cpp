@@ -60,6 +60,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <set>
 
 /* ------------------------------------------------------------------ knobs */
 KNOB<std::string> KnobPlan(KNOB_MODE_WRITEONCE, "pintool", "plan", "",
@@ -69,6 +70,12 @@ KNOB<std::string> KnobCvDir(KNOB_MODE_WRITEONCE, "pintool", "cvdir", ".",
 KNOB<UINT32> KnobPages(KNOB_MODE_WRITEONCE, "pintool", "pages", "8192",
                        "trace-buffer pages per thread (4 KB each)");
 KNOB<BOOL> KnobStats(KNOB_MODE_WRITEONCE, "pintool", "stats", "0", "print stats at exit");
+/* Synchronization events (off by default): RTN instrumentation of the pthread / semaphore / process functions;
+ * one record { w0, w1, tsc } per event (w0/w1 = the Fast format of runtime/rt/ptsync.S) into
+ * sync.<pid>.<tid>.bin -- a SEPARATE stream, so the cv value stream is unchanged. */
+KNOB<BOOL> KnobSyncEv(KNOB_MODE_WRITEONCE, "pintool", "syncev", "0", "log synchronization events");
+KNOB<std::string> KnobSyncDir(KNOB_MODE_WRITEONCE, "pintool", "syncdir", "",
+                              "directory of sync.<pid>.<tid>.bin (default: -cvdir)");
 KNOB<std::string> KnobSink(KNOB_MODE_WRITEONCE, "pintool", "sink", "buffer",
                            "value sink: buffer (inlined fill buffer) | ptwrite (ptwrite per value) | count (buffer + site profile)");
 KNOB<std::string> KnobPtwBuffer(KNOB_MODE_WRITEONCE, "pintool", "ptwbuffer", "",
@@ -86,6 +93,23 @@ KNOB<std::string> KnobCountOut(KNOB_MODE_WRITEONCE, "pintool", "countout", "hifi
 KNOB<std::string> KnobMemRead(KNOB_MODE_WRITEONCE, "pintool", "memread", "load",
                               "m: item read: load (inlined, safe cases) | safecopy (PIN_SafeCopy callout)");
 
+
+/* ---- rotation / timed detach (off by default) ----------------------------------------------
+ * Rotation-record and Rotation-attach for the Pin-JIT deployment on DeathStarBench.
+ *  -rot-period S -rot-n N -rot-idx K [-rot-epoch T]: logging is ACTIVE only while
+ *      floor((now - T) / S) mod N == K (wall clock, so N independently started tools agree on
+ *      one active target).  While inactive NO instrumentation is inserted: the process runs
+ *      under the bare Pin JIT (the paper's "attached, not active").  Each switch flushes the
+ *      code cache (PIN_RemoveInstrumentation) so the next traces are re-instrumented.
+ *  -detach-after S: PIN_Detach() S seconds after the tool starts (JIT attach/detach for
+ *      Rotation-attach).  0 (default) = never.  Both default off: no
+ *      control thread, every trace instrumented as before. */
+KNOB<UINT32> KnobRotPeriod(KNOB_MODE_WRITEONCE, "pintool", "rot-period", "0", "rotation slot seconds (0=always active)");
+KNOB<UINT32> KnobRotN(KNOB_MODE_WRITEONCE, "pintool", "rot-n", "1", "number of rotation targets");
+KNOB<UINT32> KnobRotIdx(KNOB_MODE_WRITEONCE, "pintool", "rot-idx", "0", "this target's slot index");
+KNOB<UINT64> KnobRotEpoch(KNOB_MODE_WRITEONCE, "pintool", "rot-epoch", "0", "unix time of slot 0");
+KNOB<double> KnobDetachAfter(KNOB_MODE_WRITEONCE, "pintool", "detach-after", "0", "PIN_Detach after S seconds (0=never)");
+static volatile bool g_active = true;
 /* ------------------------------------------------------------------- plan */
 enum ItemKind { IT_REG, IT_XMM_LO, IT_XMM_HI, IT_MEM, IT_FSBASE };
 
@@ -218,6 +242,10 @@ struct TLS {
     int fd;
     UINT64 nvalues;
     OS_THREAD_ID ostid;
+    int sfd;                                    /* sync.<pid>.<tid>.bin (-syncev 1) */
+    std::vector<UINT64> sbuf;                   /* pending {w0, w1, tsc} triples */
+    struct SFrame { ADDRINT sp, ret, a0, a1, a2, aux; };
+    std::vector<SFrame> sframes;                /* entry state of the instrumented calls in flight */
 };
 static TLS_KEY g_tls;
 static std::vector<TLS *> g_all;
@@ -225,7 +253,165 @@ static PIN_LOCK g_lock;
 static BUFFER_ID g_buf;
 static bool g_discard = false;
 
-static VOID ThreadStart(THREADID tid, CONTEXT *, INT32, VOID *)
+/* ------------------------------------------------------------- sync events */
+enum { SY_CREATE = 1, SY_START, SY_EXIT, SY_JOIN, SY_FORK, SY_FORK_CHILD, SY_VFORK, SY_EXEC, SY_WAIT, SY_LOCK,
+       SY_TRYLOCK, SY_UNLOCK, SY_TIMEDLOCK, SY_CWAIT_BEGIN, SY_CWAIT_END, SY_CSIGNAL, SY_CBROADCAST, SY_RDLOCK,
+       SY_WRLOCK, SY_TRYRDLOCK, SY_TRYWRLOCK, SY_RWUNLOCK, SY_SEMWAIT, SY_SEMTRYWAIT, SY_SEMTIMEDWAIT, SY_SEMPOST,
+       SY_SPAWN };
+/* how: B = before (obj = a0, or 0 with OBJ0), A = after; obj: a0 | a0p64 | a0p32 | ret | waitid; res: rc | neg */
+enum SyHow { SB, SA, SCOND, SFORK };
+enum SyObj { O_A0, O_ZERO, O_A0P64, O_A0P32, O_RET, O_WAITID };
+enum SyRes { R_RC, R_NEG };
+struct SyFn { const char *name; int op; SyHow how; SyObj obj; SyRes res; };
+static const SyFn g_syfns[] = {
+    {"pthread_create", SY_CREATE, SA, O_A0P64, R_RC}, {"pthread_join", SY_JOIN, SA, O_A0, R_RC},
+    {"pthread_tryjoin_np", SY_JOIN, SA, O_A0, R_RC}, {"pthread_timedjoin_np", SY_JOIN, SA, O_A0, R_RC},
+    {"fork", SY_FORK, SFORK, O_RET, R_NEG}, {"vfork", SY_VFORK, SB, O_ZERO, R_RC},
+    {"posix_spawn", SY_SPAWN, SA, O_A0P32, R_RC}, {"posix_spawnp", SY_SPAWN, SA, O_A0P32, R_RC},
+    {"execve", SY_EXEC, SB, O_ZERO, R_RC}, {"execv", SY_EXEC, SB, O_ZERO, R_RC}, {"execvp", SY_EXEC, SB, O_ZERO, R_RC},
+    {"execvpe", SY_EXEC, SB, O_ZERO, R_RC}, {"fexecve", SY_EXEC, SB, O_ZERO, R_RC},
+    {"wait", SY_WAIT, SA, O_RET, R_NEG}, {"waitpid", SY_WAIT, SA, O_RET, R_NEG}, {"wait4", SY_WAIT, SA, O_RET, R_NEG},
+    {"waitid", SY_WAIT, SA, O_WAITID, R_NEG},
+    {"pthread_mutex_lock", SY_LOCK, SA, O_A0, R_RC}, {"pthread_mutex_trylock", SY_TRYLOCK, SA, O_A0, R_RC},
+    {"pthread_mutex_timedlock", SY_TIMEDLOCK, SA, O_A0, R_RC}, {"pthread_mutex_clocklock", SY_TIMEDLOCK, SA, O_A0, R_RC},
+    {"pthread_mutex_unlock", SY_UNLOCK, SB, O_A0, R_RC},
+    {"pthread_cond_wait", SY_CWAIT_END, SCOND, O_A0, R_RC}, {"pthread_cond_timedwait", SY_CWAIT_END, SCOND, O_A0, R_RC},
+    {"pthread_cond_clockwait", SY_CWAIT_END, SCOND, O_A0, R_RC},
+    {"pthread_cond_signal", SY_CSIGNAL, SB, O_A0, R_RC}, {"pthread_cond_broadcast", SY_CBROADCAST, SB, O_A0, R_RC},
+    {"pthread_rwlock_rdlock", SY_RDLOCK, SA, O_A0, R_RC}, {"pthread_rwlock_wrlock", SY_WRLOCK, SA, O_A0, R_RC},
+    {"pthread_rwlock_tryrdlock", SY_TRYRDLOCK, SA, O_A0, R_RC}, {"pthread_rwlock_trywrlock", SY_TRYWRLOCK, SA, O_A0, R_RC},
+    {"pthread_rwlock_timedrdlock", SY_RDLOCK, SA, O_A0, R_RC}, {"pthread_rwlock_timedwrlock", SY_WRLOCK, SA, O_A0, R_RC},
+    {"pthread_rwlock_unlock", SY_RWUNLOCK, SB, O_A0, R_RC},
+    {"sem_wait", SY_SEMWAIT, SA, O_A0, R_RC}, {"sem_trywait", SY_SEMTRYWAIT, SA, O_A0, R_RC},
+    {"sem_timedwait", SY_SEMTIMEDWAIT, SA, O_A0, R_RC}, {"sem_clockwait", SY_SEMTIMEDWAIT, SA, O_A0, R_RC},
+    {"sem_post", SY_SEMPOST, SB, O_A0, R_RC},
+};
+static bool g_syncev = false;
+/* calls made from libc / ld.so themselves (ld.so's rtld lock is pthread_mutex_lock, dl_fini, ...) are not
+ * logged: Fast interposes only calls that cross into libc through the PLT, and HiFi matches that */
+static ADDRINT g_sy_ex[4][2]; static int g_sy_nex = 0;
+static inline bool sy_internal(ADDRINT ret)
+{
+    for (int i = 0; i < g_sy_nex; i++) if (ret >= g_sy_ex[i][0] && ret < g_sy_ex[i][1]) return true;
+    return false;
+}
+static std::string g_syncdir;
+static UINT64 g_sync_n = 0;
+
+static void sync_open(struct TLS *t);
+static void sync_flush(struct TLS *t)
+{
+    if (t->sfd >= 0 && !t->sbuf.empty()) {
+        size_t want = t->sbuf.size() * 8, off = 0;
+        const char *p = (const char *)t->sbuf.data();
+        while (off < want) { ssize_t w = write(t->sfd, p + off, want - off); if (w <= 0) break; off += (size_t)w; }
+    }
+    t->sbuf.clear();
+}
+static inline UINT64 sy_rdtsc() { UINT32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((UINT64)hi << 32) | lo; }
+static void sync_put(struct TLS *t, int op, UINT64 res, ADDRINT ret, UINT64 obj)
+{
+    if (!t) return;
+    if (res > 255) res = 255;
+    t->sbuf.push_back((1ULL << 63) | ((UINT64)op << 56) | (res << 48) | ((UINT64)ret & 0xffffffffffffULL));
+    t->sbuf.push_back(obj);
+    t->sbuf.push_back(sy_rdtsc());
+    __atomic_add_fetch(&g_sync_n, 1, __ATOMIC_RELAXED);
+    if (t->sbuf.size() >= 3 * 4096) sync_flush(t);
+}
+static VOID SyBefore(THREADID tid, ADDRINT fi, ADDRINT sp, ADDRINT a0, ADDRINT a1, ADDRINT a2)
+{
+    struct TLS *t = (struct TLS *)PIN_GetThreadData(g_tls, tid);
+    if (!t) return;
+    const SyFn &f = g_syfns[fi];
+    ADDRINT ret = 0;
+    PIN_SafeCopy(&ret, (const VOID *)sp, sizeof ret);
+    if (sy_internal(ret)) return;
+    if (f.how == SB) { sync_put(t, f.op, 0, ret, f.obj == O_ZERO ? 0 : a0); return; }
+    if (f.how == SCOND) { sync_put(t, SY_UNLOCK, 0, ret, a1); sync_put(t, SY_CWAIT_BEGIN, 0, ret, a0); }
+    TLS::SFrame fr; fr.sp = sp; fr.ret = ret; fr.a0 = a0; fr.a1 = a1; fr.a2 = a2; fr.aux = (ADDRINT)PIN_GetPid();
+    t->sframes.push_back(fr);
+}
+static VOID SyAfter(THREADID tid, ADDRINT fi, ADDRINT sp, ADDRINT rv)
+{
+    struct TLS *t = (struct TLS *)PIN_GetThreadData(g_tls, tid);
+    if (!t) return;
+    /* the frame of THIS call: entered with the same %rsp (IPOINT_AFTER sits on the `ret');
+     * frames of calls whose IPOINT_AFTER never ran (a longjmp, a tail call) are dropped */
+    while (!t->sframes.empty() && t->sframes.back().sp < sp) t->sframes.pop_back();
+    if (t->sframes.empty() || t->sframes.back().sp != sp) return;
+    TLS::SFrame fr = t->sframes.back(); t->sframes.pop_back();
+    const SyFn &f = g_syfns[fi];
+    const int r32 = (int)(UINT32)rv;
+    UINT64 obj = 0;
+    switch (f.obj) {
+    case O_A0: obj = fr.a0; break;
+    case O_ZERO: break;
+    case O_RET: obj = (UINT64)(INT64)r32; break;
+    case O_A0P64: if (r32 == 0 && fr.a0) PIN_SafeCopy(&obj, (const VOID *)fr.a0, 8); break;
+    case O_A0P32: if (r32 == 0 && fr.a0) { INT32 v = 0; PIN_SafeCopy(&v, (const VOID *)fr.a0, 4); obj = (UINT64)(INT64)v; } break;
+    case O_WAITID: if (r32 == 0 && fr.a2) { INT32 v = 0; PIN_SafeCopy(&v, (const VOID *)(fr.a2 + 16), 4); obj = (UINT64)(INT64)v; } break;
+    }
+    const UINT64 res = f.res == R_NEG ? (r32 < 0 ? 255 : 0) : (UINT64)(UINT32)r32;
+    if (f.how == SFORK && r32 == 0) { sync_put(t, SY_FORK_CHILD, 0, fr.ret, fr.aux); return; }
+    sync_put(t, f.op, res, fr.ret, obj);
+    if (f.how == SCOND) sync_put(t, SY_LOCK, 0, fr.ret, fr.a1);
+}
+static void sync_image(IMG img)
+{
+    if (!g_syncev) return;
+    {   const std::string n = IMG_Name(img); const size_t sl = n.rfind('/');
+        const std::string b = sl == std::string::npos ? n : n.substr(sl + 1);
+        if ((b.compare(0, 7, "libc.so") == 0 || b.compare(0, 8, "ld-linux") == 0 || IMG_IsInterpreter(img)) && g_sy_nex < 4) {
+            g_sy_ex[g_sy_nex][0] = IMG_LowAddress(img); g_sy_ex[g_sy_nex][1] = IMG_HighAddress(img) + 1; g_sy_nex++; } }
+    /* RTN_FindByName (which resolves glibc's aliases), plus every OTHER routine of that name: glibc keeps
+     * old symbol versions as separate functions (pthread_cond_wait@GLIBC_2.2.5 vs @@GLIBC_2.3.2) */
+    std::vector<std::pair<RTN, size_t> > todo; std::set<ADDRINT> seen;
+    const size_t NF = sizeof g_syfns / sizeof g_syfns[0];
+    for (size_t i = 0; i < NF; i++) {
+        RTN r = RTN_FindByName(img, g_syfns[i].name);
+        if (RTN_Valid(r) && seen.insert(RTN_Address(r)).second) todo.push_back(std::make_pair(r, i));
+    }
+    for (SEC sec = IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec))
+    for (RTN r = SEC_RtnHead(sec); RTN_Valid(r); r = RTN_Next(r)) {
+        std::string nm = RTN_Name(r);
+        size_t at = nm.find('@'); if (at != std::string::npos) nm.resize(at);
+        for (size_t i = 0; i < NF; i++)
+            if (nm == g_syfns[i].name && seen.insert(RTN_Address(r)).second) { todo.push_back(std::make_pair(r, i)); break; }
+    }
+    for (size_t k = 0; k < todo.size(); k++) {
+        RTN rtn = todo[k].first; const size_t i = todo[k].second;
+        RTN_Open(rtn);
+        RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)SyBefore, IARG_THREAD_ID, IARG_ADDRINT, (ADDRINT)i,
+                       IARG_REG_VALUE, REG_STACK_PTR, IARG_FUNCARG_ENTRYPOINT_VALUE, 0,
+                       IARG_FUNCARG_ENTRYPOINT_VALUE, 1, IARG_FUNCARG_ENTRYPOINT_VALUE, 2, IARG_END);
+        if (g_syfns[i].how != SB)
+            RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)SyAfter, IARG_THREAD_ID, IARG_ADDRINT, (ADDRINT)i,
+                           IARG_REG_VALUE, REG_STACK_PTR, IARG_FUNCRET_EXITPOINT_VALUE, IARG_END);
+        RTN_Close(rtn);
+    }
+}
+static void sync_open(struct TLS *t)
+{
+    t->sfd = -1;
+    if (!g_syncev) return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/sync.%d.%d.bin", g_syncdir.c_str(), (int)PIN_GetPid(), (int)t->ostid);
+    t->sfd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    CvHdr h; memcpy(h.magic, "PTSY", 4); h.version = 1; h.tid = (UINT32)t->ostid; h.sync = 0;
+    if (t->sfd >= 0 && write(t->sfd, &h, sizeof(h)) != (ssize_t)sizeof(h))
+        fprintf(stderr, "[hifitool] short sync header write\n");
+}
+static VOID SyForkChild(THREADID tid, const CONTEXT *, VOID *)
+{   /* the child's only thread: its own file (the parent's buffered records stay with the parent) */
+    struct TLS *t = (struct TLS *)PIN_GetThreadData(g_tls, tid);
+    if (!t) return;
+    t->sbuf.clear(); t->ostid = PIN_GetTid();
+    if (t->sfd >= 0) close(t->sfd);
+    sync_open(t);
+}
+
+static VOID ThreadStart(THREADID tid, CONTEXT *ctxt, INT32, VOID *)
 {
     TLS *t = new TLS;
     t->nvalues = 0;
@@ -246,15 +432,23 @@ static VOID ThreadStart(THREADID tid, CONTEXT *, INT32, VOID *)
         if (write(t->fd, &h, sizeof(h)) != (ssize_t)sizeof(h))
             fprintf(stderr, "[hifitool] short header write\n");
     }
+    sync_open(t);
+    if (g_syncev && tid != 0)       /* START(pthread_self() = the thread's %fs base) */
+        sync_put(t, SY_START, 0, 0, PIN_GetContextReg(ctxt, REG_SEG_FS_BASE));
     PIN_SetThreadData(g_tls, t, tid);
     PIN_GetLock(&g_lock, tid + 1);
     g_all.push_back(t);
     PIN_ReleaseLock(&g_lock);
 }
 
-static VOID ThreadFini(THREADID tid, const CONTEXT *, INT32, VOID *)
+static VOID ThreadFini(THREADID tid, const CONTEXT *ctxt, INT32, VOID *)
 {
     TLS *t = (TLS *)PIN_GetThreadData(g_tls, tid);
+    if (t && g_syncev) {
+        if (tid != 0) sync_put(t, SY_EXIT, 0, 0, PIN_GetContextReg(ctxt, REG_SEG_FS_BASE));
+        sync_flush(t);
+        if (t->sfd >= 0) { close(t->sfd); t->sfd = -1; }
+    }
     if (t && t->fd >= 0) {
         close(t->fd);
         t->fd = -1;
@@ -510,6 +704,7 @@ static VOID PIN_FAST_ANALYSIS_CALL CountInc(UINT64 *p) { (*p)++; }
 
 static VOID Instruction(INS ins, VOID *)
 {
+    if (!g_active) return;              /* rotation: inactive slot */
     std::map<ADDRINT, const Site *>::const_iterator it = g_sites.find(INS_Address(ins));
     Site dynamic;
     const Site *s = it == g_sites.end() ? NULL : it->second;
@@ -538,6 +733,7 @@ static VOID Instruction(INS ins, VOID *)
 static VOID ImageLoad(IMG img, VOID *)
 {
     jit_image(img);
+    sync_image(img);
     const std::string name = IMG_Name(img);
     std::map<std::string, std::map<ADDRINT, Site> >::iterator p = g_plan.find(name);
     if (p == g_plan.end()) {
@@ -600,6 +796,35 @@ static VOID ForkChild(THREADID, const CONTEXT *, VOID *)
     g_t0 = now_s();
 }
 
+
+static bool rot_want(double t)
+{
+    if (KnobRotPeriod.Value() == 0) return true;
+    long slot = (long)((t - (double)KnobRotEpoch.Value()) / KnobRotPeriod.Value());
+    long n = KnobRotN.Value() ? KnobRotN.Value() : 1;
+    return ((slot % n) + n) % n == (long)KnobRotIdx.Value();
+}
+static VOID RotCtl(VOID *)
+{
+    const double t0 = now_s();
+    for (;;) {
+        usleep(100000);
+        const double t = now_s();
+        if (KnobDetachAfter.Value() > 0 && t - t0 >= KnobDetachAfter.Value()) {
+            fprintf(stderr, "[hifitool] t=%.3f DETACH after %.1fs\n", t, t - t0);
+            fflush(stderr);
+            PIN_Detach();
+            return;
+        }
+        const bool want = rot_want(t);
+        if (want != g_active) {
+            g_active = want;
+            PIN_RemoveInstrumentation();
+            fprintf(stderr, "[hifitool] t=%.3f %s (pid %d)\n", t, want ? "ACTIVATE" : "DEACTIVATE", (int)PIN_GetPid());
+            fflush(stderr);
+        }
+    }
+}
 static VOID Fini(INT32, VOID *)
 {
     if (g_count)
@@ -617,6 +842,7 @@ static VOID Fini(INT32, VOID *)
             (unsigned long)g_all.size(), (unsigned long)tot, (unsigned long)(tot * 8),
             (unsigned long)g_resolved, (unsigned long)g_inserted,
             (unsigned long)g_skipped_after);
+    if (g_syncev) fprintf(stderr, "[hifitool] sync_events=%lu\n", (unsigned long)g_sync_n);
     fprintf(stderr, "[hifitool] memread=%s mem_inline=%lu mem_safecopy=%lu mem_faults=%lu\n",
             g_memload ? "load" : "safecopy", (unsigned long)g_mem_inline,
             (unsigned long)g_mem_safecopy, (unsigned long)g_mem_faults);
@@ -692,6 +918,9 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[hifitool] PIN_DefineTraceBuffer failed\n");
         return 1;
     }
+    g_syncev = KnobSyncEv.Value();
+    g_syncdir = KnobSyncDir.Value().empty() ? KnobCvDir.Value() : KnobSyncDir.Value();
+    if (g_syncev) PIN_AddForkFunction(FPOINT_AFTER_IN_CHILD, SyForkChild, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
     PIN_AddThreadFiniFunction(ThreadFini, 0);
     IMG_AddInstrumentFunction(ImageLoad, 0);
@@ -706,6 +935,12 @@ int main(int argc, char *argv[])
     PIN_AddFiniFunction(Fini, 0);
     if (g_count)
         PIN_AddForkFunction(FPOINT_AFTER_IN_CHILD, ForkChild, 0);
+    if (KnobRotPeriod.Value() > 0 || KnobDetachAfter.Value() > 0) {
+        g_active = rot_want(now_s());
+        fprintf(stderr, "[hifitool] start t=%.3f active=%d rot-period=%u rot-n=%u rot-idx=%u detach-after=%.1f\n",
+                now_s(), (int)g_active, KnobRotPeriod.Value(), KnobRotN.Value(), KnobRotIdx.Value(), KnobDetachAfter.Value());
+        PIN_SpawnInternalThread(RotCtl, 0, 0, NULL);
+    }
     PIN_StartProgram();
     return 0;
 }

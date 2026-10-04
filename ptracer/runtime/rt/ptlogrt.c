@@ -211,7 +211,7 @@ struct ptlog_tcb
     unsigned long gt_off;       /* +544 file offset of the current window     */
     unsigned long gt_win;       /* +552 window size in bytes                  */
     unsigned long gt_rot;       /* +560 windows mapped so far                 */
-    unsigned long rsvd_568;     /* +568 reserved (layout pinned by ptlog_abi.h) */
+    unsigned long callrec;      /* +568 &ptlog_call_rec (rewrite.py --call-sink; ptlog_abi.h) */
     /* --- (ptlog_abi.h) `abi' tells the ptracer (offline/pt_capture2.c) that
      *     this runtime keeps a pool of
      *     SPARE TCBs in `ptlog_ctl' which it may hand to a new thread at the
@@ -239,6 +239,8 @@ _Static_assert(__builtin_offsetof(struct ptlog_tcb, sync_next) == PTLOG_TCB_SYNC
 _Static_assert(__builtin_offsetof(struct ptlog_tcb, sync_bias) == PTLOG_TCB_SYNC_BIAS_OFF,
     "ptlog_abi.h: PTLOG_TCB_SYNC_BIAS_OFF is stale");
 
+_Static_assert(__builtin_offsetof(struct ptlog_tcb, callrec) == PTLOG_TCB_CALLREC_OFF,
+    "ptlog_abi.h: PTLOG_TCB_CALLREC_OFF is stale");
 _Static_assert(__builtin_offsetof(struct ptlog_tcb, tid) == PTLOG_TCB_TID_OFF,
     "ptlog_abi.h: PTLOG_TCB_TID_OFF is stale");
 _Static_assert(__builtin_offsetof(struct ptlog_tcb, magic) == PTLOG_TCB_MAGIC_OFF,
@@ -252,6 +254,22 @@ _Static_assert(__builtin_offsetof(struct ptlog_tcb, gt_cursor) == PTLOG_GT_OFF,
     "the gt cursor must sit at %gs:PTLOG_GT_OFF -- adjust gt_pad[]");
 _Static_assert(sizeof(struct ptlog_tcb) <= PTLOG_TCB_PAGE,
     "the TCB must fit in one page");
+
+/*
+ * The CALL sink (rewrite.py --call-sink, the Figure 6 "w/o PT and static analysis" arm modelled on a traditional
+ * per-access logging call): a trampoline saves the caller-saved registers and the flags, passes the value in %rdi
+ * and calls through %gs:PTLOG_TCB_CALLREC_OFF.  The store is `mov %rdi,(%rax)', the cursor form the guard-page
+ * handler decodes (ptlog_store_base), so a full buffer rotates exactly as for an inline store.  Unused otherwise.
+ */
+__attribute__((naked, used)) static void ptlog_call_rec(void)
+{
+    __asm__ volatile(
+        "movq %gs:0, %rax\n\t"
+        "movq %rdi, (%rax)\n\t"
+        "leaq 8(%rax), %rax\n\t"
+        "movq %rax, %gs:0\n\t"
+        "ret\n\t");
+}
 
 /*
  * Everything that must be visible to EVERY injected copy of this runtime lives
@@ -887,6 +905,7 @@ static struct ptlog_tcb *ptlog_make_tcb(long tid, int spare)
     tcb->magic     = PTLOG_MAGIC;
     tcb->ctl       = ptlog_ctl;
     tcb->abi       = PTLOG_ABI;
+    tcb->callrec   = (unsigned long)&ptlog_call_rec;
     tcb->pending   = spare ? 1 : 0;
     tcb->serial    = serial;
     ptlog_gt_init(tcb, tid, pid, spare ? serial : -1);

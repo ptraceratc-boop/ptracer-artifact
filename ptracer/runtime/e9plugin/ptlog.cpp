@@ -200,6 +200,8 @@ static long   n_gt_skip    = 0;     // memory-accessing instructions refused
 static std::set<intptr_t> gt_skip;
 static long   n_gt_skipped = 0;     // gt candidates dropped by the skip list
 static bool   opt_liveness = true;  // use the site file's dead-register masks
+static bool   opt_callsink = false; // `callsink 1': one clean CALL per value (ablation)
+static long   n_call_recs  = 0;     // ... call sequences emitted
 static long   n_scr_dead  = 0;      // scratch registers taken from `dead_regs'
 static long   n_scr_push  = 0;      // scratch registers that had to be pushed
 static long   n_scr_borrow = 0;    // ... of those, ones the site itself LOGS
@@ -287,6 +289,8 @@ static void parseSiteFile(const char *filename)
             { gt_skip.insert((intptr_t)strtoull(p+6, nullptr, 0)); continue; }
         if (strncmp(p, "gt", 2) == 0 && (p[2] == ' ' || p[2] == '\t'))
             { opt_gt = (strtol(p+2, nullptr, 0) != 0); continue; }
+        if (strncmp(p, "callsink", 8) == 0)
+            { opt_callsink = (strtol(p+8, nullptr, 0) != 0); continue; }
         if (strncmp(p, "liveness", 8) == 0)
             { opt_liveness = (strtol(p+8, nullptr, 0) != 0); continue; }
         if (strncmp(p, "space", 5) == 0)  { opt_space  = (int)strtol(p+5, nullptr, 0); continue; }
@@ -1984,6 +1988,66 @@ static void emitBufRun(Emitter &e, Scratch &S, const std::vector<const Op *> &op
     emitSync(e, S, flags_dead, k, cur);
 }
 
+
+/*
+ * CALL SINK (`callsink 1', rewrite.py --call-sink): the Figure 6 "w/o PT and
+ * static analysis" arm modelled on a TRADITIONAL per-access logging call.
+ * Every value is its own sequence, no batching, no liveness, nothing assumed
+ * dead -- the shape of an E9Tool `call' trampoline into a C handler:
+ *
+ *   lea -0x80(%rsp),%rsp                     ; red zone
+ *   push %rax,%rcx,%rdx,%rsi,%rdi,%r8-%r11  ; every caller-saved GP register
+ *   seto %al ; lahf ; push %rax              ; the flags (E9Tool's own form)
+ *   mov 72(%rsp),%rax                        ; the program's %rax again
+ *   <value> -> %rdi                          ; memop: lea <ea> (+ %fs base) = the ADDRESS
+ *   call *%gs:568                            ; rt/ptlogrt.c ptlog_call_rec
+ *   pop %rax ; add $0x7f,%al ; sahf ; pop %r11..%rax ; lea 0x80(%rsp),%rsp
+ */
+static void emitCallRec(Emitter &e, const Op &op, const Mem &mem, int half)
+{
+    static const int SAVE[9] = {0, 1, 2, 6, 7, 8, 9, 10, 11};
+    const int32_t RZ = 0x80;
+    emitLeaRsp(e, -RZ);
+    for (int r: SAVE) emitPush(e, r);
+    e.raw({0x0f, 0x90, 0xc0}); e.tick();        // seto %al
+    e.raw({0x9f}); e.tick();                    // lahf
+    emitPush(e, 0);
+    emitMovFromMemDisp(e, 0, 4, 72);            // mov 72(%rsp),%rax
+    const int32_t delta = RZ + 10 * 8;
+    if (op.kind == 'i')
+    {
+        e.raw({0x48, 0xc7, 0xc7}); e.imm32((int32_t)op.imm); e.tick();   // mov $imm,%rdi
+    }
+    else if (op.kind == 'm')
+    {
+        emitLeaMem(e, 7, mem, delta);
+        if (mem.seg == 0x64)
+        {
+            emitMovFromSeg(e, 0x64, 6, 0);      // %rsi = FS base (saved above)
+            emitLeaBaseIndex(e, 7, 7, 6);
+        }
+    }
+    else if (op.reg == REG_FS_BASE)
+        emitMovFromSeg(e, 0x64, 7, 0);
+    else if (op.reg >= 16)
+    {
+        if (half == 0) emitMovqXmmToGp(e, 7, op.reg - 16);
+        else           emitPextrqHi(e, 7, op.reg - 16);
+    }
+    else if (op.reg == 4)
+        emitLeaFromRsp(e, 7, delta);
+    else if (op.reg != 7)
+        emitMovRegReg(e, 7, op.reg);
+    e.pushLog(e.body_len);
+    e.raw({0x65, 0xff, 0x14, 0x25}); e.imm32(PTLOG_TCB_CALLREC_OFF); e.tick();   // call *%gs:568
+    n_emitted++; n_call_recs++;
+    emitPop(e, 0);
+    e.raw({0x04, 0x7f}); e.tick();              // add $0x7f,%al
+    e.raw({0x9e}); e.tick();                    // sahf
+    for (int i = 8; i >= 0; i--) emitPop(e, SAVE[i]);
+    emitLeaRsp(e, RZ);
+}
+
 /****************************************************************************/
 /* E9Tool plugin entry points                                               */
 /****************************************************************************/
@@ -2277,7 +2341,13 @@ extern "C" void e9_plugin_patch(const Context *cxt)
                     avoid |= 1u << SCR_CNT;     // the countdown needs `jrcxz'
                 Scratch S;
                 sInit(S, x, dead, avoid, site_hard);
-                if (run_sink == SINK_BUFFER)
+                if (run_sink == SINK_BUFFER && opt_callsink)
+                {
+                    for (size_t k = oi; k < oj; k++)
+                        for (long h = 0; h < bufSlots(*ops[k]); h++)
+                            emitCallRec(x, *ops[k], mem, (int)h);
+                }
+                else if (run_sink == SINK_BUFFER)
                     emitBufRun(x, S, ops, oi, oj, mem, flags_dead);
                 else
                 {
@@ -2452,6 +2522,8 @@ extern "C" void e9_plugin_fini(const Context *cxt)
         (n_site_free + n_site_push? 100.0*(double)n_site_free /
             (double)(n_site_free + n_site_push): 0.0),
         n_scr_dead, n_scr_push, n_scr_borrow);
+    if (opt_callsink)
+        fprintf(stderr, "ptlog: call sink: %ld call sequence(s)\n", n_call_recs);
     if (opt_gt)
         fprintf(stderr, "ptlog: gt: %ld ground-truth site(s) (%ld explicit "
             "memory operand, %ld implicit stack operand), %ld "

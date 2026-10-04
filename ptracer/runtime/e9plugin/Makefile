@@ -9,7 +9,7 @@
 E9      ?= $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/../../../third_party/e9patch)
 CXXFLAGS = -std=c++17 -fPIC -shared -O2 -Wall -I $(E9)/src/e9tool
 
-all: ptlog.so ../rt/ptlogrt.e9rt ../rt/ptlogrt_nofini.e9rt ../rt/ptlogrt.so ../rt/ptlogmt.so ../rt/ldfix.e9rt
+all: ptlog.so ../rt/ptlogrt.e9rt ../rt/ptlogrt_nofini.e9rt ../rt/ptlogrt.so ../rt/ptlogmt.so ../rt/ptlogmt_sync.so ../rt/ldfix.e9rt
 
 ptlog.so: ptlog.cpp ../rt/ptlog_abi.h ../rt/ptgt_format.h
 	g++ $(CXXFLAGS) -o $@ $<
@@ -32,11 +32,15 @@ ptlog.so: ptlog.cpp ../rt/ptlog_abi.h ../rt/ptgt_format.h
 ../rt/ptlogmt.so: ../rt/ptlogmt.c ../rt/ptlog_abi.h
 	gcc -shared -fPIC -O2 -Wall -o $@ $< -ldl
 
+# Optional variant: the same shim plus synchronization-event logging (ptsync.S); preloaded instead of ptlogmt.so.
+../rt/ptlogmt_sync.so: ../rt/ptlogmt.c ../rt/ptsync.S ../rt/ptlog_abi.h
+	gcc -shared -fPIC -O2 -Wall -DPTLOG_SYNC=1 -o $@ ../rt/ptlogmt.c ../rt/ptsync.S -ldl
+
 ../rt/ldfix.e9rt: ../rt/ldfix.c
 	cd $(E9) && NO_SIMD_CHECK=1 ./e9compile.sh $(abspath $<)
 	mv $(E9)/ldfix $@
 
 clean:
-	rm -f ptlog.so ../rt/ptlogrt.e9rt ../rt/ptlogrt_nofini.e9rt ../rt/ptlogrt.so ../rt/ptlogmt.so ../rt/ldfix.e9rt
+	rm -f ptlog.so ../rt/ptlogrt.e9rt ../rt/ptlogrt_nofini.e9rt ../rt/ptlogrt.so ../rt/ptlogmt.so ../rt/ptlogmt_sync.so ../rt/ldfix.e9rt
 
 .PHONY: all clean

@@ -1,4 +1,5 @@
 # Fast-PTWRITE sites of math.cpython-312-x86_64-linux-gnu.so (5 M values/s budget): <addr> <when> <sha1 of the spec site>
+# budgeted on count runs of all 94 pyperformance benchmarks
 0x3a10 before bfff82fbfcf7
 0x3a50 before 5bcd78d3a22b
 0x3a80 before 03962a2453a1
@@ -58,12 +59,6 @@
 0x5712 before 1d23815e31c1
 0x571a before a0464a5ab9f3
 0x5772 before e886229155cb
-0x5900 before 78e92b7a6ddf
-0x5929 before b7665dafbd4c
-0x595b before 8db35f8bc19f
-0x5995 before e4e33059d026
-0x599e before 1d6f183be5e5
-0x5a70 before 1d600fe56691
 0x5a95 before 82ed2d872e6e
 0x5a9e before 7da89b427f43
 0x5ab2 before 078080476821
@@ -153,16 +148,7 @@
 0x7b9d before 5e93257405ab
 0x7bb1 before d5249449777f
 0x7bc2 before 9d3e91b81370
-0x7d42 before 8ec18224ed63
-0x7d5c before 0fb7e3867233
-0x7df0 before 44a8f5c3f862
-0x7e9f before 984c69cea90e
-0x7edf before 1bf679c5b703
-0x7f3a before e2cbd8b37cdb
-0x7fa1 before 0faa01c6d442
-0x7fba before bd25ea816896
 0x80a3 before cb5543a9d600
-0x80f0 before 5794bbb8606b
 0x8152 before bf96b02e3fbd
 0x8180 before a965f433f915
 0x81da before d4faf4179b94

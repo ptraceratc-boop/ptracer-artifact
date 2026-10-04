@@ -66,6 +66,6 @@ lane() {
     done
 }
 for i in $(seq 0 $((JN-1))); do lane "$i" & done
-wait
+wait_jobs
 parts=(); for c in "${JC[@]}"; do parts+=("$RUN_OUT/jhifi/$c.csv"); done
 "$PYBIN" run/lib/merge_csv.py "$CSV" "${parts[@]}"

@@ -14,9 +14,36 @@
 # QUIET=1 (optional, needs root or sudo): disables turbo for the duration of the run and puts
 # the previous value back on exit.  Without it overhead MAGNITUDES vary more run to run
 # (frequency scaling); orderings and shapes do not depend on it.
+#
+# Image: the local `ptracer-artifact' image must be at least docker/IMAGE_VERSION of this checkout (its label
+# org.opencontainers.image.version, set by docker/build.sh).  If it is missing or older, the published image is pulled
+# and tagged `ptracer-artifact'; if that fails, the script says how to get it and stops.  IMAGE=name runs another
+# image without this check.
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${IMAGE:-ptracer-artifact}"
+REGISTRY="${REGISTRY:-ghcr.io/ptraceratc-boop/ptracer-artifact}"
+if [ -n "${IMAGE:-}" ]; then
+  echo "note: IMAGE=$IMAGE (its version is not checked)"
+else
+  IMAGE=ptracer-artifact
+  NEED=$(cat "$ROOT/docker/IMAGE_VERSION" 2>/dev/null || echo 0)
+  have() { local v; v=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE" 2>/dev/null) || return 1
+           [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge "$NEED" ]; }
+  if ! have; then
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then echo "The local image $IMAGE is older than this checkout."
+    else echo "No local image $IMAGE."; fi
+    echo "Pulling $REGISTRY:latest"
+    if docker pull "$REGISTRY:latest" && docker tag "$REGISTRY:latest" "$IMAGE" && have; then
+      echo "OK: $IMAGE = $REGISTRY:latest"
+    else
+      echo "FATAL: no image for this checkout.  Pull and tag it:"
+      echo "    docker pull $REGISTRY:latest && docker tag $REGISTRY:latest $IMAGE"
+      echo "or build it (~1 h):"
+      echo "    bash docker/build.sh"
+      exit 2
+    fi
+  fi
+fi
 OUT="${OUT:-$ROOT/out}"
 mkdir -p "$OUT"
 

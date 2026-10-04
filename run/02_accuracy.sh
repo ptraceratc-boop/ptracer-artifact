@@ -95,7 +95,7 @@ lane() {
     done
 }
 for i in "${!LANES[@]}"; do lane "$i" > "$A/lane$i.log" 2>&1 & done
-wait
+wait_jobs
 
 # 4. table + figure
 "$PYBIN" run/lib/acc_summary.py "$RES" --md "$A/inaccuracy.md" --csv "$A/inaccuracy.csv" --png "$A/inaccuracy.png"

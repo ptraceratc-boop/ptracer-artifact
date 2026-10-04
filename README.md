@@ -9,6 +9,8 @@ memory trace.
 
 **We apologize for the late update! We have been fixing issues caused by compatibility, speeding up experiments, new techniques, bugs, and AI messing up code. If you ran experiments by Oct 1, please re-run them with the latest code. Sorry again for the trouble!**
 
+**Update (Oct 4):** if you started before, stop the run, `git pull`, pull the image (see "How to run"), and run the same command again; finished rows are kept.
+
 * **Part 1: Overhead Figure** (the most important figure in our paper) -- execute `run/fig5.sh` for PTracer's bars,
   and then if you have time, execute `run/fig5_traditional.sh` for the traditional tracers.
 * **Part 2: Inaccuracy** (inaccuracy of PTracer's most inaccurate modes) -- execute 
@@ -42,7 +44,8 @@ but at least there is a workstation in our lab that can run almost all experimen
 # Part 1: Overhead Figure
 git clone <this repository> ptracer-artifact && cd ptracer-artifact
 bash envcheck/check_env.sh                          # host check               [1 human-min, seconds]
-bash docker/build.sh                                # build the image          [1 human-min, ~1 h]
+docker pull ghcr.io/ptraceratc-boop/ptracer-artifact:latest    # the image [1 human-min, minutes]
+docker tag ghcr.io/ptraceratc-boop/ptracer-artifact:latest ptracer-artifact   # (or build it: bash docker/build.sh, ~1 h)
 bash docker/run.sh run/fig5.sh --dry-run            # the plan, nothing run    [1 human-min, seconds]
 bash docker/run.sh run/fig5.sh                      # Figure 5, PTracer bars   [5 human-min, ~1-1.5 days from scratch]
 bash docker/run.sh run/fig5_traditional.sh          # Figure 5, other tracers  [5 human-min, ~4-5 h, <= ~11 h]

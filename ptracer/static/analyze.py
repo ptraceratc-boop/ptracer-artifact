@@ -445,6 +445,22 @@ def _memop_form(ins):
     return mems[0].size, None
 
 
+def _am_implicit_regs(ins, why):
+    """The address register(s) of a stack or string access `_memop_form' cannot re-address, else None."""
+    if why == 'stack':
+        return ['rsp']
+    if why == 'string':
+        mn = ins.mnemonic.lower().split()[-1]
+        if mn.startswith(('movs', 'cmps')):
+            return ['rdi', 'rsi']
+        if mn.startswith(('lods', 'outs')):
+            return ['rsi']
+        if mn.startswith('xlat'):
+            return ['rbx']
+        return ['rdi']                             # stos, scas, ins
+    return None
+
+
 def all_memop_sites(proj, df, insn_block, orphans, avoid):
     """One `memop` site per memory-accessing instruction; no hitting set, no reg sites.
 
@@ -453,7 +469,7 @@ def all_memop_sites(proj, df, insn_block, orphans, avoid):
     instruction that accesses memory and fails that test is SKIPPED WITH A REASON and
     counted (never silently dropped).  Returns (sites, stats).
     """
-    sites, skipped = [], {}
+    sites, skipped, implicit = [], {}, {}
     clamped = 0
     accessing = sorted({a.addr for a in df.accesses})
     for addr in accessing:
@@ -467,6 +483,15 @@ def all_memop_sites(proj, df, insn_block, orphans, avoid):
             continue
         size, why = _memop_form(ins)
         if size is None:
+            regs = _am_implicit_regs(ins, why)
+            if regs:
+                # An access with no single re-addressable operand (push/pop/call/ret/leave/enter, a string
+                # instruction): log the ADDRESS REGISTER(S) the access goes through instead -- %rsp before a
+                # stack access, %rsi/%rdi before a string one -- one record per register per execution.
+                sites.append({'addr': addr, 'when': 'before', 'kind': 'reg', 'regs': regs,
+                              'orphan': insn_block.get(addr, addr) in orphans})
+                implicit[why] = implicit.get(why, 0) + 1
+                continue
             skipped[why] = skipped.get(why, 0) + 1
             continue
         if size not in (1, 2, 4, 8):
@@ -479,7 +504,7 @@ def all_memop_sites(proj, df, insn_block, orphans, avoid):
                       'orphan': insn_block.get(addr, addr) in orphans})
     return sites, {'accessing_insns': len(accessing), 'sites': len(sites),
                    'size_clamped': clamped, 'skipped': skipped,
-                   'skipped_total': sum(skipped.values())}
+                   'skipped_total': sum(skipped.values()), 'implicit': implicit}
 
 
 def analyze_function(binary, name, start, end, mode='hifi', keyframe=0, avoid=None, roots=(), data_from=None, all_memops=False):
@@ -1063,7 +1088,7 @@ def main():
             continue
         h = func_hash(binary, s, e)
         hashes[s] = h
-        cpath = os.path.join(args.cache, f'{h}.{args.mode}.k{args.keyframe}{("." + KEYFRAME_RULE) if args.keyframe else ""}.{avoid_key_for(s, e)}{".am1" if args.all_memops else ""}.{CACHE_VERSION}.json') if args.cache and h else None
+        cpath = os.path.join(args.cache, f'{h}.{args.mode}.k{args.keyframe}{("." + KEYFRAME_RULE) if args.keyframe else ""}.{avoid_key_for(s, e)}{".am2" if args.all_memops else ""}.{CACHE_VERSION}.json') if args.cache and h else None
         if cpath and os.path.exists(cpath):
             r = json.load(open(cpath))
             # The cache key is the function's BYTES, so a byte-identical function at ANOTHER address
@@ -1149,7 +1174,7 @@ def main():
             seen.add(st['addr'])
             uniq.append(st)
         sites = uniq
-        skipped, n_acc, n_clamp = {}, 0, 0
+        skipped, implicit, n_acc, n_clamp = {}, {}, 0, 0
         for fr in functions:
             am = fr.get('all_memops')
             if not am:
@@ -1158,9 +1183,14 @@ def main():
             n_clamp += am['size_clamped']
             for k, v in am['skipped'].items():
                 skipped[k] = skipped.get(k, 0) + v
+            for k, v in am.get('implicit', {}).items():
+                implicit[k] = implicit.get(k, 0) + v
         am_summary = {'accessing_instructions': n_acc, 'sites': len(sites),
                       'duplicate_addresses': dup, 'size_clamped': n_clamp,
-                      'skipped_total': sum(skipped.values()), 'skipped': skipped}
+                      'skipped_total': sum(skipped.values()), 'skipped': skipped,
+                      'implicit_address_sites': implicit}
+        print('[analyze] --all-memops: implicit stack/string accesses logged by address register: %s'
+              % (', '.join('%s=%d' % kv for kv in sorted(implicit.items())) or 'none'), file=sys.stderr)
         print('[analyze] --all-memops: %d memory-accessing instruction(s), %d memop site(s), '
               '%d skipped (%s), %d operand(s) wider than 8 bytes logged 8 bytes wide, '
               '%d duplicate address(es) from aliased functions'

@@ -64,6 +64,11 @@ progress_figure() {
     PROGRESS_PID=$!
     trap progress_stop EXIT
 }
+# Wait for this shell's background jobs except the progress loop (a bare `wait` would wait for it forever).
+wait_jobs() {
+    local p
+    for p in $(jobs -p); do [ "$p" = "${PROGRESS_PID:-}" ] || wait "$p" || true; done
+}
 progress_stop() {
     [ -z "${PROGRESS_PID:-}" ] || { kill "$PROGRESS_PID" 2>/dev/null; wait "$PROGRESS_PID" 2>/dev/null || true; PROGRESS_PID=""; }
     return 0
@@ -74,6 +79,9 @@ pick_python() {
     for p in /opt/venv/bin/python "$ROOT/venv/bin/python" python3; do
         if "$p" -c 'import matplotlib,numpy' 2>/dev/null; then PYBIN="$p"; export PYBIN; return; fi
     done
+    if [ ! -f /.dockerenv ]; then
+        echo "FATAL: run this script inside the artifact container: bash docker/run.sh run/$(basename "$0")"; exit 2
+    fi
     echo "FATAL: no python with matplotlib+numpy (set PYBIN=/path/to/python)"; exit 2
 }
 

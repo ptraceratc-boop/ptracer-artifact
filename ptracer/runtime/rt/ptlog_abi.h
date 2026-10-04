@@ -41,6 +41,7 @@
 #define PTLOG_TCB_TID_OFF       48      /* long   owner tid (0 = spare, not yet assigned) */
 #define PTLOG_TCB_MAGIC_OFF     392     /* u64    PTLOG_MAGIC                              */
 #define PTLOG_TCB_CTL_OFF       400     /* ptr    struct ptlog_ctl *                       */
+#define PTLOG_TCB_CALLREC_OFF   568     /* ptr    record function of the --call-sink trampolines */
 #define PTLOG_TCB_ABI_OFF       576     /* u64    PTLOG_ABI (0 in a pre-protocol runtime)  */
 #define PTLOG_TCB_SYNC_NEXT_OFF 608     /* u64    reserved                                 */
 #define PTLOG_TCB_SYNC_BIAS_OFF 616     /* u64    reserved                                 */

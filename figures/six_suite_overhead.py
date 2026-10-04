@@ -64,7 +64,7 @@ def read_rows(paths):
             for r in csv.DictReader(f):
                 lab = r.get('label') or ''
                 cfg = r['config']
-                if cfg in stale:
+                if (r['suite'], cfg) in stale:
                     continue
                 key = (r['suite'], r['cell'], cfg, r.get('rep'), lab)
                 if key in seen:                 # a row present both in a lane's CSV and in the merged one

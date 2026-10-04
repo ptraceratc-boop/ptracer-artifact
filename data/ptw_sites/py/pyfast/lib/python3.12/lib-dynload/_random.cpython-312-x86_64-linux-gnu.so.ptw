@@ -1,4 +1,5 @@
 # Fast-PTWRITE sites of _random.cpython-312-x86_64-linux-gnu.so (5 M values/s budget): <addr> <when> <sha1 of the spec site>
+# budgeted on count runs of all 94 pyperformance benchmarks
 0x25f0 before bbe3cccffc4b
 0x26ad after 7e5c559d8fef
 0x26e0 before bedc891d8ab2
@@ -13,7 +14,6 @@
 0x27c4 before 20c7a5ecf47e
 0x27d4 before 4c770d92e3d7
 0x28ae before fe49f2ff3767
-0x28dc before 9f4257fa695a
 0x2988 before d1885ff87df1
 0x29c0 before 2fae7561b7df
 0x29e8 before f8ed8b353d7b
@@ -26,7 +26,6 @@
 0x2b55 before e4932036e970
 0x2b7a before 63a4dbd7ab58
 0x2c30 before f95a4104a012
-0x2cf4 before feadcbb70bf6
 0x2dc0 before c5887eea632b
 0x2dfc before 2e078716bdb8
 0x2e26 before a78531734fb9

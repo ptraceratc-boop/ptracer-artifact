@@ -1,4 +1,4 @@
-# Builds the HiFi Pintool (hifitool.so) and the no-op floor (nooptool.so):
+# Builds the HiFi Pintool (hifitool.so), the no-op floor (nooptool.so) and the Figure 6 JIT ablation tool (ablmemtool.so):
 #     make PIN_ROOT=<Pin kit root> obj-intel64/nooptool.so obj-intel64/hifitool.so
 # Without PIN_ROOT the kit is taken from <artifact root>/third_party/pin-4.4,
 # located relative to this file.

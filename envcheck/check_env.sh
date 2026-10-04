@@ -8,7 +8,7 @@
 # Hard checks (FAIL): Intel CPU; Intel PT PMU present; >= 8 online cores; >= 28 GiB RAM; >= 40 GB free disk.
 # PT required; PTWRITE only for the *-PTWRITE bars (WARN without it: every other configuration executes no PTWRITE).
 # Soft checks (WARN): PTWRITE on every online core, perf_event_paranoid (the privileged container bypasses it), free disk
-# < 100 GB, disk-write and DRAM bandwidth below thresholds, turbo / ASLR not controllable,
+# < 60 GB, disk-write and DRAM bandwidth below thresholds, turbo / ASLR not controllable,
 # hybrid P/E cores, SMT on, kernel newer than tested.  Nothing on the host is changed.
 set -u
 
@@ -122,11 +122,11 @@ else fail "${MEMGIB} GiB RAM; need a 32 GB machine (reconstruction of one accura
 
 FREEKB=$(df -Pk "$ROOT" | awk 'NR==2{print $4}')
 FREEGB=$((FREEKB/1000/1000))
-# 40 GB: vendored kits + Docker image + builds.  100 GB: the oracle re-runs write multi-GB
+# 40 GB: vendored kits + Docker image + builds.  60 GB: the oracle re-runs write multi-GB
 # PT + value-log files per accuracy cell.
-if [ "$FREEGB" -ge 100 ]; then pass "${FREEGB} GB free on $(df -P "$ROOT" | awk 'NR==2{print $6}')"
-elif [ "$FREEGB" -ge 40 ]; then warn "${FREEGB} GB free: enough for the build and the overhead experiment; keep >= 100 GB free before the inaccuracy experiment, which writes multi-GB traces"
-else fail "${FREEGB} GB free; need >= 40 GB (100 GB for the full re-measure)"; fi
+if [ "$FREEGB" -ge 60 ]; then pass "${FREEGB} GB free on $(df -P "$ROOT" | awk 'NR==2{print $6}')"
+elif [ "$FREEGB" -ge 40 ]; then warn "${FREEGB} GB free: enough for the build and the overhead experiment; keep >= 60 GB free before the inaccuracy experiment, which writes multi-GB traces"
+else fail "${FREEGB} GB free; need >= 40 GB (60 GB for the full re-measure)"; fi
 
 # Disk write bandwidth on the artifact's own directory (this is where traces would land).
 if command -v dd >/dev/null 2>&1; then

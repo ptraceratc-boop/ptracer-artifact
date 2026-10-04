@@ -104,6 +104,7 @@ rs() {  # rs <csv> <suite(s)> <reps> [repslice args...]: one repslice run in the
     local csv="$1" su="$2" n="$3"; shift 3
     local fd="$FWP" lib="$FWP/lib" pd="$PWP" plib="$PWP/lib"
     [ "$su" = pyperf ] && { fd="$FWP/py"; lib="$FWP/py/lib"; pd="$PWP/py"; plib="$PWP/py/lib"; }
+    [ "$su" = mc ] && [ -d "$PWP/mc/lib" ] && plib="$PWP/mc/lib"
     PLANS_DIR="$PLANS_WP" FAST_DIR="$fd" FAST_PTW_DIR="$pd" FIG5_FASTLIB="$lib" FIG5_FASTLIB_PTW="$plib" \
         FIG5_OUT="${LANE_OUT:-$RS_OUT}" \
         "$PYBIN" run/lib/repslice.py --suites "$su" --configs "${NONJIT_CONFIGS:-vanilla,pinhifi,fast}" --reps "$n" \
@@ -122,7 +123,7 @@ lanes() {  # lanes <suite> <cells...>: cells dealt round-robin over the lanes, o
             rs "$RUN_OUT/overhead.lane$i.$su.csv" "$su" "$REPS" --cells "$(IFS=,; echo "${mine[*]}")" \
             --no-lock --mutex-inherit --load-gate 0 > "$RUN_OUT/overhead.lane$i.$su.log" 2>&1 &
     done
-    wait
+    wait_jobs
     "$PYBIN" run/lib/merge_csv.py "$CSV" "${parts[@]}"
 }
 read -r -a POLYCELLS <<< "$FIG5_POLY"
@@ -218,7 +219,7 @@ if [ "${SKIP_JIT:-0}" != 1 ] && [ -n "$JIT_FAST_CONFIGS" ]; then
                 --csv "$RUN_OUT/overhead.jlane$i.csv" --suites java --configs "$JSWEEP" --warm-only \
                 --warm-slots "${ws[*]}" --java-cells "$(IFS=,; echo "${mine[*]}")" > "$RUN_OUT/jitfast.jwarm$i.log" 2>&1 &
         done
-        wait
+        wait_jobs
         for i in $(seq 0 $((JN-1))); do
             mine=(); for j in $(seq "$i" "$JN" $((${#JC[@]}-1))); do mine+=("${JC[$j]}"); done
             [ ${#mine[@]} -gt 0 ] || continue
@@ -228,7 +229,7 @@ if [ "${SKIP_JIT:-0}" != 1 ] && [ -n "$JIT_FAST_CONFIGS" ]; then
                 --configs "$JSWEEP" \
                 --java-cells "$(IFS=,; echo "${mine[*]}")" > "$RUN_OUT/jitfast.jlane$i.log" 2>&1 &
         done
-        wait
+        wait_jobs
         "$PYBIN" run/lib/merge_csv.py "$CSV" "${parts[@]}"
     fi
 fi

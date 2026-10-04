@@ -63,4 +63,11 @@ RUN bash run/lib/build_baselines.sh
 # The plans must match the system libraries they were computed on (fails loudly otherwise).
 RUN cd / && md5sum -c /artifact/data/plans/SYSLIBS.md5
 
+# docker/IMAGE_VERSION and the commit this image was built from (docker/build.sh); docker/run.sh checks the version.
+ARG IMAGE_VERSION=0
+ARG REVISION=unknown
+LABEL org.opencontainers.image.version=$IMAGE_VERSION \
+      org.opencontainers.image.revision=$REVISION \
+      org.opencontainers.image.source=https://github.com/ptraceratc-boop/ptracer-artifact
+
 CMD ["bash"]

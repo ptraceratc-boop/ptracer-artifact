@@ -52,7 +52,7 @@ make -C "$PT/runtime/jit_toolchain/e9plugin" E9="$E9PATCH_DIR"
 if [ -x "$PIN_ROOT/pin" ]; then
     say "Pin 4.4 HiFi Pintool + no-op floor"
     make -C "$PT/runtime/pinjit" PIN_ROOT="$PIN_ROOT" \
-        obj-intel64/nooptool.so obj-intel64/hifitool.so
+        obj-intel64/nooptool.so obj-intel64/hifitool.so obj-intel64/ablmemtool.so
 else
     echo "WARNING: Pin 4.4 kit not at $PIN_ROOT -- HiFi overhead rows cannot be re-measured"
 fi

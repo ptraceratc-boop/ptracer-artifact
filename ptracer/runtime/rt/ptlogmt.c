@@ -60,6 +60,55 @@
 #include <unistd.h>
 
 #include "ptlog_abi.h"
+#include <string.h>
+#include <sys/auxv.h>
+
+/* ---- synchronization events (ptsync.S) -------------------------------------------------------
+ * Only in the SYNC build, ptlogmt_sync.so = this file with -DPTLOG_SYNC=1 + ptsync.S:
+ *      gcc -shared -fPIC -O2 -DPTLOG_SYNC=1 -o ptlogmt_sync.so ptlogmt.c ptsync.S -ldl
+ * which preloads INSTEAD of ptlogmt.so.  Events are on by default there; PTLOG_SYNC_EVENTS=0 turns the
+ * wrappers into tail jumps (A/B only).  Needs FSGSBASE (rdgsbase), else it stays off.  The plain
+ * ptlogmt.so build is unchanged. */
+#ifndef PTLOG_SYNC
+#define PTLOG_SYNC 0
+#endif
+#if PTLOG_SYNC
+__attribute__((visibility("hidden"))) unsigned char ptsync_on = 0;
+static int ptsync_fsgs = 0;
+struct ptsync_frame { unsigned long ret, a0, a1, a2; };
+struct ptsync_tls_t { unsigned long n, flags; struct ptsync_frame f[16]; };
+__attribute__((visibility("hidden"), tls_model("initial-exec")))
+__thread struct ptsync_tls_t ptsync_tls;
+#define PTSYNC_OP_START 2
+#define PTSYNC_OP_EXIT  3
+/* The real functions ptsync.S jumps to (hidden .data words named ptsync_real_<fn>). */
+#define PTSYNC_FNS(X) X(pthread_join) X(pthread_tryjoin_np) X(pthread_timedjoin_np) X(fork) X(vfork) \
+    X(posix_spawn) X(posix_spawnp) X(execve) X(execv) X(execvp) X(execvpe) X(fexecve) X(wait) X(waitpid) \
+    X(wait4) X(waitid) X(pthread_mutex_lock) X(pthread_mutex_trylock) X(pthread_mutex_timedlock) \
+    X(pthread_mutex_clocklock) X(pthread_mutex_unlock) X(pthread_cond_wait) X(pthread_cond_timedwait) \
+    X(pthread_cond_clockwait) X(pthread_cond_signal) X(pthread_cond_broadcast) X(pthread_rwlock_rdlock) \
+    X(pthread_rwlock_wrlock) X(pthread_rwlock_tryrdlock) X(pthread_rwlock_trywrlock) \
+    X(pthread_rwlock_timedrdlock) X(pthread_rwlock_timedwrlock) X(pthread_rwlock_unlock) X(sem_wait) \
+    X(sem_trywait) X(sem_timedwait) X(sem_clockwait) X(sem_post)
+#define PTSYNC_DECL(f) extern void *ptsync_real_##f __attribute__((visibility("hidden")));
+PTSYNC_FNS(PTSYNC_DECL)
+/* Called by the constructor, and by ptsync.S if a wrapper runs before it (an earlier library's
+ * initializer).  Lives in .ptsync_text: ptrecon skips it like the wrappers. */
+__attribute__((visibility("hidden"), section(".ptsync_text"), used)) void ptsync_resolve_all(void)
+{
+#define PTSYNC_RES(f) if (ptsync_real_##f == 0) ptsync_real_##f = dlsym(RTLD_NEXT, #f);
+    PTSYNC_FNS(PTSYNC_RES)
+}
+/* Enter ptsync.S's ptsync_emit_c by a jump in BOTH modes: this file's own instructions (which
+ * ptrecon replays as program code) must not depend on the switch.  op | force<<8. */
+static inline __attribute__((always_inline)) void ptsync_c(void *ip, unsigned long opf)
+{
+    register unsigned long r11 __asm__("r11") = opf;
+    unsigned long rax = (unsigned long)ip;
+    __asm__ __volatile__("lea 1f(%%rip), %%r10\n\tjmp ptsync_emit_c\n1:"
+                         : "+a"(rax), "+r"(r11) : : "r10", "cc", "memory");
+}
+#endif
 
 #ifndef ARCH_SET_GS
 #define ARCH_SET_GS 0x1001
@@ -70,6 +119,9 @@ struct ptlogmt_arg
 {
     void *(*fn)(void *);
     void *arg;
+#if PTLOG_SYNC
+    unsigned long force;        /* the creator had a TCB: the runtime is present (ptsync START) */
+#endif
 };
 
 /* Is `gs' one of the runtime's TCBs?  A page-aligned mmap carrying the magic. */
@@ -79,11 +131,23 @@ static int ptlogmt_is_tcb(unsigned long gs)
            *(volatile unsigned long *)(gs + PTLOG_TCB_MAGIC_OFF) == PTLOG_MAGIC;
 }
 
+#if PTLOG_SYNC
+/* pthread cleanup handler of every wrapped thread (normal return, pthread_exit, cancellation): ptsync EXIT */
+static void ptlogmt_thread_end(void *unused)
+{
+    (void)unused;
+    ptsync_c(0, PTSYNC_OP_EXIT);
+}
+#endif
+
 static void *ptlogmt_start(void *v)
 {
     struct ptlogmt_arg *a = (struct ptlogmt_arg *)v;
     void *(*fn)(void *) = a->fn;
     void *arg = a->arg;
+#if PTLOG_SYNC
+    unsigned long force = a->force;
+#endif
     free(a);
     /* Keep a base that is already this thread's own (the ptracer's spare TCB)
      * or none at all; drop anything else -- the creator's inherited base --
@@ -97,7 +161,16 @@ static void *ptlogmt_start(void *v)
         if (!ptlogmt_is_tcb(gs) || *(volatile long *)(gs + PTLOG_TCB_TID_OFF) != tid)
             syscall(SYS_arch_prctl, ARCH_SET_GS, 0UL);
     }
+#if PTLOG_SYNC
+    ptsync_c((void *)fn, PTSYNC_OP_START | (force << 8));
+    void *r;
+    pthread_cleanup_push(ptlogmt_thread_end, 0);
+    r = fn(arg);
+    pthread_cleanup_pop(1);
+    return r;
+#else
     return fn(arg);
+#endif
 }
 
 /* fork WITHOUT exec (multiprocessing Pool workers).  fork(2) copies the calling thread's GS base
@@ -130,10 +203,31 @@ static void ptlogmt_atfork_child(void)
 __attribute__((constructor)) static void ptlogmt_init(void)
 {
     pthread_atfork(0, 0, ptlogmt_atfork_child);
+#if PTLOG_SYNC
+    ptsync_fsgs = (getauxval(AT_HWCAP2) & 2) != 0;          /* HWCAP2_FSGSBASE */
+    ptsync_resolve_all();
+    const char *e = getenv("PTLOG_SYNC_EVENTS");
+    if (e == 0 || e[0] != '0')
+    {
+        if (ptsync_fsgs)
+            __atomic_store_n(&ptsync_on, 1, __ATOMIC_RELEASE);
+        else
+        {
+            static const char m[] = "[ptlogmt] sync events off: no FSGSBASE\n";
+            ssize_t w = write(2, m, sizeof m - 1); (void)w;
+        }
+    }
+#endif
 }
 
+#if PTLOG_SYNC
+/* The exported pthread_create is ptsync.S's wrapper; it calls this at the program's own %rsp. */
+__attribute__((visibility("hidden"), noinline)) int ptlogmt_pthread_create(pthread_t *thread,
+    const pthread_attr_t *attr, void *(*fn)(void *), void *arg)
+#else
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     void *(*fn)(void *), void *arg)
+#endif
 {
     static int (*real)(pthread_t *, const pthread_attr_t *,
                        void *(*)(void *), void *);
@@ -149,6 +243,15 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
         return real(thread, attr, fn, arg);      /* out of memory: no worse */
     a->fn = fn;
     a->arg = arg;
+#if PTLOG_SYNC
+    a->force = 0;
+    if (ptsync_fsgs)
+    {
+        unsigned long g;
+        __asm__ __volatile__("rdgsbase %0" : "=r"(g));
+        a->force = g != 0;
+    }
+#endif
     int r = real(thread, attr, ptlogmt_start, a);
     if (r != 0)
         free(a);
