@@ -5,11 +5,11 @@ A static analysis finds the few values that must be logged, lightweight instrume
 only those while Intel PT records control flow, and an offline pass reconstructs the complete
 memory trace.
 
-## Status (Updated Oct 1)
+## Status (Updated Oct 4)
 
-**We apologize for the late update! We have been fixing issues caused by compatibility, speeding up experiments, new techniques, bugs, and AI messing up code. If you ran experiments by Oct 1, please re-run them with the latest code. Sorry again for the trouble!**
+We apologize for the late update! We have been fixing issues caused by compatibility, speeding up experiments, new techniques, bugs, and AI messing up code. If you ran experiments by Oct 1, please re-run them with the latest code. Sorry again for the trouble!
 
-**Update (Oct 4):** if you started before, stop the run, `git pull`, pull the image (see "How to run"), and run the same command again; finished rows are kept.
+**Update (Oct 4): if you started before, stop the run, `git pull`, pull the image (see "How to run"), and run the same command again. Rows finished before Oct 4 are still correct, and the new scripts keep them and measure only the missing ones.**
 
 * **Part 1: Overhead Figure** (the most important figure in our paper) -- execute `run/fig5.sh` for PTracer's bars,
   and then if you have time, execute `run/fig5_traditional.sh` for the traditional tracers.
