@@ -615,6 +615,7 @@ extern bool option_tactic_T1;
 extern bool option_tactic_T2;
 extern bool option_tactic_T3;
 extern bool option_tactic_backward_T3;
+extern bool option_tactic_T3_realloc;
 extern intptr_t option_loader_base;
 extern int option_loader_phdr;
 extern bool option_loader_static;

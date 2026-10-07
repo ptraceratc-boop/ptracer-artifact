@@ -21,7 +21,7 @@
 # "Err"), a cell whose reference run failed cap = "no-reference" ("Err"); cap = "na" = not applicable ("NA").
 # Rows -> $RUN_OUT/baselines.csv; finished rows are skipped, so an interrupted run resumes.
 # Lanes (run/lib/trad_par.py): single-core lanes TRAD_CORES ("4 .. 19": PolyBench, pyperformance, Rust, Node.js) and
-# wide slots TRAD_WIDE (7 x 4 cores + their SMT siblings: Java, Memcached); Spindle-plus alongside on
+# wide slots TRAD_WIDE (7 x 4 cores + their SMT siblings: Java); Memcached last, alone (MC_SRV_CORES / MC_CLI_CORES); Spindle-plus alongside on
 # TRAD_SPINDLE_CORES ("2 3": PolyBench/C, pyperformance).  Knobs: TRAD_REPS (1), TRAD_SUITES, TRAD_POLY / TRAD_PYPERF /
 # TRAD_RUST / TRAD_NODE / TRAD_JAVA (explicit cell lists), TRAD_CEILING (QUICK only: stop a run after this many
 # seconds; cap = "stopped", plotted "Err", never as 200x).

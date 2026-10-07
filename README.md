@@ -5,9 +5,11 @@ A static analysis finds the few values that must be logged, lightweight instrume
 only those while Intel PT records control flow, and an offline pass reconstructs the complete
 memory trace.
 
-## Status (Updated Oct 4)
+## Status (Updated Oct 7)
 
 We apologize for the late update! We have been fixing issues caused by compatibility, speeding up experiments, new techniques, bugs, and AI messing up code. If you ran experiments by Oct 1, please re-run them with the latest code. Sorry again for the trouble!
+
+**Update (Oct 7): before running `run/fig5_traditional.sh` or `run/02_accuracy.sh`, run `git pull` and pull the image again (see "How to run"). Results you already have are kept; only the Memcached rows of the traditional tracers and the pyperformance cells of the inaccuracy experiment (plus any failed cell) are measured again.**
 
 **Update (Oct 4): if you started before, stop the run, `git pull`, pull the image (see "How to run"), and run the same command again. Rows finished before Oct 4 are still correct, and the new scripts keep them and measure only the missing ones.**
 
@@ -88,7 +90,7 @@ labelled "pending" until its rows exist, then drawn from the rows measured so fa
 If you have run experiments before Oct 1, please discard their results and cache if any: our fixes of PTracer
 make previous cache files unusable. You can simply run `git restore .` to discard everything, or `git clone` the repo again to a different dir.
 
-Disk: >= 60 GB free. The peak is about 30 GB. 
+Disk: >= 60 GB free. Figure 5 peaks at about 30 GB. `run/02_accuracy.sh` keeps its temporary traces (up to ~50 GB per cell) in memory on machines with >= 160 GB RAM, otherwise on disk (slower). 
 
 Every script prints its plan first (`--dry-run` shows it without running), skips finished work and resumes
 an interrupted run from the rows already measured, so it can be restarted at any time. Run the steps one after the

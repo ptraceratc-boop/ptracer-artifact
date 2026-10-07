@@ -90,11 +90,23 @@ for v in REPS JIT_REPS JREPS TIMED_LANES HELPER_LANES TIMED_CORE HELPER_CORES RU
          POLY_CELLS RUST_CELLS PYPERF_LIST NONJIT_CONFIGS SKIP_JIT SKIP_POLY SKIP_PYPERF SKIP_RUST SKIP_MC WP_TARGETS JOBS \
          SKIP_NODE_HIFI SKIP_JAVA_HIFI JAVA_HIFI_CONFIGS JAVA_HIFI_CELLS JAVA_HIFI_ITERS JAVA_HIFI_DROP JAVA_HIFI_TIMEOUT JAVA_HIFI_JOBS JAVA_DRAIN_MS JAVA_LANE_HELPER HIFI_PTW_ALL HIFI_PTW_BUDGET NODE_HIFI_CONFIGS NODE_HIFI_CELLS NODE_HIFI_TIMEOUT NODE_HIFI_JOBS NODE_JIT_CORES JAVA_JIT_CORES \
          JIT_FAST_CONFIGS JIT_FAST_NODE_CELLS JIT_FAST_JAVA_CELLS JAVA_LANES JAVA_LANE_CORES JAVA_LANE_JIT PTW_JOBS TRAD_REPS TRAD_SUITES TRAD_POLY TRAD_PYPERF TRAD_RUST TRAD_NODE TRAD_JAVA TRAD_CEILING BASELINES_CSV \
-         NODE_WARM_SLOTS JAVA_WARM_SLOTS JIT_WARM_PASS PTW_REMEASURE_FULL PTW_REMEASURE_REPS PTW_REMEASURE_POLY TRAD_CORES TRAD_WIDE TRAD_SPINDLE_CORES QUICK PROGRESS_SECS; do
+         NODE_WARM_SLOTS JAVA_WARM_SLOTS JIT_WARM_PASS PTW_REMEASURE_FULL PTW_REMEASURE_REPS PTW_REMEASURE_POLY TRAD_CORES TRAD_WIDE TRAD_SPINDLE_CORES QUICK PROGRESS_SECS ACC_LANES ACC_CELL_GB ACC_RTIMEOUT; do
   [ -n "${!v:-}" ] && ENVS+=(-e "$v=${!v}")
 done
+# The accuracy step keeps each cell's trace and value stream (up to ~50 GB for the largest cells) until the cell is
+# reconstructed.  On a machine with >= 160 GB RAM that scratch is an in-memory filesystem of ACC_TMP_GB (90) GB: a
+# network or small disk would make the largest cells take hours and could fill up.  ACC_TMP_GB=0 keeps it on disk.
+TMPFS=()
+case "${1:-}" in run/02_accuracy.sh)
+  MEM_GB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 ))
+  ACC_TMP_GB="${ACC_TMP_GB:-$([ "$MEM_GB" -ge 160 ] && echo 90 || echo 0)}"
+  if [ "$ACC_TMP_GB" -gt 0 ]; then
+    TMPFS=(--tmpfs "/acc_tmp:rw,size=${ACC_TMP_GB}g" -e ACC_TMP=/acc_tmp -e "ACC_TMP_GB=$ACC_TMP_GB")
+    echo "accuracy scratch: ${ACC_TMP_GB} GB in memory (/acc_tmp; ${MEM_GB} GB RAM)"
+  fi ;;
+esac
 TTY=""; [ -t 0 ] && TTY="-it"
 docker run --rm $TTY --privileged \
   --ulimit memlock=-1:-1 \
-  -v "$OUT:/artifact/out" -e OUT=/artifact/out "${ENVS[@]}" \
+  -v "$OUT:/artifact/out" -e OUT=/artifact/out "${ENVS[@]}" "${TMPFS[@]}" \
   "$IMAGE" "$@"

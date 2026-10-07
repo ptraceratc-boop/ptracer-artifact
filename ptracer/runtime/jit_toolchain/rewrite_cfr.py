@@ -3557,6 +3557,10 @@ def main():
     if a.full_coverage:
         argv += ["-100"]
     argv += list(a.e9tool_arg)
+    if a.gt_all:
+        # Twins only (as runtime/rewrite.py): retry a T3 punned jump in another
+        # sub-window when its evictee cannot be placed.
+        argv += ["--option", "--tactic-T3-realloc"]
     ld_so_fix_base = 0
     ld_so_rt_base = 0
     ld_so_loader_base = 0
@@ -3717,9 +3721,14 @@ def main():
               # Drop the gt sequence at the neighbours that block the site
               # (see gt_skip_candidates) and run e9tool again. Critical-value
               # sequences are untouched, including with critical-oracle retry.
-              attempt += 1
-              new = gt_skip_candidates(a.image, np_, attempt, csv_file,
-                                       groups, a.gt_retry_critical_oracles) - gt_skip
+              # An empty window is no reason to stop: widen it (attempts 1-3
+              # are +-0/24/128 bytes) until it names a gt-only neighbour.
+              while True:
+                  attempt += 1
+                  new = gt_skip_candidates(a.image, np_, attempt, csv_file,
+                                           groups, a.gt_retry_critical_oracles) - gt_skip
+                  if new or attempt >= min(3, a.gt_retry):
+                      break
               if new and not a.allow_gt_drop:
                   # A silent drop would leave an oracle hole nothing downstream
                   # reports, and every access at the dropped addresses would

@@ -29,6 +29,12 @@ case $suite in
   *) echo "unknown suite $suite"; exit 2 ;;
 esac
 E+=(--child-env "LD_LIBRARY_PATH=$lib")
+# One capture at a time, started only with ACC_CELL_GB (40) GB free unless no other cell holds scratch: a cell's value
+# stream and trace are written during its capture (up to ~50 GB for the largest pyperformance cells) and then stay
+# until its reconstruction ends, so a full disk would fail every cell running at that moment.
+exec 9> "$A/.capture.lock"; flock 9
+while [ "$(df -Pk "${ACC_TMP:-$A/tmp}" | awk 'NR==2 {print $4}')" -lt $(( ${ACC_CELL_GB:-40} * 1048576 )) ] \
+      && [ -n "$(find "${ACC_TMP:-$A/tmp}" -mindepth 1 -maxdepth 1 ! -name "$name" -print -quit)" ]; do sleep 20; done
 echo "-- $name: capture (core $core)"
 t0=$(date +%s.%N)
 # a fixed, minimal environment: the traced program's memory layout must not depend on the caller's variables
@@ -36,6 +42,7 @@ t0=$(date +%s.%N)
     timeout "${ACC_TIMEOUT:-3600}" taskset -c "$helper" setarch -R "$PC" --aux-mb 512 $ptw --no-decode \
     --aux-out "$d/aux" --child-core "$core" --sideband "$d/sb.json" "${E[@]}" --map-poll-gate -- "${argv[@]}" \
     > "$d/run.out" 2> "$d/run.err" ); crc=$?
+flock -u 9; exec 9>&-
 t1=$(date +%s.%N)
 # the traced process = the pid of the largest ground-truth ring; its main thread = tid == pid
 gt=$(ls -S "$d"/gt.*.bin 2>/dev/null | head -1); cv=""

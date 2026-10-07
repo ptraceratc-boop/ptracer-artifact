@@ -48,6 +48,7 @@ bool option_tactic_T1          = true;
 bool option_tactic_T2          = true;
 bool option_tactic_T3          = true;
 bool option_tactic_backward_T3 = true;
+bool option_tactic_T3_realloc   = false;
 bool option_Ocall              = false;
 bool option_OCFR               = false;
 bool option_OCFR_hacks         = false;
@@ -377,6 +378,11 @@ static void usage(FILE *stream, const char *progname)
         "\t\tEnable [disables] backward jumps for tactic T3.\n"
         "\t\tDefault: true (enabled)\n"
         "\n"
+        "\t--tactic-T3-realloc[=false]\n"
+        "\t\tEnable [disable] re-allocating a T3 punned jump in another\n"
+        "\t\tsub-window of its range when the evictee cannot be placed.\n"
+        "\t\tDefault: false (disabled)\n"
+        "\n"
         "\t--trap=ADDR\n"
         "\t\tInsert a trap (int3) instruction at the trampoline entry for\n"
         "\t\tthe instruction at address ADDR.  This can be used to debug\n"
@@ -435,6 +441,7 @@ enum Option
     OPTION_TACTIC_T2,
     OPTION_TACTIC_T3,
     OPTION_TACTIC_BACKWARD_T3,
+    OPTION_TACTIC_T3_REALLOC,
     OPTION_TRAP,
     OPTION_TRAP_ALL,
     OPTION_TRAP_ENTRY,
@@ -486,6 +493,7 @@ void parseOptions(char * const argv[], bool api)
         {"tactic-T2",          opt_arg, nullptr, OPTION_TACTIC_T2},
         {"tactic-T3",          opt_arg, nullptr, OPTION_TACTIC_T3},
         {"tactic-backward-T3", opt_arg, nullptr, OPTION_TACTIC_BACKWARD_T3},
+        {"tactic-T3-realloc",  opt_arg, nullptr, OPTION_TACTIC_T3_REALLOC},
         {"trap",               req_arg, nullptr, OPTION_TRAP},
         {"trap-all",           opt_arg, nullptr, OPTION_TRAP_ALL},
         {"trap-entry",         opt_arg, nullptr, OPTION_TRAP_ENTRY},
@@ -599,6 +607,10 @@ void parseOptions(char * const argv[], bool api)
             case OPTION_TACTIC_BACKWARD_T3:
                 option_tactic_backward_T3 =
                     parseBoolOptArg("--tactic-backward-T3", optarg);
+                break;
+            case OPTION_TACTIC_T3_REALLOC:
+                option_tactic_T3_realloc =
+                    parseBoolOptArg("--tactic-T3-realloc", optarg);
                 break;
             case OPTION_TRAP:
                 option_trap.insert(parseIntOptArg("--trap", optarg, 0,

@@ -17,7 +17,7 @@
 # PYTHONHASHSEED=0, fixed SOURCE_DATE_EPOCH, precompiled standard library, minimal environment, ASLR off, one core.
 # Resumable: cells already in cells.jsonl are kept.  QUICK=1: 3 PolyBench + 3 pyperformance cells.
 # Env: ACC_LANES ("core:helper ..." pairs, default 8 lanes), ACC_MODES ("tnt ptw" = Fast, Fast-PTWRITE),
-#      ACC_SUITES ("poly py"), ACC_CELLS (explicit cell list), ACC_TMP (per-cell scratch, ~10 GB per lane),
+#      ACC_SUITES ("poly py"), ACC_CELLS (explicit cell list), ACC_TMP (per-cell scratch, up to ~50 GB per cell; docker/run.sh puts it in memory on >= 160 GB RAM),
 #      ACC_GTMAX (ground-truth bytes of the main thread, default 4 GiB = 268 M records), JOBS (build processes).
 # Output: $RUN_OUT/accuracy/{cells.jsonl, inaccuracy.md, inaccuracy.csv, inaccuracy.png}.
 set -u
@@ -35,8 +35,16 @@ if [ "${QUICK:-0}" = 1 ]; then
 fi
 export ACC_DIR="$A" ACC_POLY="${ACC_POLY:-$POLY_ALL}" ACC_PY="${ACC_PY:-$PY_ALL}"
 NC=$(nproc)
+# scratch of cells an interrupted run left behind (no cell runs yet at this point)
+mkdir -p "$A"
+if [ "${1:-}" != "--dry-run" ]; then
+    for t in "$A/tmp" "${ACC_TMP:-$A/tmp}"; do [ ! -d "$t" ] || find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf {} +; done
+fi
+mkdir -p "${ACC_TMP:-$A/tmp}"; FREE_GB=$(( $(df -Pk "${ACC_TMP:-$A/tmp}" | awk 'NR==2 {print $4}') / 1048576 ))
+# lanes = min(8, cores / 4, (RAM - in-memory scratch) / 16 GB): a reconstruction can hold ~16 GB
+MEM_GB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1048576 ))
 if [ -z "${ACC_LANES:-}" ]; then
-    n=$(( NC / 4 )); [ $n -gt 8 ] && n=8; [ $n -lt 1 ] && n=1
+    n=$(( NC / 4 )); [ $n -gt 8 ] && n=8; m=$(( (MEM_GB - ${ACC_TMP_GB:-0}) / 16 )); [ $n -gt $m ] && n=$m; [ $n -lt 1 ] && n=1
     ACC_LANES=""; for i in $(seq 0 $((n - 1))); do ACC_LANES="$ACC_LANES $((2 + 2 * i)):$((3 + 2 * i))"; done
 fi
 export ACC_LANES="${ACC_LANES# }"
@@ -51,7 +59,9 @@ cat <<EOF
   steps: Figure 5 Fast / Fast-PTWRITE images (skipped if run/fig5.sh built them), ground-truth twins, cells, table
   estimated time on a 96-vCPU machine: Figure 5 images ~0.5 h if absent; twins ~15 min; cells ~$(( (ncell * 9 + nl * 60 - 1) / (nl * 60) )) h on
   $nl lanes (a cell: capture seconds to minutes, reconstruction 1 min-1 h, ~9 min on average); QUICK=1 ~1.5 h in all
-  disk and memory: ~10 GB scratch + ~8 GB RAM per lane under ${ACC_TMP:-$A/tmp} (deleted per cell); ~2 GB for the twins under $A/gt and
+  memory and scratch: ~8-16 GB RAM per lane; a cell's trace under ${ACC_TMP:-$A/tmp} (up to ~50 GB, deleted per cell;
+  ${FREE_GB} GB free there now; ACC_TMP_GB=${ACC_TMP_GB:-0} GB of it in memory): one capture at a time, started with >= ACC_CELL_GB (40) GB
+  free, so a small scratch makes lanes wait; ~2 GB for the twins under $A/gt and
   ~2 GB for the Figure 5 images under $RUN_OUT (shared with run/fig5.sh)
   results: $A/cells.jsonl -> $A/inaccuracy.{md,csv,png}
 EOF
@@ -77,13 +87,58 @@ ln -sfn "$RUN_OUT/fastwp/ptld" /ptld 2>/dev/null || [ "$(readlink /ptld)" = "$RU
 # 2. ground-truth twins
 bash run/lib/acc_gt.sh ${ACC_SUITES:-poly py}
 
-# 3. cells, dealt over the lanes; a cell already in cells.jsonl is skipped
+# 3. cells, dealt over the lanes; a cell already measured successfully in cells.jsonl is skipped (failed ones are retried)
 RES="$A/cells.jsonl"; touch "$RES"
+# rows measured by an older version of this step are moved to cells.stale.jsonl and measured again
+#   py 2 (both modes): every plan site of the python3.12 twin is placed (E9Patch --tactic-T3-realloc); with version 1
+#   the twin could fail and the cell then compared only the libraries
+"$PYBIN" - "$A" <<'PY'
+import json, os, sys
+VERSION = {"tnt/py": 2, "ptw/py": 2}
+a = sys.argv[1]; res, led = os.path.join(a, "cells.jsonl"), os.path.join(a, "cells.versions.json")
+try:
+    have = json.load(open(led))
+except (OSError, ValueError):
+    have = {}
+old = {k for k, v in VERSION.items() if int(have.get(k, 1)) < v}
+if old and os.path.getsize(res):
+    keep, stale = [], []
+    for line in open(res):
+        k = None
+        for part in (line, line[max(line.rfind('{"mode"'), 0):]):
+            try:
+                r = json.loads(part); k = "%s/%s" % (r["mode"], r["suite"]); break
+            except (ValueError, KeyError):
+                continue
+        (stale if k is None or k in old else keep).append(line)
+    if stale:
+        with open(os.path.join(a, "cells.stale.jsonl"), "a") as f:
+            f.writelines(stale)
+        with open(res + ".tmp", "w") as f:
+            f.writelines(keep)
+        os.replace(res + ".tmp", res)
+        print("== %d rows of an older version (%s) moved to cells.stale.jsonl; measured again ==" % (len(stale), ",".join(sorted(old))))
+json.dump(dict(have, **VERSION), open(led, "w"))
+PY
+# cells with a complete, successful row (a line cut short, e.g. by a full disk, does not count)
+DONE=$("$PYBIN" - "$RES" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    for part in (line, line[max(line.rfind('{"mode"'), 0):]):
+        try:
+            r = json.loads(part)
+        except ValueError:
+            continue
+        if r.get("capture_rc") == 0 and r.get("recon_rc") == 0:
+            print("%s %s %s" % (r["mode"], r["suite"], r["cell"]))
+        break
+PY
+)
 pending=()
 for m in ${ACC_MODES:-tnt ptw}; do for s in ${ACC_SUITES:-poly py}; do
     cells="${ACC_CELLS:-}"; [ -n "$cells" ] || { [ "$s" = poly ] && cells="$ACC_POLY" || cells="$ACC_PY"; }
     for c in $cells; do
-        grep -q "\"mode\": \"$m\", \"suite\": \"$s\", \"cell\": \"$c\"," "$RES" || pending+=("$m $s $c")
+        grep -qxF "$m $s $c" <<< "$DONE" || pending+=("$m $s $c")
     done
 done; done
 read -r -a LANES <<< "$ACC_LANES"

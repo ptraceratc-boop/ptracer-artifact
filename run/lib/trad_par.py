@@ -11,12 +11,13 @@ start-up included) and counted as 200x (cap = "cap"); a cell whose reference fai
 (cap = "no-reference").  --ceiling S (QUICK only) also stops a run after S seconds (cap = "stopped": not a 200x
 result, plotted as an error).
 Single-core lanes (the tracee pinned to the lane's core) run PolyBench, pyperformance, Rust Stream and Node.js; wide
-slots run Java (the JVM on the first half of the slot's cpus) and Memcached (server on the first half, load client
-on the second).  Each lane writes its own CSV (BASELINES.t<lane>.csv), merged into BASELINES.csv at the end; a row
+slots run Java (the JVM on the first half of the slot's cpus).  Memcached runs last and alone, its server on
+MC_SRV_CORES (4,5,6,7) and its load client on MC_CLI_CORES (8-11), other physical cores, as in its Figure 5 rows.  Each lane writes its own CSV (BASELINES.t<lane>.csv), merged into BASELINES.csv at the end; a row
 already in any of them is not re-run.  The timing mutex is taken once for the whole pass.
 """
 import argparse
 import csv
+import json
 import glob
 import os
 import queue
@@ -40,7 +41,12 @@ TOOL = {
                "--libdft-tool", os.path.join(TP, "libdft64", "tools", "obj-intel64", "track.so")],
     "valgrind": ["--valgrind", os.environ.get("VALGRIND") or os.path.join(TP, "valgrind-build", "bin", "valgrind")],
 }
-WIDE_SUITES = ("java", "mc")
+WIDE_SUITES = ("java",)
+# Memcached runs alone after the parallel lanes, its server and load client on different physical cores (the layout of
+# its Figure 5 rows: MC_SRV_CORES / MC_CLI_CORES), so neither the reference nor a tracer run shares a core with the client
+SOLO_SUITES = ("mc",)
+# measurement version of a suite's rows in this step (absent = 1); older rows are moved to <csv>.stale.csv and re-measured
+TRAD_VERSION = {"mc": 2}   # 2: Memcached alone, client on its own physical cores (1: client on the server cores' SMT siblings)
 REF = "trad"                       # label of the reference (uninstrumented) rows
 COLS = ["suite", "cell", "config", "rep", "ktime", "wall", "rc", "ck", "mutex", "load0", "load1", "label", "ts", "tps",
         "gate", "cap", "acalls", "pt_lost_bytes", "pt_trunc", "pt_aux_bytes", "pt_peak_fill", "topa", "iters",
@@ -70,6 +76,52 @@ def rows(paths):
             pass
 
 
+def kind_of(s):
+    return "solo" if s in SOLO_SUITES else "wide" if s in WIDE_SUITES else "single"
+
+
+def prune_stale(base, paths, dry):
+    """Move the rows of every suite whose recorded version is older than TRAD_VERSION to <base>.stale.csv."""
+    ledger = base + ".versions.json"
+    try:
+        with open(ledger) as f:
+            have = json.load(f)
+    except (OSError, ValueError):
+        have = {}
+    old = [s for s, v in TRAD_VERSION.items() if int(have.get(s, 1)) < v]
+    moved = 0
+    for p in paths if old else []:
+        try:
+            with open(p) as f:
+                rd = csv.DictReader(f)
+                fields, rs = rd.fieldnames, list(rd)
+        except (OSError, KeyError):
+            continue
+        drop = [r for r in rs if r.get("suite") in old]
+        if not drop or not fields:
+            continue
+        moved += len(drop)
+        if dry:
+            continue
+        new = not os.path.exists(base + ".stale.csv")
+        with open(base + ".stale.csv", "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, restval="", extrasaction="ignore")
+            if new:
+                w.writeheader()
+            w.writerows(drop)
+        with open(p + ".tmp", "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, restval="")
+            w.writeheader()
+            w.writerows(r for r in rs if r.get("suite") not in old)
+        os.replace(p + ".tmp", p)
+    if old:
+        print("[trad_par] %s: %d rows of an older version %s %s.stale.csv; re-measured in this run"
+              % (",".join(old), moved, "would be moved to" if dry else "moved to", os.path.basename(base)), flush=True)
+    if not dry:
+        with open(ledger, "w") as f:
+            json.dump(dict(have, **{s: v for s, v in TRAD_VERSION.items()}), f)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True)
@@ -91,6 +143,9 @@ def main():
             s, cs = part.split("=", 1)
             cells[s] = [c for c in cs.split(",") if c]
     singles, wides = a.singles.split(), a.wide.split()
+    solo_env = dict(MC_SRV_CORES=os.environ.get("MC_SRV_CORES", "4,5,6,7"), MC_CLI_CORES=os.environ.get("MC_CLI_CORES", "8-11"))
+    solo_env.update(TIMED_CORE=solo_env["MC_SRV_CORES"].split(",")[0], HELPER_CORES=solo_env["MC_CLI_CORES"])
+    prune_stale(base, files(), a.dry_run)
 
     def ref_walls():
         acc = {}
@@ -148,9 +203,11 @@ def main():
             x.start()
         for x in th:
             x.join()
+        # then the solo jobs, one at a time on an otherwise idle machine
+        worker("solo", "m0", solo_env)
 
     def plan(kind_jobs, what):
-        for k, n in (("single", len(singles)), ("wide", len(wides))):
+        for k, n in (("single", len(singles)), ("wide", len(wides)), ("solo", 1)):
             js = kind_jobs[k]
             tot = sum(j[0] for j in js)
             print("[trad_par] %s, %s lanes: %d runs on %d lanes, <= %.1f h if every run reaches its cap"
@@ -159,19 +216,19 @@ def main():
 
     # 1. the reference runs
     done = have()
-    ref_jobs = {"single": [], "wide": []}
+    ref_jobs = {"single": [], "wide": [], "solo": []}
     for s, cs in cells.items():
         for c in cs:
             if (s, c, "vanilla", REF) not in done:
-                ref_jobs["wide" if s in WIDE_SUITES else "single"].append((0.0, "vanilla", s, c))
+                ref_jobs[kind_of(s)].append((0.0, "vanilla", s, c))
     print("[trad_par] reference (uninstrumented) runs: %d" % sum(len(v) for v in ref_jobs.values()), flush=True)
     if a.dry_run:
         walls = ref_walls()
-        jobs = {"single": [], "wide": []}
+        jobs = {"single": [], "wide": [], "solo": []}
         for t in a.tracers.split(","):
             for s, cs in cells.items():
                 for c in cs:
-                    jobs["wide" if s in WIDE_SUITES else "single"].append((200 * walls.get((s, c), 0.0), t, s, c))
+                    jobs[kind_of(s)].append((200 * walls.get((s, c), 0.0), t, s, c))
         if any(j[0] for v in jobs.values() for j in v):
             plan(jobs, "tracers")
         return 0
@@ -181,7 +238,7 @@ def main():
         lanes(ref_jobs)
         # 2. the tracers, each run capped at 200x its cell's reference wall time
         walls, done = ref_walls(), have()
-        jobs = {"single": [], "wide": []}
+        jobs = {"single": [], "wide": [], "solo": []}
         noref = []
         for t in a.tracers.split(","):
             for s, cs in cells.items():
@@ -191,7 +248,7 @@ def main():
                     if (s, c) not in walls:
                         noref.append((s, c, t))
                         continue
-                    jobs["wide" if s in WIDE_SUITES else "single"].append((200 * walls[(s, c)], t, s, c))
+                    jobs[kind_of(s)].append((200 * walls[(s, c)], t, s, c))
         if noref:
             new = not os.path.exists(base + ".tref.csv")
             with open(base + ".tref.csv", "a", newline="") as f:

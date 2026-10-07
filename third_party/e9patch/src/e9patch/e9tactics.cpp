@@ -552,6 +552,74 @@ static Patch *tactic_T2(Binary &B, Instr *I, const Trampoline *T)
 }
 
 /*
+ * Tactic T3 (both forms) under --tactic-T3-realloc: the punned jump at
+ * J->addr+i was allocated but J could not then be evicted.  The jump's free
+ * rel32 bytes (J's own bytes after the jmpq opcode) become the HIGH bytes of
+ * the jump that evicts J, so the one choice the allocator made can leave the
+ * evictee without a feasible window while another choice would not.  Retry
+ * the allocation in each sub-window of the jump's range in which the most
+ * significant free byte takes a different value (at most 256 sub-windows).
+ * Returns the eviction patch chain (with the punned-jump patch after it) and
+ * sets A, or nullptr with the binary unchanged.
+ */
+static Patch *reallocT3(Binary &B, Instr *J, unsigned i, Instr *I,
+    const Trampoline *T, bool backward, const Alloc *&A)
+{
+    if (!option_tactic_T3_realloc)
+        return nullptr;
+    size_t size = i + 1;        // as makeBounds(): the free rel32 bytes
+    for (; size < J->size &&
+            (J->STATE[size] == STATE_INSTRUCTION ||
+             J->STATE[size] == STATE_FREE); size++)
+        ;
+    for (; size < /*sizeof(jmpq)=*/5 && J->STATE[size] == STATE_FREE; size++)
+        ;
+    size_t diff = size - i - /*sizeof(jmpq opcode)=*/1;
+    if (diff == 0 || diff >= sizeof(int32_t))
+        return nullptr;         // one target only / no constraint
+    uint32_t mask   = 0xFFFFFFFFu << (8 * diff);
+    uint32_t urel32 = *(uint32_t *)(J->PATCH + i + /*sizeof(jmpq opcode)=*/1);
+    intptr_t jmp_lo = (intptr_t)J->addr + i + JMP_SIZE +
+        (intptr_t)(int32_t)(urel32 & mask);
+    intptr_t step   = (intptr_t)1 << (8 * (diff - 1));
+    Bounds b = makeBounds(B, T, J, I, i, /*trap=*/false);
+    const Trampoline *U = evicteeTrampoline;
+    for (intptr_t k = 0; k < 256; k++)
+    {
+        intptr_t lo = std::max(b.lb, jmp_lo + k * step);
+        intptr_t hi = std::min(b.ub, jmp_lo + (k + 1) * step - 1);
+        if (lo > hi)
+            continue;
+        bool save = (bool)J->no_optimize;
+        if (backward)
+            J->no_optimize = true;
+        const Alloc *R = allocate(&B, lo, hi, T, I, !option_mem_multi_page);
+        if (R == nullptr)
+        {
+            J->no_optimize = save;
+            continue;
+        }
+        Patch *P = new Patch(J, TACTIC_T3, R);
+        patchJump(P, i);
+        Patch *Q = nullptr;
+        Q = (Q == nullptr? tactic_B1(B, J, U, TACTIC_T3): Q);
+        Q = (Q == nullptr? tactic_B2(B, J, U, TACTIC_T3): Q);
+        Q = (Q == nullptr? tactic_T1(B, J, U, TACTIC_T3): Q);
+        if (Q == nullptr)
+        {
+            J->no_optimize = save;
+            undo(B, P);
+            continue;
+        }
+        Q->next = P;
+        P->A = nullptr;
+        A = R;
+        return Q;
+    }
+    return nullptr;
+}
+
+/*
  * Tactic T3 (single-byte instruction): evict a neighbour instruction.
  */
 static Patch *tactic_T3b(Binary &B, Instr *I, const Trampoline *T)
@@ -627,7 +695,10 @@ static Patch *tactic_T3b(Binary &B, Instr *I, const Trampoline *T)
                 // Eviction failed...
                 J->no_optimize = save;
                 undo(B, P);
-                return nullptr;
+                P = reallocT3(B, J, i, I, T, target < I->addr, A);
+                if (P == nullptr)
+                    return nullptr;
+                break;
             }
             Q->next = P;
             P->A = nullptr;
@@ -770,7 +841,7 @@ static Patch *tactic_T3(Binary &B, Instr *I, const Trampoline *T)
                         // Eviction failed...
                         J->no_optimize = save;
                         undo(B, P);
-                        P = nullptr;
+                        P = reallocT3(B, J, i, I, T, J->addr < I->addr, A);
                         continue;
                     }
                     Q->next = P;

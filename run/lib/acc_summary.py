@@ -53,10 +53,23 @@ def main():
     ap.add_argument("--png")
     a = ap.parse_args()
     rows = {}
+    torn = 0
     for line in open(a.rows):
         if line.strip():
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except ValueError:            # a line cut short (e.g. a full disk) and continued by the next record
+                torn += 1
+                k = line.rfind('{"mode"')
+                try:
+                    r = json.loads(line[k:]) if k > 0 else None
+                except ValueError:
+                    r = None
+                if r is None:
+                    continue
             rows[(r["mode"], r["suite"], r["cell"])] = r          # the last row of a cell wins
+    if torn:
+        print("note: %d malformed line(s) in %s skipped (their cells count as not measured)" % (torn, a.rows))
     agg, fails = collections.defaultdict(list), []
     csv = ["mode,suite,cell,gt_records,D_ub,inaccuracy_pct,lower_bound_pct,unknown_pct,wrong,unpaired_pct,"
            "oracle_coverage_pct,in_pt_overflow_pct,pt_overflows,gt_capped"]
